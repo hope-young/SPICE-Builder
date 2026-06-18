@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SpiceBuilder specific
+datademo/cleaned/*.csv
+datademo/cleaned/*.parquet
+datademo/inspect/*.json
+datademo/inspect/*.txt
+*.log
+*.raw
+*.net
+*.lib
+*.sub
+*.asy
+lt*.tmp
