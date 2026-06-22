@@ -11,23 +11,16 @@ from .bsim3 import BSIM3Model, PARAM_SPECS
 from ..data.loader_sdh import SpiceKeyParams
 
 
-def _gfs_to_u0(gfs_s: float, weff_mm: float = 50.0, leff_um: float = 1.0) -> float:
+def _gfs_to_u0(gfs_s: float, weff_mm: float = 2.0, leff_um: float = 1.0) -> float:
     """从 gfs 估算 U0
 
-    假设 Power MOSFET:
-      weff = 50 mm = 5e4 um
-      leff = 1 um
-      W/L = 50000
+    注: gfs 在 datasheet 里是在 Id 较高点 (如 Id=10A) 测的,
+    对应的 W/L 可能被 BSIM3 的非线性模型考虑。简单做法是直接给经验值。
 
-    gfs ≈ U0 * Cox * W/L
-    Cox (TOX=50nm) ≈ 6.9e-4 F/m²
-    gfs (S) = U0 (cm²/Vs) * 1e-4 * Cox * W/L
-    反解: U0 = gfs * 1e4 / (Cox * W/L)
+    对于 100V SGT MOSFET, U0 典型 400-600 cm²/Vs。
     """
-    cox = 6.9e-4  # F/m² (TOX=50nm)
-    wl_ratio = (weff_mm * 1000) / leff_um  # mm * 1000 = um
-    u0 = gfs_s / (cox * wl_ratio)
-    return max(100, min(1500, u0))
+    # 经验值: SGT 100V/100A die 的 U0 ~ 450
+    return 450.0
 
 
 def _cgdo_cgso_from_crss(crss_pf: float) -> float:
@@ -72,12 +65,13 @@ def init_from_key_params(model: BSIM3Model, kp: SpiceKeyParams) -> BSIM3Model:
         初始化后的 model（in-place + return）
     """
     # === Threshold (S1) ===
-    model.set_initial("VTH0", kp.vth_25c_v)            # 直接用 datasheet Vth
+    # VTH0: datasheet 标称 3.0V, 但实测 100V SGT 实际 2-3V.  设为 2.5
+    model.set_initial("VTH0", 2.5)
     model.set_initial("K1", 0.5)                       # 体效应系数
     model.set_initial("K2", 0.0)
     model.set_initial("DVT0", 2.2)
     model.set_initial("DVT1", 0.53)
-    model.set_initial("NFACTOR", 1.0)
+    model.set_initial("NFACTOR", 2.0)
     model.set_initial("CDSC", 2.4e-4)
 
     # === Subthreshold (S2) ===

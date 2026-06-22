@@ -125,37 +125,58 @@ class Stage:
         return None
 
     def _eval_idvg_simple(self, sd: SimData) -> np.ndarray:
-        """简化 Id-Vg 评估（加 vsat 限制）"""
+        """简化 Id-Vg 评估（使用正确 BSIM3-like 公式）
+
+        注: 100V/100A SGT MOSFET 典型 die 参数:
+          - 总沟道宽度 W ~ 100mm = 0.1m
+          - 沟道长度 L ~ 1um
+          - W/L ~ 1e5
+        """
         vgs = sd.ivar
         vth = self.model.get("VTH0")
         n = self.model.get("NFACTOR")
-        vsat = self.model.get("VSAT")
-        vt = 0.0259
-        cox = 6.9e-4
-        w_m = 2500e-3  # 2.5 m (SGT 高功率器件总沟道宽度)
-        l_m = 1e-6   # 1 um
-        # 亚阈值 (Vgs < Vth)
-        i_sub = 1e-6 * np.exp(np.clip((vgs - vth) / (n * vt), -50, 50))
-        # 强反型 (vsat-limited)
+        u0_cm2 = self.model.get("U0")  # cm²/Vs
+        vsat = self.model.get("VSAT")  # m/s
+        vt = 0.0259  # 26 mV @ 25°C
+        cox = 6.9e-4  # F/m² (TOX=50nm)
+        w_m = 0.1     # 总沟道宽度 0.1m = 100mm (100V/100A SGT die)
+        l_m = 1e-6    # 沟道长度 1um
+        mu = u0_cm2 * 1e-4  # 转换为 m²/Vs
+
         vov = np.maximum(vgs - vth, 0)
-        i_strong = w_m * cox * vov * vsat / (vov + vsat * l_m + 1e-9)
-        # 平滑过渡：在 Vth 附近混合
-        # 软开关：alpha 随 Vgs 变化
-        alpha = 1.0 / (1.0 + np.exp(-(vgs - vth) / 0.1))  # sigmoid
+
+        # 亚阈值电流 (指数区)
+        # Id_sub = I0 * exp((Vgs-Vth) / (n·Vt))
+        # I0 ≈ μ·Cox·(W/L)·Vt²
+        i0 = (w_m / l_m) * cox * mu * vt**2
+        i_sub = i0 * np.exp(np.clip((vgs - vth) / (n * vt), -50, 50))
+
+        # 强反型（饱和 + vsat 限制）
+        # Id_sat_full = 0.5 · μ · Cox · (W/L) · vov²
+        # Id_vsat = W · Cox · vov · vsat
+        # Id = 1 / (1/Id_sat + 1/Id_vsat) （vsat-limited）
+        i_sat_full = 0.5 * (w_m / l_m) * cox * mu * vov**2
+        i_vsat = w_m * cox * vov * vsat
+        i_strong = i_sat_full * i_vsat / (i_sat_full + i_vsat + 1e-12)
+
+        # 平滑过渡 (sigmoid 在 Vth 附近)
+        alpha = 1.0 / (1.0 + np.exp(-(vgs - vth) / 0.05))
         i_d = i_sub * (1 - alpha) + i_strong * alpha
         return np.maximum(i_d, 1e-15)
 
     def _eval_idvd_simple(self, sd: SimData) -> np.ndarray:
-        """简化 Id-Vd 评估"""
+        """简化 Id-Vd 评估（与 _eval_idvg_simple 同样的 w_m, l_m）"""
         vds = sd.ivar
         vgs_v = sd.metadata.get('vgs_v', 5.0)
         vth = self.model.get("VTH0")
         cox = 6.9e-4
         vsat = self.model.get("VSAT")
-        w_m = 2500e-3
+        w_m = 0.1  # 与 Id-Vg 一致
         l_m = 1e-6
+        u0_cm2 = self.model.get("U0")
+        mu = u0_cm2 * 1e-4
         vov = max(vgs_v - vth, 0)
-        # 饱和电流
+        # 饱和电流 (vsat-limited)
         i_sat = w_m * cox * vov * vsat / (vov + vsat * l_m + 1e-9)
         # 线性区
         rdson = max(self.model.get("RD") + self.model.get("RS"), 1e-6)
@@ -168,20 +189,23 @@ class Stage:
         return np.maximum(i_d, 1e-9)
 
     def _eval_cv_simple(self, sd: SimData) -> np.ndarray:
-        """简化 C-V 评估"""
+        """简化 C-V 评估 (与 die 几何一致: W=0.1m, L=1e-6m)"""
         vds = sd.ivar
         cap_type = sd.metadata.get('cap_type', 'ciss')
-        cgdo = self.model.get("CGDO")
+        cgdo = self.model.get("CGDO")  # F/m
         cgso = self.model.get("CGSO")
         cgbo = self.model.get("CGBO")
+        w_m = 0.1  # 与 Id-Vg/Id-Vd 一致
+        l_m = 1e-6
+        # 单位: CGDO (F/m) × W (m) = 寄生电容
         if cap_type == 'ciss':
-            base = cgdo + cgso + cgbo
+            base = (cgdo + cgso) * w_m + cgbo * l_m
         elif cap_type == 'coss':
-            base = cgdo
+            base = cgdo * w_m
         elif cap_type == 'crss':
-            base = cgdo
+            base = cgdo * w_m  # 简化: Crss ≈ Cgd
         else:
-            base = cgdo
+            base = cgdo * w_m
         # C-V 随 Vds 衰减（简化）
         decay = 1.0 / (1.0 + np.maximum(vds, 0) / 5.0)
         return base * (1.0 + 0.5 * decay) * 1e12  # 转 pF

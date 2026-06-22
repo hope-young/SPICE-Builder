@@ -36,12 +36,12 @@ class BSIM3ParamSpec:
 
 PARAM_SPECS: list[BSIM3ParamSpec] = [
     # === Threshold & Body Effect (S1) ===
-    BSIM3ParamSpec("VTH0",   2.0,    0.1,   8.0,    "V",      "Threshold",     "S1", "零偏阈值电压 @ Vbs=0"),
+    BSIM3ParamSpec("VTH0",   3.0,    2.0,   4.0,    "V",      "Threshold",     "S1", "零偏阈值电压 @ Vbs=0 (收紧 bounds)"),
     BSIM3ParamSpec("K1",     0.5,    0.0,   2.0,    "V^0.5",  "Threshold",     "S1", "体效应系数一阶"),
     BSIM3ParamSpec("K2",     0.0,   -1.0,   1.0,    "—",      "Threshold",     "S1", "体效应系数二阶"),
     BSIM3ParamSpec("DVT0",   2.2,    0.0,   10.0,   "—",      "Threshold",     "S1", "短沟道 Vth 衰减系数 0"),
     BSIM3ParamSpec("DVT1",   0.53,   0.0,   5.0,    "—",      "Threshold",     "S1", "短沟道 Vth 衰减系数 1"),
-    BSIM3ParamSpec("NFACTOR",1.0,    0.1,   5.0,    "—",      "Subthreshold",  "S1", "亚阈值摆幅因子"),
+    BSIM3ParamSpec("NFACTOR",2.0,    0.5,   5.0,    "—",      "Subthreshold",  "S1", "亚阈值摆幅因子"),
     BSIM3ParamSpec("CDSC",   2.4e-4, 0.0,   1e-2,   "F/m^2",  "Subthreshold",  "S1", "源/漏与沟道耦合电容"),
 
     # === Subthreshold (S2) ===

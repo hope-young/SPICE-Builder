@@ -54,9 +54,80 @@ for i in range(30):
 # 加载原始数据
 ds = load_sdh_excel('datademo/SDH10N2P1WC-AA_SPICE_Data.xlsx')
 
+# 导出 .lib to get fitted model（plot fit overlay）
+import subprocess
+r = requests.post(f'http://127.0.0.1:19999/api/projects/{pid}/export',
+                  json={'format': 'B', 'output_path': 'datademo/SDH10N2P1WC-AA.lib', 'rg_ohm': 1.6})
+print(f"Export: {r.json().get('n_bytes', 0)} bytes")
+
+# 获得 fitted model 用于 fit overlay
+r = requests.get(f'http://127.0.0.1:19999/api/projects/{pid}/model')
+fitted_model_dict = {p['name']: p['value'] for p in r.json()['params']}
+print(f"Fitted model: VTH0={fitted_model_dict.get('VTH0', 0):.3f}, "
+      f"U0={fitted_model_dict.get('U0', 0):.1f}")
+
 # 是否有 Qg 数据
 HAS_QG = False
 print(f"Qg data: {'available' if HAS_QG else 'NOT available (placeholder)'}")
+
+
+def predict_idvg(model_dict, vgs, vds=0.5):
+    """用 stage.py 简化公式评估 Id-Vg"""
+    vth = model_dict.get('VTH0', 3.0)
+    n = model_dict.get('NFACTOR', 2.0)
+    u0 = model_dict.get('U0', 450)
+    vsat = model_dict.get('VSAT', 1e5)
+    vt = 0.0259
+    cox = 6.9e-4
+    w_m, l_m = 0.1, 1e-6  # 100mm × 1um (SGT die)
+    mu = u0 * 1e-4
+    vov = np.maximum(vgs - vth, 0)
+    i0 = (w_m / l_m) * cox * mu * vt**2
+    i_sub = i0 * np.exp(np.clip((vgs - vth) / (n * vt), -50, 50))
+    i_sat_full = 0.5 * (w_m / l_m) * cox * mu * vov**2
+    i_vsat = w_m * cox * vov * vsat
+    i_strong = i_sat_full * i_vsat / (i_sat_full + i_vsat + 1e-12)
+    alpha = 1.0 / (1.0 + np.exp(-(vgs - vth) / 0.05))
+    return np.maximum(i_sub * (1 - alpha) + i_strong * alpha, 1e-15)
+
+
+def predict_idvd(model_dict, vds, vgs=10.0):
+    """用简化公式评估 Id-Vd"""
+    vth = model_dict.get('VTH0', 3.0)
+    u0 = model_dict.get('U0', 450)
+    vsat = model_dict.get('VSAT', 1e5)
+    cox = 6.9e-4
+    w_m, l_m = 0.1, 1e-6
+    rd = max(model_dict.get('RD', 1e-4) + model_dict.get('RS', 1e-4), 1e-6)
+    mu = u0 * 1e-4
+    vov = max(vgs - vth, 0)
+    i_sat = (w_m / l_m) * cox * mu * vov * vsat / (vov + vsat * l_m + 1e-9)
+    vds_clip = np.minimum(vds, vov)
+    i_lin = vov * vds_clip / rd
+    i_d = np.where(vds < vov, i_lin, i_sat)
+    pclm = model_dict.get('PCLM', 0.5)
+    i_d = np.where(vds < vov, i_d, i_d * (1 + pclm * (vds - vov)))
+    return np.maximum(i_d, 1e-9)
+
+
+def predict_cv(model_dict, vds, cap_type='ciss'):
+    cgdo = model_dict.get('CGDO', 1e-9)
+    cgso = model_dict.get('CGSO', 1e-9)
+    cgbo = model_dict.get('CGBO', 1e-10)
+    w_m, l_m = 0.1, 1e-6
+    if cap_type == 'ciss': base = (cgdo + cgso) * w_m + cgbo * l_m
+    elif cap_type == 'coss': base = cgdo * w_m
+    elif cap_type == 'crss': base = cgdo * w_m
+    else: base = cgdo * w_m
+    decay = 1.0 / (1.0 + np.maximum(vds, 0) / 5.0)
+    return base * (1.0 + 0.5 * decay) * 1e12
+
+
+def predict_diode(model_dict, vsd):
+    is_ = model_dict.get('IS', 1e-12)
+    n = model_dict.get('N', 1.5)
+    vt = 0.0259
+    return np.maximum(is_ * (np.exp(vsd / (n * vt)) - 1), 1e-15)
 
 # === 3. 画 5 张子图 (default scale) ===
 fig, axes = plt.subplots(2, 3, figsize=(18, 10))
@@ -67,6 +138,10 @@ fig.suptitle('SpiceBuilder Fit Result (Default Scales) — SDH10N2P1WC-AA (100V 
 ax = axes[0, 0]
 sim = SimData.from_idvg(ds.idvg_vds5, temperature_c=25, vds_v=5.0)
 ax.plot(sim.ivar, sim.dvar * 1e6, 'b-', label='Target (25°C)', linewidth=2)
+# Fit overlay
+vgs_fit = np.linspace(0, 5.5, 100)
+id_fit = predict_idvg(fitted_model_dict, vgs_fit, vds=5.0) * 1e6
+ax.plot(vgs_fit, id_fit, 'r--', label='Fit (simplified)', linewidth=2, alpha=0.8)
 ax.set_xlabel('Vgs (V)')
 ax.set_ylabel('Id (μA)  [linear]')
 ax.set_title('Id-Vg @ Vds=5V  [linear]')
@@ -85,6 +160,11 @@ for vgs in [5.0, 5.5, 6.0, 6.5, 7.0, 8.0, 9.0, 10.0]:
             ax.plot(sim.ivar, sim.dvar, color=color, label=f'Vgs={vgs}V', linewidth=1.5, marker='o', markersize=3)
     except ValueError:
         pass
+# Fit overlay (red dashed, only for a few Vgs)
+vds_fit = np.linspace(0, 12, 100)
+for vgs_fit, color in [(5.0, 'b'), (8.0, 'orange'), (10.0, 'brown')]:
+    id_fit = predict_idvd(fitted_model_dict, vds_fit, vgs=vgs_fit)
+    ax.plot(vds_fit, id_fit, color=color, linestyle='--', linewidth=1.5, alpha=0.6)
 ax.set_xlabel('Vds (V)')
 ax.set_ylabel('Id (A)  [linear]')
 ax.set_title('Id-Vd @ 25°C  [linear]')
@@ -102,6 +182,11 @@ for cap, color, label in zip(['ciss', 'coss', 'crss'],
         ax.semilogy(sim.ivar, sim.dvar/1e3, color=color, label=label, linewidth=2)
     except:
         pass
+# Fit overlay
+vds_cv = np.linspace(0, 25, 50)
+for cap, color in zip(['ciss', 'coss', 'crss'], ['b', 'r', 'g']):
+    c_fit = predict_cv(fitted_model_dict, vds_cv, cap_type=cap) / 1e3  # to nF
+    ax.semilogy(vds_cv, c_fit, color=color, linestyle='--', linewidth=1.5, alpha=0.6)
 ax.set_xlabel('Vds (V)')
 ax.set_ylabel('Capacitance (nF)  [log]')
 ax.set_title('C-V @ 1MHz  [log]')
@@ -140,6 +225,10 @@ for temp, color in zip([-55, 25, 150], ['b', 'r', 'g']):
             ax.semilogy(sim.ivar[mask], sim.dvar[mask], color=color, label=f'T={temp}°C', linewidth=1.5)
     except:
         pass
+# Fit overlay (T=25C only)
+vsd_fit = np.linspace(0.01, 1.3, 50)
+is_fit = predict_diode(fitted_model_dict, vsd_fit)
+ax.semilogy(vsd_fit, is_fit, 'r--', linewidth=2, alpha=0.6)
 ax.set_xlabel('|Vsd| (V)')
 ax.set_ylabel('|Is| (A)  [log]')
 ax.set_title('Body Diode If-Vf  [log]')
