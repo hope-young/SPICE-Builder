@@ -72,19 +72,22 @@ print(f"Qg data: {'available' if HAS_QG else 'NOT available (placeholder)'}")
 
 
 def predict_idvg(model_dict, vgs, vds=0.5):
-    """用 stage.py 简化公式评估 Id-Vg"""
+    """用 stage.py 简化公式评估 Id-Vg (含 mobility degradation)"""
     vth = model_dict.get('VTH0', 3.0)
     n = model_dict.get('NFACTOR', 2.0)
     u0 = model_dict.get('U0', 450)
     vsat = model_dict.get('VSAT', 1e5)
+    ua = model_dict.get('UA', 2e-9)
+    ub = model_dict.get('UB', 5e-17)
     vt = 0.0259
     cox = 6.9e-4
-    w_m, l_m = 0.1, 1e-6  # 100mm × 1um (SGT die)
+    w_m, l_m = 100e-6, 1e-6  # BSIM3 cell: W=100u, L=1u
     mu = u0 * 1e-4
     vov = np.maximum(vgs - vth, 0)
     i0 = (w_m / l_m) * cox * mu * vt**2
     i_sub = i0 * np.exp(np.clip((vgs - vth) / (n * vt), -50, 50))
-    i_sat_full = 0.5 * (w_m / l_m) * cox * mu * vov**2
+    mu_eff = mu / (1.0 + ua * vov + ub * vov**2)
+    i_sat_full = 0.5 * (w_m / l_m) * cox * mu_eff * vov**2
     i_vsat = w_m * cox * vov * vsat
     i_strong = i_sat_full * i_vsat / (i_sat_full + i_vsat + 1e-12)
     alpha = 1.0 / (1.0 + np.exp(-(vgs - vth) / 0.05))
@@ -96,12 +99,15 @@ def predict_idvd(model_dict, vds, vgs=10.0):
     vth = model_dict.get('VTH0', 3.0)
     u0 = model_dict.get('U0', 450)
     vsat = model_dict.get('VSAT', 1e5)
+    ua = model_dict.get('UA', 2e-9)
+    ub = model_dict.get('UB', 5e-17)
     cox = 6.9e-4
-    w_m, l_m = 0.1, 1e-6
+    w_m, l_m = 100e-6, 1e-6  # BSIM3 cell: W=100u, L=1u
     rd = max(model_dict.get('RD', 1e-4) + model_dict.get('RS', 1e-4), 1e-6)
     mu = u0 * 1e-4
     vov = max(vgs - vth, 0)
-    i_sat = (w_m / l_m) * cox * mu * vov * vsat / (vov + vsat * l_m + 1e-9)
+    mu_eff = mu / (1.0 + ua * vov + ub * vov**2)
+    i_sat = (w_m / l_m) * cox * mu_eff * vov * vsat / (vov + vsat * l_m + 1e-9)
     vds_clip = np.minimum(vds, vov)
     i_lin = vov * vds_clip / rd
     i_d = np.where(vds < vov, i_lin, i_sat)
@@ -114,7 +120,7 @@ def predict_cv(model_dict, vds, cap_type='ciss'):
     cgdo = model_dict.get('CGDO', 1e-9)
     cgso = model_dict.get('CGSO', 1e-9)
     cgbo = model_dict.get('CGBO', 1e-10)
-    w_m, l_m = 0.1, 1e-6
+    w_m, l_m = 100e-6, 1e-6  # BSIM3 cell: W=100u, L=1u
     if cap_type == 'ciss': base = (cgdo + cgso) * w_m + cgbo * l_m
     elif cap_type == 'coss': base = cgdo * w_m
     elif cap_type == 'crss': base = cgdo * w_m

@@ -82,7 +82,7 @@ class Stage:
         self._set_params_from_x(x)
         residuals = []
         for sd in self.simdata:
-            fit = self._eval_simple(sd)
+            fit = self._eval(sd)
             if fit is None:
                 # 无法评估，加一个 dummy
                 residuals.append(np.ones(len(sd.ivar)) * 0.1)
@@ -94,7 +94,7 @@ class Stage:
             #   - Id-Vd: 过滤 Vds < 0 的点
             mask = (meas > 1e-9) & np.isfinite(meas) & np.isfinite(fit)
             if sd.curve_type == "IdVg":
-                mask &= sd.ivar >= 1.0  # 跳过 Vgs < 1V （亚阈值以下，简化模型不准）
+                mask &= sd.ivar >= 4.0  # 跳过 Vgs < 4V (亚阈值 + 机台 30mA 下限)
             if sd.curve_type == "IdVd":
                 mask &= sd.ivar >= 0
             if not mask.any():
@@ -107,6 +107,31 @@ class Stage:
         if not residuals:
             return np.array([0.0])
         return np.concatenate(residuals)
+
+    def _eval(self, sd: SimData) -> Optional[np.ndarray]:
+        """评估拟合曲线 (LTspice 优先，否则用简化 model)"""
+        if self.simulator is not None:
+            return self._eval_ltspice(sd)
+        return self._eval_simple(sd)
+
+    def _eval_ltspice(self, sd: SimData) -> Optional[np.ndarray]:
+        """用 LTspice evaluator 评估曲线"""
+        try:
+            if sd.curve_type == "IdVg":
+                vds = sd.metadata.get('vds_v', 5.0)
+                return self.simulator.eval_idvg(self.model, sd.ivar, vds=vds)
+            elif sd.curve_type == "IdVd":
+                vgs = sd.metadata.get('vgs_v', 10.0)
+                return self.simulator.eval_idvd(self.model, sd.ivar, vgs=vgs)
+            elif sd.curve_type == "CvVds":
+                return self.simulator.eval_cv(self.model, sd.ivar)
+            # Diode 暂用简化 (LTspice diode 仿真另需模型)
+            elif sd.curve_type == "IsVsd":
+                return self._eval_diode_simple(sd)
+        except Exception as e:
+            if self.simulator.verbose:
+                print(f"[stage {self.name}] LTspice eval error: {e}")
+        return self._eval_simple(sd)
 
     def _eval_simple(self, sd: SimData) -> Optional[np.ndarray]:
         """简化版 BSIM3 评估器（Phase 1 用，Phase 2 替换为 LTspice）
@@ -125,7 +150,7 @@ class Stage:
         return None
 
     def _eval_idvg_simple(self, sd: SimData) -> np.ndarray:
-        """简化 Id-Vg 评估（使用正确 BSIM3-like 公式）
+        """简化 Id-Vg 评估（使用正确 BSIM3-like 公式，含 mobility degradation）
 
         注: 100V/100A SGT MOSFET 典型 die 参数:
           - 总沟道宽度 W ~ 100mm = 0.1m
@@ -137,9 +162,11 @@ class Stage:
         n = self.model.get("NFACTOR")
         u0_cm2 = self.model.get("U0")  # cm²/Vs
         vsat = self.model.get("VSAT")  # m/s
+        ua = self.model.get("UA")  # mobility degradation 1
+        ub = self.model.get("UB")  # mobility degradation 2
         vt = 0.0259  # 26 mV @ 25°C
         cox = 6.9e-4  # F/m² (TOX=50nm)
-        w_m = 0.1     # 总沟道宽度 0.1m = 100mm (100V/100A SGT die)
+        w_m = 4.0  # 4m = 40000 cells × 100um (full die沟道总宽)
         l_m = 1e-6    # 沟道长度 1um
         mu = u0_cm2 * 1e-4  # 转换为 m²/Vs
 
@@ -147,16 +174,17 @@ class Stage:
 
         # 亚阈值电流 (指数区)
         # Id_sub = I0 * exp((Vgs-Vth) / (n·Vt))
-        # I0 ≈ μ·Cox·(W/L)·Vt²
         i0 = (w_m / l_m) * cox * mu * vt**2
         i_sub = i0 * np.exp(np.clip((vgs - vth) / (n * vt), -50, 50))
 
-        # 强反型（饱和 + vsat 限制）
-        # Id_sat_full = 0.5 · μ · Cox · (W/L) · vov²
+        # 强反型（饱和 + vsat 限制 + mobility degradation）
+        # mobility: mu_eff = u0 / (1 + UA·vov + UB·vov²)
+        mu_eff = mu / (1.0 + ua * vov + ub * vov**2)
+        # Id_sat_full = 0.5 · mu_eff · Cox · (W/L) · vov²
+        i_sat_full = 0.5 * (w_m / l_m) * cox * mu_eff * vov**2
         # Id_vsat = W · Cox · vov · vsat
-        # Id = 1 / (1/Id_sat + 1/Id_vsat) （vsat-limited）
-        i_sat_full = 0.5 * (w_m / l_m) * cox * mu * vov**2
         i_vsat = w_m * cox * vov * vsat
+        # Id = 1 / (1/Id_sat + 1/Id_vsat) （vsat-limited）
         i_strong = i_sat_full * i_vsat / (i_sat_full + i_vsat + 1e-12)
 
         # 平滑过渡 (sigmoid 在 Vth 附近)
@@ -165,19 +193,23 @@ class Stage:
         return np.maximum(i_d, 1e-15)
 
     def _eval_idvd_simple(self, sd: SimData) -> np.ndarray:
-        """简化 Id-Vd 评估（与 _eval_idvg_simple 同样的 w_m, l_m）"""
+        """简化 Id-Vd 评估（含 mobility degradation）"""
         vds = sd.ivar
         vgs_v = sd.metadata.get('vgs_v', 5.0)
         vth = self.model.get("VTH0")
         cox = 6.9e-4
         vsat = self.model.get("VSAT")
-        w_m = 0.1  # 与 Id-Vg 一致
+        ua = self.model.get("UA")
+        ub = self.model.get("UB")
+        w_m = 4.0  # 4m = 40000 cells × 100um (full die沟道总宽)
         l_m = 1e-6
         u0_cm2 = self.model.get("U0")
         mu = u0_cm2 * 1e-4
         vov = max(vgs_v - vth, 0)
+        # mobility degradation
+        mu_eff = mu / (1.0 + ua * vov + ub * vov**2)
         # 饱和电流 (vsat-limited)
-        i_sat = w_m * cox * vov * vsat / (vov + vsat * l_m + 1e-9)
+        i_sat = w_m * cox * mu_eff * vov * vsat / (vov + vsat * l_m + 1e-9)
         # 线性区
         rdson = max(self.model.get("RD") + self.model.get("RS"), 1e-6)
         vds_clip = np.minimum(vds, vov)
@@ -195,7 +227,7 @@ class Stage:
         cgdo = self.model.get("CGDO")  # F/m
         cgso = self.model.get("CGSO")
         cgbo = self.model.get("CGBO")
-        w_m = 0.1  # 与 Id-Vg/Id-Vd 一致
+        w_m = 4.0  # 4m = 40000 cells × 100um (full die沟道总宽)
         l_m = 1e-6
         # 单位: CGDO (F/m) × W (m) = 寄生电容
         if cap_type == 'ciss':
@@ -240,7 +272,7 @@ class Stage:
 
         # 把拟合结果存到 simdata
         for sd in self.simdata:
-            fit = self._eval_simple(sd)
+            fit = self._eval(sd)
             if fit is not None:
                 sd.set_fit(fit)
 

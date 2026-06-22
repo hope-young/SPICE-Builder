@@ -87,16 +87,19 @@ class LTspiceBackend:
     def run_netlist_text(self,
                          netlist: str,
                          timeout_s: int = 60,
-                         output_dir: Optional[Path] = None) -> SimulationResult:
+                         output_dir: Optional[Path] = None,
+                         cleanup: Optional[bool] = None) -> SimulationResult:
         """运行一段 SPICE netlist 文本
 
         Args:
             netlist: 完整 SPICE netlist 文本
             timeout_s: 超时秒数
             output_dir: 输出目录（None = 临时目录）
+            cleanup: 是否清理临时目录 (None = 用 self.cleanup, 通常 True)
+                   设 False 以保留 .raw 文件供后续 parse_raw 使用
 
         Returns:
-            SimulationResult
+            SimulationResult (含 raw_path 指向 .raw 文件)
         """
         if output_dir is None:
             tmpdir = Path(tempfile.mkdtemp(prefix="spicebuilder_"))
@@ -109,7 +112,9 @@ class LTspiceBackend:
 
         result = self.run(netlist_path, timeout_s=timeout_s)
 
-        if self.cleanup and output_dir is None:
+        # 决定是否清理
+        should_cleanup = cleanup if cleanup is not None else self.cleanup
+        if should_cleanup and output_dir is None:
             try:
                 shutil.rmtree(tmpdir)
             except OSError:

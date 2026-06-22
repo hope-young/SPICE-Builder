@@ -43,7 +43,8 @@ def build_sgt_engine(dataset: SpiceDataSet,
                       optimizer: Optimizer,
                       error_threshold: float = 0.5,
                       max_loops: int = 3,
-                      verbose: bool = True) -> Engine:
+                      verbose: bool = True,
+                      simulator=None) -> Engine:
     """构建 Si SGT 6 阶段提取 pipeline
 
     Args:
@@ -53,6 +54,7 @@ def build_sgt_engine(dataset: SpiceDataSet,
         error_threshold: Engine 收敛阈值（总 RMS < 此值）
         max_loops: 最大外层循环次数
         verbose: 是否打印阶段信息
+        simulator: LTspiceEvaluator 或 None (None=用简化公式)
     """
     stages = []
 
@@ -64,6 +66,7 @@ def build_sgt_engine(dataset: SpiceDataSet,
         param_names=model.get_params_by_stage("S1"),
         model=model,
         error_func="log",
+        simulator=simulator,
     )
     stages.append(s1)
     if verbose:
@@ -78,6 +81,7 @@ def build_sgt_engine(dataset: SpiceDataSet,
         param_names=model.get_params_by_stage("S2"),
         model=model,
         error_func="log",
+        simulator=simulator,
     )
     stages.append(s2)
     if verbose:
@@ -91,6 +95,7 @@ def build_sgt_engine(dataset: SpiceDataSet,
         param_names=model.get_params_by_stage("S3"),
         model=model,
         error_func="log",
+        simulator=simulator,
     )
     stages.append(s3)
     if verbose:
@@ -111,6 +116,7 @@ def build_sgt_engine(dataset: SpiceDataSet,
         param_names=model.get_params_by_stage("S4"),
         model=model,
         error_func="log",
+        simulator=simulator,
     )
     stages.append(s4)
     if verbose:
@@ -134,6 +140,7 @@ def build_sgt_engine(dataset: SpiceDataSet,
         param_names=model.get_params_by_stage("S5"),
         model=model,
         error_func="log",
+        simulator=simulator,
     )
     stages.append(s5)
     if verbose:
@@ -158,6 +165,7 @@ def build_sgt_engine(dataset: SpiceDataSet,
         param_names=model.get_params_by_stage("S6"),
         model=model,
         error_func="linear",
+        simulator=simulator,
     )
     stages.append(s6)
     if verbose:

@@ -65,8 +65,8 @@ def init_from_key_params(model: BSIM3Model, kp: SpiceKeyParams) -> BSIM3Model:
         初始化后的 model（in-place + return）
     """
     # === Threshold (S1) ===
-    # VTH0: datasheet 标称 3.0V, 但实测 100V SGT 实际 2-3V.  设为 2.5
-    model.set_initial("VTH0", 2.5)
+    # VTH0: 让拟合器自己找最优 (target 强反型区 Vov≈0.5-2V)
+    model.set_initial("VTH0", 3.5)
     model.set_initial("K1", 0.5)                       # 体效应系数
     model.set_initial("K2", 0.0)
     model.set_initial("DVT0", 2.2)
@@ -79,9 +79,9 @@ def init_from_key_params(model: BSIM3Model, kp: SpiceKeyParams) -> BSIM3Model:
     model.set_initial("CDSCB", 0.0)
 
     # === Mobility (S3) ===
-    # U0 从 gfs 估算
+    # U0 经验值 (SGT 100V 典型 300 cm²/Vs，约束避免简化公式误判)
     u0_est = _gfs_to_u0(kp.gfs_25c_s)
-    model.set_initial("U0", u0_est)
+    model.set_initial("U0", 300)
     model.set_initial("UA", 2.0e-9)
     model.set_initial("UB", 5.0e-19)
     model.set_initial("UC", 5.0e-11)
@@ -101,10 +101,9 @@ def init_from_key_params(model: BSIM3Model, kp: SpiceKeyParams) -> BSIM3Model:
 
     # === Parasitic Resistance (S4) ===
     # RD + RS ≈ Rds_on(25C) - Rds_on_internal_estimate
-    # 假设 Rds_on 测量值已包含 bond wire + clip，BSIM3 的 RD+RS 是 die-level
-    # 简化: RD = RS = Rds_on_25C * 0.1
+    # 100V/100A SGT: 大部分 Rds 在 die 内, RD ~ RS ~ Rds/4 each
     rdson_total_ohm = kp.rdson_25c_10v_ohm
-    rd_each = rdson_total_ohm * 0.05  # 5% 给 RD, 5% 给 RS, 90% 给沟道
+    rd_each = rdson_total_ohm * 0.25  # 25% 各给 RD/RS, 50% 沟道
     model.set_initial("RD", rd_each)
     model.set_initial("RS", rd_each)
 

@@ -63,7 +63,7 @@ class LibExporter:
         输出示例：
           * SpiceBuilder Export - <part>
           .SUBCKT MY_MOSFET D G S
-          M1 D_int G S S BSIM3_core L=1u W=1u
+          M1 D_int G S S BSIM3_core L=1u W=4e6u
           Rd D D_int 0.001
           Rs S_int S 0.001
           Rgate G_int G 1.6
@@ -96,7 +96,7 @@ class LibExporter:
             f"* Subckt: {subckt_name}",
             "",
             f".SUBCKT {subckt_name} D G S",
-            f"M1 D_int G_int S S BSIM3_core L=1u W=1u",
+            f"M1 D_int G_int S S BSIM3_core L=1u W=4e6u",
         ]
         # Gate resistance (in series with G)
         if rg_ohm > 0:

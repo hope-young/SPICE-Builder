@@ -36,7 +36,7 @@ class BSIM3ParamSpec:
 
 PARAM_SPECS: list[BSIM3ParamSpec] = [
     # === Threshold & Body Effect (S1) ===
-    BSIM3ParamSpec("VTH0",   3.0,    2.0,   4.0,    "V",      "Threshold",     "S1", "零偏阈值电压 @ Vbs=0 (收紧 bounds)"),
+    BSIM3ParamSpec("VTH0",   3.0,    2.0,   5.0,    "V",      "Threshold",     "S1", "零偏阈值电压 @ Vbs=0 (target Vth≈3.5V)"),
     BSIM3ParamSpec("K1",     0.5,    0.0,   2.0,    "V^0.5",  "Threshold",     "S1", "体效应系数一阶"),
     BSIM3ParamSpec("K2",     0.0,   -1.0,   1.0,    "—",      "Threshold",     "S1", "体效应系数二阶"),
     BSIM3ParamSpec("DVT0",   2.2,    0.0,   10.0,   "—",      "Threshold",     "S1", "短沟道 Vth 衰减系数 0"),
@@ -49,13 +49,13 @@ PARAM_SPECS: list[BSIM3ParamSpec] = [
     BSIM3ParamSpec("CDSCB",  0.0,   -1e-2,  1e-2,   "F/m^2",  "Subthreshold",  "S2", "体与沟道耦合电容"),
 
     # === Mobility (S3) ===
-    BSIM3ParamSpec("U0",     450.0,  50.0,  1500.0, "cm^2/Vs","Mobility",      "S3", "低场迁移率（零偏）"),
+    BSIM3ParamSpec("U0",     300.0,  50.0,  800.0, "cm^2/Vs","Mobility",      "S3", "低场迁移率（零偏，约束以防简化公式误判）"),
     BSIM3ParamSpec("UA",     2.0e-9, 0.0,   1e-7,   "m/V",    "Mobility",      "S3", "迁移率一阶退化系数"),
     BSIM3ParamSpec("UB",     5.0e-19,0.0,   1e-16,  "(m/V)^2","Mobility",      "S3", "迁移率二阶退化系数"),
     BSIM3ParamSpec("UC",     5.0e-11,0.0,   1e-9,   "m/V^2",  "Mobility",      "S3", "迁移率体偏系数"),
 
     # === Saturation Velocity (S4) ===
-    BSIM3ParamSpec("VSAT",   1.0e5,  1.0e3, 5.0e5,  "m/s",    "Saturation",    "S4", "饱和载流子速度"),
+    BSIM3ParamSpec("VSAT",   1.0e5,  1.0e3, 2.0e6,  "m/s",    "Saturation",    "S4", "饱和载流子速度 (SGT 可达 1e6+)"),
     BSIM3ParamSpec("A0",     1.0,    0.0,   10.0,   "—",      "Saturation",    "S4", "沟长调制 bulk 偏置系数"),
     BSIM3ParamSpec("AGS",    0.0,   -1.0,   1.0,    "—",      "Saturation",    "S4", "Vsat 栅偏系数"),
     BSIM3ParamSpec("KETA",   0.0,   -1.0,   1.0,    "—",      "Saturation",    "S4", "Vsat 体偏系数"),

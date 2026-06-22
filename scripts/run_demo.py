@@ -13,10 +13,13 @@ SpiceBuilder 端到端 demo。
   7. 对比拟合 vs 实测
 
 用法：
-  python scripts/run_demo.py
+  python scripts/run_demo.py [--ltspice]
+
+  --ltspice  : 用 LTspice 跑 BSIM3 仿真作为拟合评估函数 (慢但准)
 """
 import sys
 import io
+import argparse
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 from pathlib import Path
@@ -28,9 +31,18 @@ from spicebuilder.models.exporter import LibExporter
 from spicebuilder.fitting.optimizer import Optimizer
 from spicebuilder.strategy.sgt_6stage import build_sgt_engine
 from spicebuilder.simulator.ltspice import LTspiceBackend, gen_idvg_netlist
+from spicebuilder.simulator.evaluator import LTspiceEvaluator
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='SpiceBuilder end-to-end demo')
+    parser.add_argument('--ltspice', action='store_true',
+                         help='Use LTspice as evaluator (slow but accurate)')
+    return parser.parse_args()
 
 
 def main():
+    args = parse_args()
     repo_root = Path(__file__).resolve().parent.parent
 
     print("=" * 60)
@@ -91,6 +103,15 @@ def main():
     print(f"  IdVd @Vgs=10V: {idvd.n_points} pts")
 
     # 6. 跑 6 阶段策略
+    simulator = None
+    if args.ltspice:
+        print(f"\n  [LTSPICE MODE] 使用 LTspice 仿真作为评估函数")
+        simulator = LTspiceEvaluator(
+            subckt_name='SDH10N2P1',
+            rg_ohm=ds.key_params.rg_internal_ohm,
+            verbose=False,
+        )
+
     print(f"\n[6/7] Running 6-stage BSIM3 extraction...")
     opt = Optimizer(method='trf')
     opt.set_eps1(1e-2)
@@ -104,6 +125,7 @@ def main():
         error_threshold=10.0,
         max_loops=1,
         verbose=True,
+        simulator=simulator,
     )
     result = engine.run(opt)
     print(f"\n  Overall: success={result.success}, total_rms={result.total_rms:.3f}")
