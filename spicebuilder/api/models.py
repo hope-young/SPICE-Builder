@@ -1,11 +1,21 @@
 """Pydantic models for API requests/responses."""
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 
 
 class LoadProjectRequest(BaseModel):
-    excel_path: str
-    name: Optional[str] = None
+    """Request payload for POST /projects/load."""
+    excel_path: str = Field(..., description="Absolute path to the SDH-format Excel file (must end with .xlsx)")
+    name: Optional[str] = Field(None, description="Optional display name; defaults to device part number")
+
+    @field_validator('excel_path')
+    @classmethod
+    def _excel_path_must_be_xlsx(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError('excel_path is required')
+        if not v.lower().endswith('.xlsx'):
+            raise ValueError(f'excel_path must end with .xlsx, got: {v}')
+        return v
 
 
 class FitOptimizerConfig(BaseModel):
@@ -25,15 +35,34 @@ class FitRequest(BaseModel):
 
 
 class ExportRequest(BaseModel):
-    format: str = "B"  # "A" (pure BSIM3) or "B" (subckt wrapper)
-    output_path: str
-    rg_ohm: float = 1.6
-    rd_ohm: Optional[float] = None
-    rs_ohm: Optional[float] = None
-    include_diode: bool = True
+    """Request payload for POST /projects/{id}/export."""
+    format: str = Field("B", description="A: pure BSIM3 .model, B: .subckt wrapper")
+    output_path: str = Field(..., description="Absolute output file path (must end with .lib)")
+    rg_ohm: float = Field(1.6, description="Gate resistance in Ohms")
+    rd_ohm: Optional[float] = Field(None, description="Override RD in Ohms (None = use fitted)")
+    rs_ohm: Optional[float] = Field(None, description="Override RS in Ohms (None = use fitted)")
+    include_diode: bool = Field(True, description="Include body diode subcircuit")
+
+    @field_validator('format')
+    @classmethod
+    def _format_must_be_known(cls, v: str) -> str:
+        u = v.upper()
+        if u not in ('A', 'B'):
+            raise ValueError(f'format must be A or B, got: {v}')
+        return u
+
+    @field_validator('output_path')
+    @classmethod
+    def _output_path_must_be_lib(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError('output_path is required')
+        if not v.lower().endswith('.lib'):
+            raise ValueError(f'output_path must end with .lib, got: {v}')
+        return v
 
 
 class HealthResponse(BaseModel):
+    """Response payload for GET /health."""
     status: str
     version: str
     n_projects: int
@@ -53,7 +82,6 @@ class FitResponse(BaseModel):
     project_id: str
     status: str  # "queued" / "running" / "completed" / "failed"
     message: str = ""
-
 
 class TaskInfo(BaseModel):
     id: str
