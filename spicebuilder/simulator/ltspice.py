@@ -162,7 +162,10 @@ class LTspiceBackend:
                 error=f"Timeout after {timeout_s}s",
                 elapsed_s=time.time() - start,
             )
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
+            # Subprocess / OS-level failure only.  Let other exceptions
+            # (TypeError, ValueError, KeyboardInterrupt, ...) propagate so
+            # code-level bugs are not masked as simulation errors.
             return SimulationResult(
                 success=False,
                 error=str(e),
