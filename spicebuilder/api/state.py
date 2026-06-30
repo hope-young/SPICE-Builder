@@ -32,9 +32,17 @@ class Task:
     asyncio_task: "Optional[asyncio.Task]" = None
 
 
+@dataclass
 class State:
-    projects: Dict[str, Project] = {}
-    tasks: Dict[str, Task] = {}
+    """Process-wide state for the SpiceBuilder API.
+
+    Note: previously State had class-level mutable defaults (`projects = {}`)
+    which is a Python anti-pattern: every State instance would share the
+    same dict.  Use a dataclass with default_factory so each instance
+    owns its own dict.
+    """
+    projects: Dict[str, Project] = field(default_factory=dict)
+    tasks: Dict[str, Task] = field(default_factory=dict)
 
 
 state = State()
