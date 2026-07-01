@@ -93,11 +93,17 @@ class Stage:
             meas = sd.dvar
             # 物理 mask:
             #   - meas > 1e-9 （避免 log(0)）
-            #   - Id-Vg: 过滤 Vgs < 0.5V 的 OFF 状态点（工程师不关心）
+            #   - Id-Vg: 动态 Vgs 下限（从 metadata 读取，per-stage 定制）
             #   - Id-Vd: 过滤 Vds < 0 的点
             mask = (meas > 1e-9) & np.isfinite(meas) & np.isfinite(fit)
+
+            # Id-Vg 动态 Vgs 下限（per-stage 定制，通过 metadata 传递）
             if sd.curve_type == "IdVg":
-                mask &= sd.ivar >= 4.0  # 跳过 Vgs < 4V (亚阈值 + 机台 30mA 下限)
+                vgs_min = sd.metadata.get("vgs_floor_v")
+                if vgs_min is not None:
+                    mask &= sd.ivar >= vgs_min
+
+            # Id-Vd 基础物理 mask
             if sd.curve_type == "IdVd":
                 mask &= sd.ivar >= 0
             if not mask.any():

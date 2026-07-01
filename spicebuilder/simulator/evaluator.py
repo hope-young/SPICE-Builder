@@ -61,7 +61,7 @@ class LTspiceEvaluator:
         vals = []
         for k in keys:
             try:
-                vals.append(f"{k}={model.get(k):.6g}")
+                vals.append(f"{k}={model.get(k):.12g}")  # 提高精度 6g → 12g，避免缓存键冲突
             except (KeyError, ValueError):
                 pass
         s = scenario + "|" + "|".join(vals)
@@ -94,7 +94,7 @@ class LTspiceEvaluator:
             |Id| 数组 (A)，与 vgs_arr 同长度
         """
         import time
-        key = self._param_hash(model, f"idvg_vds{vds}", ivar)
+        key = self._param_hash(model, f"idvg_vds{vds}", vgs_arr)
         if key in self.cache:
             self.stats["cache_hits"] += 1
             return self.cache[key]

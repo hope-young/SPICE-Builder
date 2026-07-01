@@ -34,11 +34,11 @@ class Optimizer:
 
     def __init__(self, method: str = "trf"):
         self.method = method
-        # 容差
-        self.eps1: float = 1e-3   # ftol
-        self.eps2: float = 1e-3   # xtol
-        self.eps3: float = 1e-3   # gtol
-        self.max_iter: int = 1000
+        # 容差（降低以允许更充分的优化）
+        self.eps1: float = 1e-6   # ftol（函数值变化容差）
+        self.eps2: float = 1e-6   # xtol（参数变化容差）
+        self.eps3: float = 1e-6   # gtol（梯度容差，关键）
+        self.max_iter: int = 200  # 增加迭代上限
         # 并行
         self.parallel_jobs: int = 1
 
@@ -88,7 +88,7 @@ class Optimizer:
                 xtol=self.eps2,
                 gtol=self.eps3,
                 max_nfev=self.max_iter * max(1, len(x0)),
-                diff_step=1e-7,
+                diff_step=1e-4,  # 相对步长，对于 VTH0=3.5 → 步长 0.35mV（适配 LTspice 数值精度）
             )
             rms = float(np.sqrt(np.mean(r.fun ** 2)))
             return OptimizeResult(

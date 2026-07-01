@@ -55,7 +55,7 @@ PARAM_SPECS: list[BSIM3ParamSpec] = [
     BSIM3ParamSpec("UC",     5.0e-11,0.0,   1e-9,   "m/V^2",  "Mobility",      "S3", "迁移率体偏系数"),
 
     # === Saturation Velocity (S4) ===
-    BSIM3ParamSpec("VSAT",   1.0e5,  1.0e3, 2.0e6,  "m/s",    "Saturation",    "S4", "饱和载流子速度 (SGT 可达 1e6+)"),
+    BSIM3ParamSpec("VSAT",   1.0e5,  5.0e4, 2.0e6,  "m/s",    "Saturation",    "S4", "饱和载流子速度 (SGT 可达 1e6+)"),
     BSIM3ParamSpec("A0",     1.0,    0.0,   10.0,   "—",      "Saturation",    "S4", "沟长调制 bulk 偏置系数"),
     BSIM3ParamSpec("AGS",    0.0,   -1.0,   1.0,    "—",      "Saturation",    "S4", "Vsat 栅偏系数"),
     BSIM3ParamSpec("KETA",   0.0,   -1.0,   1.0,    "—",      "Saturation",    "S4", "Vsat 体偏系数"),
@@ -221,13 +221,13 @@ class BSIM3Model:
             if spec.category == "Diode":
                 continue
             val = self._values[spec.name]
-            # 格式化数值
+            # 格式化数值（提高精度以避免优化器梯度计算问题）
             if val == 0:
                 fmt = "0"
             elif abs(val) < 1e-3 or abs(val) > 1e6:
-                fmt = f"{val:.4e}"
+                fmt = f"{val:.8e}"  # 科学计数法，8位精度
             else:
-                fmt = f"{val:.4g}"
+                fmt = f"{val:.8g}"  # 普通格式，8位有效数字
             lines.append(f"+{spec.name}={fmt}")
         return "\n".join(lines)
 

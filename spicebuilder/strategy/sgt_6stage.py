@@ -57,7 +57,7 @@ def _resolve_saturation_lo(dataset: SpiceDataSet) -> float:
     sparser high-Vds saturation region.  Anchoring the cut to half
     of vds_max is fragile on short-range sweeps (e.g. SDH10N2P1WC-AA's
     Id-Vd only sweeps to ~5.4V, so vds_max*0.5=2.7V excludes everything).
-    Use the 60th percentile instead so at least ~40% of Vds points
+    Use the 40th percentile instead so at least ~60% of Vds points
     survive the cut regardless of the test sweep range.
     """
     import statistics
@@ -65,7 +65,8 @@ def _resolve_saturation_lo(dataset: SpiceDataSet) -> float:
                 if pt.get("vds_v") is not None]
     if not vds_vals:
         return 2.0
-    return float(statistics.quantiles(vds_vals, n=10, method="inclusive")[5])
+    return float(statistics.quantiles(vds_vals, n=10, method="inclusive")[3])  # 40th percentile
+
 
 
 def build_sgt_engine(dataset: SpiceDataSet,
@@ -100,6 +101,8 @@ def build_sgt_engine(dataset: SpiceDataSet,
     # === S1: Threshold ===
     if "S1" in want:
         s1_sim = SimData.from_idvg(dataset.idvg_vds05, temperature_c=25, vds_v=0.5)
+        # S1 Vgs 下限: 4V（保守策略，避免近阈值区噪声）
+        s1_sim.metadata["vgs_floor_v"] = 4.0
         s1 = Stage(
             name="S1_Threshold",
             simdata=[s1_sim],
@@ -110,31 +113,20 @@ def build_sgt_engine(dataset: SpiceDataSet,
         )
         out.append(s1)
         if verbose:
-            print(f"S1: params={s1.param_names}, data={s1_sim.n_points} pts")
+            print(f"S1: params={s1.param_names}, data={s1_sim.n_points} pts "
+                  f"(Vgs >= {s1_sim.metadata['vgs_floor_v']:.1f}V)")
 
-    # === S2: Subthreshold (亚阈值段单独 mask) ===
-    if "S2" in want:
-        s2_sim_full = SimData.from_idvg(dataset.idvg_vds05, temperature_c=25, vds_v=0.5)
-        # mask with dynamic threshold (vth_typ - 0.5V) so subthreshold
-        # coverage adapts to the device; the previous fixed 3.5V cut
-        # masked away almost all data on real devices (vth ~3.0V).
-        s2_sim = s2_sim_full.filter("lt", s2_threshold_v, dtype="ivar")
-        s2 = Stage(
-            name="S2_Subthreshold",
-            simdata=[s2_sim],
-            param_names=model.get_params_by_stage("S2"),
-            model=model,
-            error_func="log",
-            simulator=simulator,
-        )
-        out.append(s2)
-        if verbose:
-            print(f"S2: params={s2.param_names}, data={s2_sim.n_points} pts "
-                  f"(mask: Vgs < {s2_threshold_v:.2f}V)")
+    # === S2: Subthreshold (禁用 - 数据无效) ===
+    # 注释原因：数据集中 Vgs < 2.5V 的所有点电流都在 23-36 mA（仪器下限噪声），
+    # 不是真正的亚阈值电流（应为 µA 量级），无法用于 NFACTOR 参数拟合。
+    # if "S2" in want:
+    #     ...
 
     # === S3: Linear Mobility ===
     if "S3" in want:
         s3_sim = SimData.from_idvg(dataset.idvg_vds5, temperature_c=25, vds_v=5.0)
+        # S3 Vgs 下限: 4V（保守策略）
+        s3_sim.metadata["vgs_floor_v"] = 4.0
         s3 = Stage(
             name="S3_LinearMobility",
             simdata=[s3_sim],
@@ -145,7 +137,8 @@ def build_sgt_engine(dataset: SpiceDataSet,
         )
         out.append(s3)
         if verbose:
-            print(f"S3: params={s3.param_names}, data={s3_sim.n_points} pts")
+            print(f"S3: params={s3.param_names}, data={s3_sim.n_points} pts "
+                  f"(Vgs >= {s3_sim.metadata['vgs_floor_v']:.1f}V)")
 
     # === S4: Saturation ===
     if "S4" in want:
@@ -176,7 +169,7 @@ def build_sgt_engine(dataset: SpiceDataSet,
             try:
                 sd = SimData.from_idvd(dataset.idvd, vgs_v=vgs, temperature_c=25)
                 if sd.n_points > 0:
-                    # dynamic saturation cut: Vds > max/2 (clamped to 2V floor)
+                    # dynamic saturation cut: Vds > 40th percentile
                     sd_sat = sd.filter("gt", s5_saturation_v, dtype="ivar")
                     if sd_sat.n_points > 0:
                         s5_sims.append(sd_sat)
