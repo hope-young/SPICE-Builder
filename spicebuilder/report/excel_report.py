@@ -28,6 +28,10 @@ import numpy as np
 import openpyxl
 import re
 from openpyxl.cell import MergedCell
+from openpyxl.chart import ScatterChart, Reference, Series
+from openpyxl.chart.marker import Marker
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.layout import Layout, ManualLayout
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
@@ -96,6 +100,75 @@ def _auto_column_width(ws: Worksheet, min_width: int = 12, max_width: int = 28):
                 longest = n
         if col_letter:
             ws.column_dimensions[col_letter].width = max(min_width, min(longest + 2, max_width))
+
+
+def _add_curve_chart(
+    ws: Worksheet,
+    *,
+    ivar_col: int,
+    dvar_col: int,
+    fit_col: Optional[int],
+    row_start: int,
+    row_end: int,
+    anchor: str,
+    title: str,
+    x_label: str,
+    y_label: str,
+    log_y: bool = True,
+) -> None:
+    """Insert an Excel-native scatter chart comparing measured vs SPICE fit.
+
+    Args:
+        ws: the worksheet to attach the chart to.
+        ivar_col / dvar_col / fit_col: 1-based column indices for
+            the X axis, measured Y, and fitted Y respectively.
+        row_start: first data row (after header).  Header is row_start - 1.
+        row_end: last data row.
+        anchor: top-left cell where the chart sits (e.g. "J4").
+        log_y: emit log10 axis for current/voltage values that span
+            decades (Id-Vg/Id-Vd/C-V/Is-Vsd all want this).
+    """
+    chart = ScatterChart()
+    chart.title = title
+    chart.x_axis.title = x_label
+    chart.y_axis.title = y_label
+    chart.legend.position = "r"   # legend on the right
+    chart.width = 18
+    chart.height = 10
+    chart.style = 13                # light grid, coloured series
+
+    x_values = Reference(ws,
+                         min_col=ivar_col, max_col=ivar_col,
+                         min_row=row_start, max_row=row_end)
+
+    y_meas = Reference(ws,
+                       min_col=dvar_col, max_col=dvar_col,
+                       min_row=row_start, max_row=row_end)
+    s_meas = Series(y_meas, x_values, title="Measured")
+    s_meas.marker = Marker(symbol="circle", size=7)
+    chart.series.append(s_meas)
+
+    if fit_col is not None:
+        y_fit = Reference(ws,
+                          min_col=fit_col, max_col=fit_col,
+                          min_row=row_start, max_row=row_end)
+        s_fit = Series(y_fit, x_values, title="SPICE Fit")
+        s_fit.marker = Marker(symbol="diamond", size=5)
+        # Draw the fit as a connected line by giving its series
+        # an explicit GraphicalProperties with a solid line + noFill=False.
+        gp = GraphicalProperties(solidFill="C00000")
+        gp.line.solidFill = "C00000"
+        gp.line.width = 12700  # 1 pt
+        s_fit.graphicalProperties = gp
+        chart.series.append(s_fit)
+
+    # Log y axis so currents spanning 9 decades are legible.
+    if log_y:
+        from openpyxl.chart.axis import Scaling
+        chart.x_axis.scaling.logBase = 10
+        chart.y_axis.scaling.logBase = 10
+
+    ws.add_chart(chart, anchor)
 
 
 def _fmt_eng(v: Any) -> str:
@@ -318,6 +391,19 @@ def _build_idvg_sheet(ws: Worksheet, *, title: str, conditions: str,
         r2c.font = r2_font
         r2c.fill = r2_fill
 
+    # Append an Excel-native scatter chart comparing Measured vs SPICE Fit.
+    if n > 0:
+        _add_curve_chart(
+            ws,
+            ivar_col=2, dvar_col=3, fit_col=(4 if has_fit else None),
+            row_start=6, row_end=5 + n,
+            anchor="J5",
+            title=f"{title}: measured vs SPICE",
+            x_label="Vgs (V)",
+            y_label="Id (A)",
+            log_y=True,
+        )
+
     _auto_column_width(ws, min_width=12, max_width=22)
 
 
@@ -376,6 +462,19 @@ def _build_idvd_sheet(ws: Worksheet, ivar: Sequence[float], dvar: Sequence[float
         r2_fill, r2_font = _r2_cell_color(r2)
         r2c.font = r2_font
         r2c.fill = r2_fill
+
+    n = len(ivar)
+    if n > 0:
+        _add_curve_chart(
+            ws,
+            ivar_col=2, dvar_col=3, fit_col=(4 if has_fit else None),
+            row_start=6, row_end=5 + n,
+            anchor="J5",
+            title="Id-Vd: measured vs SPICE",
+            x_label="Vds (V)",
+            y_label="Id (A)",
+            log_y=True,
+        )
 
     _auto_column_width(ws, min_width=12, max_width=22)
 
@@ -650,6 +749,19 @@ def _build_generic_curve_sheet(ws: Worksheet, *,
         r2_fill, r2_font = _r2_cell_color(r2)
         r2c.font = r2_font
         r2c.fill = r2_fill
+
+    n = len(ivar)
+    if n > 0:
+        _add_curve_chart(
+            ws,
+            ivar_col=2, dvar_col=3, fit_col=(4 if has_fit else None),
+            row_start=6, row_end=5 + n,
+            anchor="J5",
+            title=f"{title}: measured vs SPICE",
+            x_label=x_label,
+            y_label=y_label,
+            log_y=True,
+        )
 
     _auto_column_width(ws, min_width=12, max_width=22)
 

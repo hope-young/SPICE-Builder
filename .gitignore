@@ -39,6 +39,12 @@ datademo/inspect/*.txt
 *.sub
 *.asy
 lt*.tmp
+# Generated fit reports live at the repo root for visibility but are
+# ephemeral output, not source.
+__FIT_REPORT__*.xlsx
+__FIT_LIB__*.lib
+~$*.xlsx
+~$*.docx
 src/styles/index.css
 node_modules/
 src-tauri/target/
