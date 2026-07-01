@@ -7,16 +7,6 @@
 
 ## ⚡ Quick start (dev mode, **REAL-TIME PREVIEW**)
 
-**Double-click this file**:
-```
-E:\AICoding\SpiceBuilder\dev.bat
-```
-
-This starts:
-1. Python FastAPI backend (port 8000, in a new window)
-2. Vite + Tauri dev mode (port 1420, opens GUI window)
-3. **Edit any `.tsx` file → GUI auto-refreshes in < 1 second**
-4. Edit any Python file → Ctrl+C the API window, re-run
 
 ### Dev mode workflow
 
