@@ -156,6 +156,64 @@ export async function runFitting(
   return resp.body;
 }
 
+/** Fire a fit task and immediately return its task_id.
+
+    Add this to the front of a polling loop instead of awaiting the full
+    fit.  Returns: { task_id, status: "queued" }.
+*/
+export async function startFitting(
+  projectId: string,
+  useLtspice: boolean = false,
+  maxLoops: number = 1,
+): Promise<{ task_id: string; status: string; message?: string }> {
+  const resp = await cmd<{
+    status: number; ok: boolean;
+    body: { task_id: string; status: string; message?: string };
+    error?: string;
+  }>("call_api", {
+    method: "POST",
+    endpoint: `/api/projects/${projectId}/fit`,
+    body: {
+      stages: ["S1", "S2", "S3", "S4", "S5", "S6"],
+      max_loops: maxLoops,
+      error_threshold: 1.0,
+      optimizer: {
+        method: "trf", eps1: 1e-3, eps2: 1e-3, eps3: 1e-3,
+        max_iter: 30, parallel_jobs: 1,
+      },
+    },
+  });
+  if (!resp.ok) {
+    throw new Error(`startFitting failed: ${resp.status} ${resp.error || ""}`);
+  }
+  return resp.body;
+}
+
+/** Poll task status. Returns TaskInfo with progress (0..1) + status. */
+export async function pollFitTask(
+  taskId: string,
+): Promise<{
+  id: string;
+  status: string;
+  progress: number;
+  result: FittingResult;
+  error: string;
+  created_at: string;
+}> {
+  const resp = await cmd<{
+    status: number; ok: boolean;
+    body: any;
+    error?: string;
+  }>("call_api", {
+    method: "GET",
+    endpoint: `/api/tasks/${taskId}`,
+  });
+  if (!resp.ok) {
+    throw new Error(`pollFitTask failed: ${resp.status} ${resp.error || ""}`);
+  }
+  return resp.body;
+}
+
 /** 导出 .lib */
 export async function exportLib(
   projectId: string,

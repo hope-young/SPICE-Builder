@@ -26,10 +26,10 @@ const STAGE_DEFS = [
 ];
 
 export function FittingPipeline() {
-  const { projectId, fitResult, runFit, logs, backendRunning, setLog } = useApp();
+  const { projectId, fitResult, fitProgress, fitProgressStatus,
+          runFit, logs, backendRunning, setLog } = useApp();
   const [running, setRunning] = useState(false);
   const [useLtspice, setUseLtspice] = useState(false);
-  const [stage, setStage] = useState<string>("S1");
   const logRef = useRef<HTMLDivElement>(null);
 
   // 自动滚到 log 末尾
@@ -49,15 +49,9 @@ export function FittingPipeline() {
       return;
     }
     setRunning(true);
-    setStage("S1");
     try {
-      // 模拟逐步显示 stage 进度（实际后端一次性跑完）
-      for (const s of STAGE_DEFS) {
-        setStage(s.id);
-        await new Promise((r) => setTimeout(r, 100));  // 让 UI 有机会更新
-      }
+      // runFit now polls task.progress on its own; it resolves when done.
       await runFit(useLtspice);
-      setStage("DONE");
     } catch (e: any) {
       setLog("error", e.message);
     } finally {
@@ -67,15 +61,32 @@ export function FittingPipeline() {
 
   const onStop = () => {
     setRunning(false);
-    setLog("warn", "Fit stopped by user");
+    setLog("warn", "Fit stopped by user (the backend task may still run to completion)");
   };
 
-  // 计算 stage status from fitResult
+  // Map fitProgress (0..1) to the active stage index.  Stages span:
+  //   S1 [0.05-0.20)   S2 [0.20-0.35)   S3 [0.35-0.50)
+  //   S4 [0.50-0.65)   S5 [0.65-0.80)   S6 [0.80-1.00)
+  const STAGE_BANDS: [number, number][] = [
+    [0.05, 0.20], [0.20, 0.35], [0.35, 0.50],
+    [0.50, 0.65], [0.65, 0.80], [0.80, 1.00],
+  ];
+  const activeStageIdx = (() => {
+    if (!running || fitProgress === null) return -1;
+    for (let i = 0; i < STAGE_BANDS.length; i++) {
+      const [lo, hi] = STAGE_BANDS[i];
+      if (fitProgress >= lo && fitProgress < hi) return i;
+    }
+    return STAGE_BANDS.length - 1;
+  })();
+  const activeStageId = activeStageIdx >= 0 ? STAGE_DEFS[activeStageIdx].id : null;
+
+  // 计算 stage status from fitResult + running state
   const getStageStatus = (stageId: string): StageStatus => {
-    if (!fitResult) return "pending";
-    if (running && stage === stageId) return "running";
-    if (running) return "pending";
-    const sr = fitResult.stage_results?.find((s) => s.stage_name.startsWith(stageId));
+    if (!fitResult && !running) return "pending";
+    if (running && activeStageId === stageId) return "running";
+    if (running && activeStageIdx >= 0 && STAGE_DEFS[activeStageIdx].id === stageId) return "running";
+    const sr = fitResult?.stage_results?.find((s) => s.stage_name.startsWith(stageId));
     if (!sr) return "pending";
     return sr.success ? "done" : "error";
   };
@@ -137,6 +148,29 @@ export function FittingPipeline() {
           );
         })}
       </div>
+
+      {/* Live progress bar driven by store.fitProgress (polled from backend). */}
+      {running && fitProgress !== null && (
+        <Card style={{ marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ fontSize: 12, color: C.muted, minWidth: 110 }}>
+              {fitProgressStatus.toUpperCase() || "RUNNING"}
+              {activeStageId ? ` · ${activeStageId}` : ""}
+            </div>
+            <div style={{ flex: 1, height: 8, background: "#eee", borderRadius: 4, overflow: "hidden" }}>
+              <div style={{
+                width: `${Math.round(fitProgress * 100)}%`,
+                height: "100%",
+                background: "linear-gradient(90deg, #0d99ff, #14ae5c)",
+                transition: "width 0.4s ease",
+              }} />
+            </div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: C.text, minWidth: 40, textAlign: "right" }}>
+              {Math.round(fitProgress * 100)}%
+            </div>
+          </div>
+        </Card>
+      )}
 
       {/* Total RMS Banner */}
       {fitResult && (
