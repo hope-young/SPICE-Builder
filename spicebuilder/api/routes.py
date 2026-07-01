@@ -22,6 +22,7 @@ from spicebuilder.models.init_values import init_from_key_params
 from spicebuilder.fitting.optimizer import Optimizer
 from spicebuilder.strategy.sgt_6stage import build_sgt_engine
 from spicebuilder.models.exporter import LibExporter
+from spicebuilder.simulator.evaluator import LTspiceEvaluator
 
 router = APIRouter()
 
@@ -158,12 +159,23 @@ def _run_fit_sync(project: Project, req: FitRequest, task: Task):
 
     # Engine with stage-level progress reporting.
     task.progress = 0.05
+    # Wire an optional LTspice simulator into the engine objective.
+    # A failed attempt (LTspice not installed) is non-fatal: fall back to
+    # the simplified BSIM3 formula objective.  The decision is taken from
+    # the FitRequest so callers (driveby.py, Tauri GUI) can opt out.
+    simulator = None
+    if getattr(req, "use_ltspice", True):
+        try:
+            simulator = LTspiceEvaluator()
+        except Exception as e:
+            print(f"[fit] LTspice unavailable, falling back to built-in formula: {e}")
     engine = build_sgt_engine(
         dataset=ds, model=model, optimizer=opt,
         error_threshold=req.error_threshold,
         max_loops=req.max_loops,
         verbose=False,
         progress_callback=_make_progress_callback(task),
+        simulator=simulator,
     )
 
     result = engine.run(opt)

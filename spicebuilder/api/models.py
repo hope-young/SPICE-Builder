@@ -33,6 +33,7 @@ class FitRequest(BaseModel):
     stages: List[str] = Field(default_factory=lambda: ["S1", "S2", "S3", "S4", "S5", "S6"], description="Subset of BSIM3 stages to run, e.g. ['S1', 'S2']")
     max_loops: int = Field(3, description="Maximum outer-loop iterations across all stages")
     error_threshold: float = Field(10.0, description="Stop if total RMS falls below this threshold")
+    use_ltspice: bool = Field(True, description="Use real LTspice XVII simulator as objective function (falls back to simplified BSIM3 formula if LTspice is not installed)")
     optimizer: FitOptimizerConfig = Field(default_factory=FitOptimizerConfig, description="Optimizer hyperparameters")
 
 

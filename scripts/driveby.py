@@ -82,6 +82,9 @@ def main() -> int:
     p.add_argument("--format", choices=("A", "B"), default="B",
                    help="A: pure BSIM3 .model, B: .subckt wrapper")
     p.add_argument("--rg", type=float, default=1.6, help="Gate resistance in Ohms")
+    p.add_argument("--use-ltspice", dest="use_ltspice",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Use real LTspice simulator as objective (default: enabled, fall back to formula if not installed)")
     p.add_argument("--poll-interval", type=float, default=1.0,
                    help="Seconds between status polls")
     p.add_argument("--timeout", type=float, default=600.0,
@@ -117,6 +120,7 @@ def main() -> int:
                                 "stages": stages,
                                 "max_loops": args.max_loops,
                                 "error_threshold": args.error_threshold,
+                                "use_ltspice": args.use_ltspice,
                                 "optimizer": {
                                     "method": "trf", "eps1": 1e-3,
                                     "eps2": 1e-3, "eps3": 1e-3,
