@@ -370,14 +370,34 @@ def _build_idvg_sheet(ws: Worksheet, *, title: str, conditions: str,
             resid = "n/a"
         ws.cell(row=row, column=1, value=i + 1).font = NORMAL_FONT
         ws.cell(row=row, column=2, value=round(x, 4)).font = NORMAL_FONT
-        ws.cell(row=row, column=3, value=_fmt_eng(m)).font = NORMAL_FONT
-        ws.cell(row=row, column=4, value=(_fmt_eng(f_val) if has_fit else f_val)).font = NORMAL_FONT
-        ws.cell(row=row, column=5,
-                value=round(log_m, 4) if log_m == log_m else "n/a").font = NORMAL_FONT
-        ws.cell(row=row, column=6,
-                value=round(log_f, 4) if isinstance(log_f, float) else log_f).font = NORMAL_FONT
-        ws.cell(row=row, column=7,
-                value=round(resid, 4) if isinstance(resid, float) else resid).font = NORMAL_FONT
+        ws.cell(row=row, column=2).number_format = "0.0000"
+        # Cell 3: Id_measured (numeric so Excel chart can plot it)
+        c3 = ws.cell(row=row, column=3, value=float(m))
+        c3.font = NORMAL_FONT
+        c3.number_format = "0.000e+00"
+        # Cell 4: Id_simulated (numeric when fit present; otherwise placeholder)
+        if has_fit:
+            c4 = ws.cell(row=row, column=4, value=float(f_val))
+            c4.number_format = "0.000e+00"
+        else:
+            ws.cell(row=row, column=4, value=f_val).font = NORMAL_FONT
+        # Cell 5/6: log10 columns (numeric)
+        if isinstance(log_m, float) and log_m == log_m:
+            c5 = ws.cell(row=row, column=5, value=float(log_m))
+            c5.number_format = "0.0000"
+        else:
+            ws.cell(row=row, column=5, value="n/a").font = NORMAL_FONT
+        if isinstance(log_f, float) and log_f == log_f:
+            c6 = ws.cell(row=row, column=6, value=float(log_f))
+            c6.number_format = "0.0000"
+        else:
+            ws.cell(row=row, column=6, value=log_f).font = NORMAL_FONT
+        # Cell 7: |residual| (log)
+        if isinstance(resid, float):
+            c7 = ws.cell(row=row, column=7, value=float(resid))
+            c7.number_format = "0.0000"
+        else:
+            ws.cell(row=row, column=7, value=resid).font = NORMAL_FONT
         row += 1
 
     if has_fit and n > 0:
@@ -443,14 +463,25 @@ def _build_idvd_sheet(ws: Worksheet, ivar: Sequence[float], dvar: Sequence[float
             resid = "n/a"
         ws.cell(row=row, column=1, value="(see sheets for per-Vgs)").font = NORMAL_FONT
         ws.cell(row=row, column=2, value=round(x, 4)).font = NORMAL_FONT
-        ws.cell(row=row, column=3, value=_fmt_eng(m)).font = NORMAL_FONT
-        ws.cell(row=row, column=4, value=(_fmt_eng(f_val) if has_fit else f_val)).font = NORMAL_FONT
-        ws.cell(row=row, column=5,
-                value=round(log_m, 4) if log_m == log_m else "n/a").font = NORMAL_FONT
-        ws.cell(row=row, column=6,
-                value=round(log_f, 4) if isinstance(log_f, float) else log_f).font = NORMAL_FONT
-        ws.cell(row=row, column=7,
-                value=round(resid, 4) if isinstance(resid, float) else resid).font = NORMAL_FONT
+        ws.cell(row=row, column=2).number_format = "0.0000"
+        # Numeric cells (3/4/5/6/7) for chart compatibility.
+        c3 = ws.cell(row=row, column=3, value=float(m)); c3.number_format = "0.000e+00"
+        if has_fit:
+            c4 = ws.cell(row=row, column=4, value=float(f_val)); c4.number_format = "0.000e+00"
+        else:
+            ws.cell(row=row, column=4, value=f_val).font = NORMAL_FONT
+        if isinstance(log_m, float) and log_m == log_m:
+            c5 = ws.cell(row=row, column=5, value=float(log_m)); c5.number_format = "0.0000"
+        else:
+            ws.cell(row=row, column=5, value="n/a").font = NORMAL_FONT
+        if isinstance(log_f, float) and log_f == log_f:
+            c6 = ws.cell(row=row, column=6, value=float(log_f)); c6.number_format = "0.0000"
+        else:
+            ws.cell(row=row, column=6, value=log_f).font = NORMAL_FONT
+        if isinstance(resid, float):
+            c7 = ws.cell(row=row, column=7, value=float(resid)); c7.number_format = "0.0000"
+        else:
+            ws.cell(row=row, column=7, value=resid).font = NORMAL_FONT
         row += 1
 
     if has_fit:
@@ -727,15 +758,19 @@ def _build_generic_curve_sheet(ws: Worksheet, *,
             log_f = None
         ws.cell(row=row, column=1, value=i + 1).font = NORMAL_FONT
         ws.cell(row=row, column=2, value=round(x, 4)).font = NORMAL_FONT
-        ws.cell(row=row, column=3, value=_fmt_eng(m)).font = NORMAL_FONT
-        if has_fit:
-            ws.cell(row=row, column=4, value=_fmt_eng(f_val)).font = NORMAL_FONT
+        ws.cell(row=row, column=2).number_format = "0.0000"
+        # Numeric cells (3/4/5/6) so Excel chart can plot.
+        c3 = ws.cell(row=row, column=3, value=float(m)); c3.number_format = "0.000e+00"
+        if has_fit and f_val is not None:
+            c4 = ws.cell(row=row, column=4, value=float(f_val)); c4.number_format = "0.000e+00"
         else:
             ws.cell(row=row, column=4, value="n/a").font = NORMAL_FONT
-        ws.cell(row=row, column=5,
-                value=round(log_m, 4) if log_m is not None else "n/a").font = NORMAL_FONT
+        if log_m is not None:
+            c5 = ws.cell(row=row, column=5, value=float(log_m)); c5.number_format = "0.0000"
+        else:
+            ws.cell(row=row, column=5, value="n/a").font = NORMAL_FONT
         if log_f is not None:
-            ws.cell(row=row, column=6, value=round(log_f, 4)).font = NORMAL_FONT
+            c6 = ws.cell(row=row, column=6, value=float(log_f)); c6.number_format = "0.0000"
         else:
             ws.cell(row=row, column=6, value="n/a").font = NORMAL_FONT
         row += 1
