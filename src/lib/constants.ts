@@ -181,15 +181,3 @@ export const BSIM3_PARAMS: BSIM3ParamSpec[] = [
   { name: "NGATE", default: 1e20, lower: 1e18, upper: 1e22, unit: "cm^-3", category: "Doping", stage: "S5", description: "Poly gate doping" },
 ];
 
-// Mock 数据用于演示
-export const MOCK_PROJECT = {
-  name: "SDH10N2P1WC-AA",
-  device: "100V N-Channel SGT MOSFET",
-  bvdss: 100,
-  rdson_mohm: 1.85,
-  vth_v: 3.0,
-  id_a: 100,
-  package: "PDFN5x6 (clip)",
-  test_date: "2025-12-18",
-  lot: "P1C6363.007 5#",
-};

@@ -1,10 +1,11 @@
 // Sidebar.tsx - 侧边栏（216px 宽，8 项导航）
 import {
   LayoutDashboard, Database, TrendingUp, Cpu, Sliders,
-  CheckCircle2, Download, Settings, Zap, ChevronRight, FolderOpen
+  CheckCircle2, Download, Settings, Zap, ChevronRight, FolderOpen,
+  Activity
 } from "lucide-react";
 import type { NavSection } from "../../lib/types";
-import { MOCK_PROJECT } from "../../lib/constants";
+import { useApp } from "../../lib/store";
 
 interface NavItem {
   id: NavSection;
@@ -16,8 +17,10 @@ const navItems: NavItem[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "data", label: "Data", icon: Database },
   { id: "curve", label: "Curve", icon: TrendingUp },
+  { id: "singlefit", label: "Single Fit", icon: Activity },
   { id: "model", label: "Model", icon: Cpu },
   { id: "fitting", label: "Fitting", icon: Sliders },
+  { id: "explore", label: "Explore", icon: Zap },
   { id: "validate", label: "Validate", icon: CheckCircle2 },
   { id: "export", label: "Export", icon: Download },
   { id: "settings", label: "Settings", icon: Settings },
@@ -29,6 +32,8 @@ interface SidebarProps {
 }
 
 export function Sidebar({ activeNav, onNavChange }: SidebarProps) {
+  const { projectId, dataset, backendRunning } = useApp();
+  const partNumber = dataset?.device_info?.part_number ?? null;
   return (
     <div
       style={{
@@ -108,7 +113,7 @@ export function Sidebar({ activeNav, onNavChange }: SidebarProps) {
                 whiteSpace: "nowrap",
               }}
             >
-              {MOCK_PROJECT.name}
+              {partNumber ?? (projectId ? `Project ${projectId.slice(0,8)}` : "No project loaded")}
             </div>
           </div>
           <div
@@ -137,7 +142,7 @@ export function Sidebar({ activeNav, onNavChange }: SidebarProps) {
         >
           Workflow
         </div>
-        {navItems.slice(0, 6).map((item) => (
+        {navItems.slice(0, 7).map((item) => (
           <NavItem key={item.id} item={item} active={activeNav === item.id} onClick={() => onNavChange(item.id)} />
         ))}
 
@@ -154,7 +159,7 @@ export function Sidebar({ activeNav, onNavChange }: SidebarProps) {
         >
           Output
         </div>
-        {navItems.slice(6).map((item) => (
+        {navItems.slice(7).map((item) => (
           <NavItem key={item.id} item={item} active={activeNav === item.id} onClick={() => onNavChange(item.id)} />
         ))}
       </nav>
@@ -162,8 +167,10 @@ export function Sidebar({ activeNav, onNavChange }: SidebarProps) {
       {/* Status footer */}
       <div style={{ padding: "10px 12px", borderTop: "1px solid var(--border)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-          <div style={{ width: 6, height: 6, borderRadius: "50%", backgroundColor: "var(--success)" }} />
-          <span style={{ fontSize: 11, color: "var(--success)", fontWeight: 500 }}>LTspice Connected</span>
+        <div style={{ width: 6, height: 6, borderRadius: "50%", backgroundColor: backendRunning ? "var(--success)" : "var(--error)" }} />
+        <span style={{ fontSize: 11, color: backendRunning ? "var(--success)" : "var(--error)", fontWeight: 500 }}>
+          {backendRunning ? "Python backend running" : "Python backend offline"}
+        </span>
         </div>
         <div style={{ fontSize: 10, color: "var(--muted)" }}>Si SGT MOSFET  ·  &lt;200V</div>
       </div>

@@ -1,6 +1,7 @@
 """Pydantic models for API requests/responses."""
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
+from dataclasses import field
 
 
 class LoadProjectRequest(BaseModel):
@@ -94,6 +95,8 @@ class TaskInfo(BaseModel):
     type: str = Field(..., description="Task type: 'fit'")
     status: str = Field(..., description="queued | running | completed | failed")
     progress: float = Field(..., description="0.0 to 1.0 progress within the task")
+    current_stage: str = Field("", description="Name of the most recently entered or completed stage")
+    current_loop: int = Field(0, description="1-based current outer loop index")
     result: Dict[str, Any] = Field(default_factory=dict, description="Populated when status='completed' (total_rms, iterations, stages)")
     error: str = Field("", description="Populated when status='failed'")
     created_at: str = Field(..., description="ISO 8601 timestamp")
@@ -135,6 +138,65 @@ class CurveResponse(BaseModel):
     # missing fit does not 500 the endpoint.
     data: Dict[str, Optional[List[float]]] = Field(..., description="Sweep variable, response columns, and an optional 'fit' (None if no fit has run)")
     metadata: Dict[str, Any] = Field(..., description="Optional metadata: test conditions, units, source")
+
+
+class SimulateRequest(BaseModel):
+    """Request payload for POST /projects/{id}/simulate."""
+    curve_type: Literal["idvg", "idvd"] = Field(..., description="Curve type to simulate")
+    param_overrides: Dict[str, float] = Field(
+        default_factory=dict,
+        description="BSIM3 param name -> value overrides to apply before simulation"
+    )
+    vds: float = Field(5.0, description="Vds bias (V) for Id-Vg sweep")
+    vgs_v: float = Field(10.0, description="Fixed Vgs bias (V) for Id-Vd sweep")
+    vds_max: float = Field(12.0, description="Max Vds (V) for Id-Vd sweep")
+
+
+class SimulateResponse(BaseModel):
+    """Response payload for POST /projects/{id}/simulate."""
+    curve_type: str = Field(..., description="Echo of requested curve type")
+    ivar: List[float] = Field(..., description="Sweep variable values (Vgs for idvg, Vds for idvd)")
+    sim: List[float] = Field(..., description="Simulated Id values (A)")
+    meas: List[float] = Field(..., description="Measured Id values (A), same length as ivar")
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="vds_v, vgs_v, temperature_c, ltspice_available"
+    )
+
+
+class FitSingleRequest(BaseModel):
+    """Request payload for POST /projects/{id}/fit_single."""
+    curve_type: Literal["idvg", "idvd"] = Field(..., description="Curve type to fit")
+    param_names: List[str] = Field(..., description="Parameters to optimize (e.g. ['VTH0', 'U0'])")
+    vmin: float = Field(..., description="Lower bound of fit range")
+    vmax: float = Field(..., description="Upper bound of fit range")
+    vds: float = Field(5.0, description="Vds bias (V) for IdVg")
+    vgs_v: float = Field(10.0, description="Fixed Vgs for IdVd")
+
+
+class FitSingleResponse(BaseModel):
+    """Response payload for POST /projects/{id}/fit_single."""
+    fitted_params: Dict[str, float] = Field(..., description="Optimized values for the requested params")
+    ivar: List[float] = Field(..., description="Full Vgs/Vds grid")
+    sim: List[float] = Field(..., description="Full simulated curve")
+    meas: List[float] = Field(..., description="Measured curve")
+    rms: float = Field(..., description="Root mean square of fit error on interval")
+    r_squared: float = Field(..., description="R² on the fit interval")
+    iterations: int = Field(0)
+    success: bool = True
+
+
+class LoadCsvRequest(BaseModel):
+    """Request payload for POST /projects/{id}/load_csv."""
+    csv_path: str = Field(..., description="Absolute path to the CSV file")
+    curve_type: Literal["idvg", "idvd", "cv", "qg", "body_diode"] = Field("idvg")
+
+
+class LoadCsvResponse(BaseModel):
+    curve_type: str
+    ivar: List[float]
+    dvar: List[float]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class ErrorResponse(BaseModel):

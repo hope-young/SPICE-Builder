@@ -15,21 +15,31 @@ const C = {
   accent: "#e6f4ff", hover: "#f5f5f5",
 };
 
-// 6 阶段定义
-const STAGE_DEFS = [
+// 阶段定义 (top-level)
+const STAGE_DEFS: { id: string; name: string; params: string[] }[] = [
   { id: "S1", name: "Threshold", params: ["VTH0", "K1", "K2", "NFACTOR"] },
   { id: "S2", name: "Subthreshold", params: ["NFACTOR", "CDSCD", "CDSCB"] },
   { id: "S3", name: "Linear Mobility", params: ["U0", "UA", "UB", "UC"] },
   { id: "S4", name: "Saturation", params: ["VSAT", "A0", "AGS", "KETA", "RD", "RS"] },
   { id: "S5", name: "Output Resistance", params: ["PCLM", "PDIBLC1", "DROUT", "PVAG"] },
-  { id: "S6", name: "Capacitance & Diode", params: ["CGSO", "CGDO", "CGBO", "IS", "N", "MJ"] },
+];
+// S6 was a single "Capacitance & Diode" stage; the backend now splits it
+// into 4 sub-stages (S6_Ciss, S6_Coss, S6_Crss, S6_BodyDiode) so the
+// per-cap-type optimizer can run independently.
+const SUB_STAGE_DEFS: { id: string; name: string; params: string[] }[] = [
+  { id: "S6_Ciss", name: "Ciss", params: ["CGSO", "CGDO", "CGBO"] },
+  { id: "S6_Coss", name: "Coss", params: ["CGSO", "CGDO", "CGBO"] },
+  { id: "S6_Crss", name: "Crss", params: ["CGSO", "CGDO", "CGBO"] },
+  { id: "S6_BodyDiode", name: "Body Diode", params: ["IS", "N", "MJ", "MJSW", "PB", "PBSW"] },
 ];
 
 export function FittingPipeline() {
   const { projectId, fitResult, fitProgress, fitProgressStatus,
-          runFit, logs, backendRunning, setLog } = useApp();
+          currentStage, currentLoop,
+          runFit, cancelFit, logs, backendRunning, setLog } = useApp();
   const [running, setRunning] = useState(false);
   const [useLtspice, setUseLtspice] = useState(false);
+  const [maxLoops, setMaxLoops] = useState(3);
   const logRef = useRef<HTMLDivElement>(null);
 
   // 自动滚到 log 末尾
@@ -51,7 +61,7 @@ export function FittingPipeline() {
     setRunning(true);
     try {
       // runFit now polls task.progress on its own; it resolves when done.
-      await runFit(useLtspice);
+      await runFit(useLtspice, maxLoops);
     } catch (e: any) {
       setLog("error", e.message);
     } finally {
@@ -59,28 +69,23 @@ export function FittingPipeline() {
     }
   };
 
-  const onStop = () => {
+  const onStop = async () => {
     setRunning(false);
-    setLog("warn", "Fit stopped by user (the backend task may still run to completion)");
-  };
-
-  // Map fitProgress (0..1) to the active stage index.  Stages span:
-  //   S1 [0.05-0.20)   S2 [0.20-0.35)   S3 [0.35-0.50)
-  //   S4 [0.50-0.65)   S5 [0.65-0.80)   S6 [0.80-1.00)
-  const STAGE_BANDS: [number, number][] = [
-    [0.05, 0.20], [0.20, 0.35], [0.35, 0.50],
-    [0.50, 0.65], [0.65, 0.80], [0.80, 1.00],
-  ];
-  const activeStageIdx = (() => {
-    if (!running || fitProgress === null) return -1;
-    for (let i = 0; i < STAGE_BANDS.length; i++) {
-      const [lo, hi] = STAGE_BANDS[i];
-      if (fitProgress >= lo && fitProgress < hi) return i;
+    try {
+      await cancelFit();
+    } catch (e: any) {
+      setLog("error", `Stop failed: ${e.message}`);
     }
-    return STAGE_BANDS.length - 1;
-  })();
-  const activeStageId = activeStageIdx >= 0 ? STAGE_DEFS[activeStageIdx].id : null;
-
+  };
+  // The backend task now reports the active stage name directly
+  // via currentStage (e.g. "S3_LinearMobility").  The old
+  // STAGE_BANDS hardcoded map went out of sync whenever the
+  // backend skipped a stage (S2 is disabled in sgt_6stage.py),
+  // so we use the explicit string instead.
+  const activeStageId = currentStage ? currentStage.split("_")[0] : null;
+  const activeStageIdx = activeStageId
+    ? STAGE_DEFS.findIndex((d) => d.id === activeStageId)
+    : -1;
   // 计算 stage status from fitResult + running state
   const getStageStatus = (stageId: string): StageStatus => {
     if (!fitResult && !running) return "pending";
@@ -119,6 +124,15 @@ export function FittingPipeline() {
             />
             LTspice (slow but accurate)
           </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.text }}>
+            <span>Loops:</span>
+            <select value={maxLoops} disabled={running} onChange={(e) => setMaxLoops(parseInt(e.target.value, 10))} style={{ padding: "2px 4px", borderRadius: 4, border: "1px solid " + C.border }}>
+              <option value={1}>1</option>
+              <option value={3}>3 (default)</option>
+              <option value={5}>5</option>
+              <option value={10}>10</option>
+            </select>
+          </label>
           {!running ? (
             <Button onClick={onRun} variant="primary">
               <Play size={14} /> Run Fit
@@ -144,6 +158,22 @@ export function FittingPipeline() {
               params={s.params}
               status={status}
               rms={rms}
+            />
+          );
+        })}
+        {SUB_STAGE_DEFS.map((s) => {
+          const status = getStageStatus(s.id);
+          // Sub-stages share RMS display with the parent S6 if it
+          // exists in stage_results (legacy format), else show nothing.
+          const rms = getStageRms("S6");
+          return (
+            <StageCard
+              key={s.id}
+              id={s.id}
+              name={s.name}
+              params={s.params}
+              status={status}
+              rms={status === "running" ? undefined : rms}
             />
           );
         })}

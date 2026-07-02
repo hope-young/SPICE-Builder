@@ -101,8 +101,13 @@ def build_sgt_engine(dataset: SpiceDataSet,
     # === S1: Threshold ===
     if "S1" in want:
         s1_sim = SimData.from_idvg(dataset.idvg_vds05, temperature_c=25, vds_v=0.5)
-        # S1 Vgs 下限: 4V（保守策略，避免近阈值区噪声）
-        s1_sim.metadata["vgs_floor_v"] = 4.0
+        # S1 Vgs 下限: Vth（只拟合超阈值区，避免亚阈值噪声）
+        # 从 key_params 读取 Vth，默认 2.5V
+        vth_25c = getattr(dataset.key_params, "vth_25c_v", 2.5)
+        s1_vgs_floor = max(vth_25c, 2.0)  # 保底 2.0V（防止 Vth 异常）
+        # 物理过滤数据（不仅是 metadata 标记）
+        s1_sim = s1_sim.filter("ge", s1_vgs_floor, dtype="ivar")
+        s1_sim.metadata["vgs_floor_v"] = s1_vgs_floor
         s1 = Stage(
             name="S1_Threshold",
             simdata=[s1_sim],
@@ -114,7 +119,7 @@ def build_sgt_engine(dataset: SpiceDataSet,
         out.append(s1)
         if verbose:
             print(f"S1: params={s1.param_names}, data={s1_sim.n_points} pts "
-                  f"(Vgs >= {s1_sim.metadata['vgs_floor_v']:.1f}V)")
+                  f"(Vgs >= {s1_sim.metadata['vgs_floor_v']:.1f}V, Vth={vth_25c:.2f}V)")
 
     # === S2: Subthreshold (禁用 - 数据无效) ===
     # 注释原因：数据集中 Vgs < 2.5V 的所有点电流都在 23-36 mA（仪器下限噪声），
@@ -125,8 +130,12 @@ def build_sgt_engine(dataset: SpiceDataSet,
     # === S3: Linear Mobility ===
     if "S3" in want:
         s3_sim = SimData.from_idvg(dataset.idvg_vds5, temperature_c=25, vds_v=5.0)
-        # S3 Vgs 下限: 4V（保守策略）
-        s3_sim.metadata["vgs_floor_v"] = 4.0
+        # S3 Vgs 下限: Vth（只拟合超阈值区，跟随实测曲线趋势）
+        vth_25c = getattr(dataset.key_params, "vth_25c_v", 2.5)
+        s3_vgs_floor = max(vth_25c, 2.0)
+        # 物理过滤数据
+        s3_sim = s3_sim.filter("ge", s3_vgs_floor, dtype="ivar")
+        s3_sim.metadata["vgs_floor_v"] = s3_vgs_floor
         s3 = Stage(
             name="S3_LinearMobility",
             simdata=[s3_sim],
@@ -138,7 +147,7 @@ def build_sgt_engine(dataset: SpiceDataSet,
         out.append(s3)
         if verbose:
             print(f"S3: params={s3.param_names}, data={s3_sim.n_points} pts "
-                  f"(Vgs >= {s3_sim.metadata['vgs_floor_v']:.1f}V)")
+                  f"(Vgs >= {s3_sim.metadata['vgs_floor_v']:.1f}V, Vth={vth_25c:.2f}V)")
 
     # === S4: Saturation ===
     if "S4" in want:
@@ -188,32 +197,51 @@ def build_sgt_engine(dataset: SpiceDataSet,
             print(f"S5: params={s5.param_names}, data={sum(s.n_points for s in s5_sims)} pts "
                   f"(mask: Vds > {s5_saturation_v:.2f}V)")
 
-    # === S6: Capacitance & Diode ===
-    if "S6" in want:
-        s6_sims = []
-        for cap in ['ciss', 'coss', 'crss']:
-            try:
-                sd = SimData.from_cv(dataset.cv_vds, cap_type=cap)
-                s6_sims.append(sd)
-            except ValueError:
-                pass
+    # === S6a/b/c: Capacitance (split per cap type) ===
+    # C-V curves share the same BSIM3 overlap-cap params (CGBO,
+    # CGDO, CGSO) so fitting all three together is a 3-equation
+    # / 3-unknown system with strong collinearity and frequent
+    # local minima.  Splitting into per-cap stages lets each
+    # stage optimize its dominant cap parameter and the engine
+    # cycles them across outer loops.  Weights are normalised
+    # inside Stage so each cap type contributes equally.
+    for cap in ['ciss', 'coss', 'crss']:
+        if cap not in want and f"S6_{cap}" not in want:
+            continue
         try:
-            sd_body = SimData.from_body_diode(dataset.body_diode, temperature_c=25)
-            s6_sims.append(sd_body)
+            sd = SimData.from_cv(dataset.cv_vds, cap_type=cap)
         except ValueError:
-            pass
-        s6 = Stage(
-            name="S6_Capacitance_Diode",
-            simdata=s6_sims,
+            continue
+        s_cv = Stage(
+            name=f"S6_{cap.capitalize()}",
+            simdata=[sd],
             param_names=model.get_params_by_stage("S6"),
             model=model,
             error_func="linear",
             simulator=simulator,
         )
-        out.append(s6)
+        out.append(s_cv)
         if verbose:
-            print(f"S6: params={s6.param_names}, data={sum(s.n_points for s in s6_sims)} pts")
+            print(f"S6_{cap}: params={s_cv.param_names}, data={sd.n_points} pts")
 
+    # === S6d: Body Diode ===
+    if "S6" in want:
+        try:
+            sd_body = SimData.from_body_diode(dataset.body_diode, temperature_c=25)
+        except ValueError:
+            sd_body = None
+        if sd_body is not None:
+            s_body = Stage(
+                name="S6_BodyDiode",
+                simdata=[sd_body],
+                param_names=model.get_params_by_stage("S6"),
+                model=model,
+                error_func="linear",
+                simulator=simulator,
+            )
+            out.append(s_body)
+            if verbose:
+                print(f"S6_BodyDiode: params={s_body.param_names}, data={sd_body.n_points} pts")
     return Engine(
         out,
         error_threshold=error_threshold,

@@ -13,7 +13,7 @@
 ```
 dev.bat  (double-click)
   ↓
-  [Window 1] Python API server (port 8000)
+  [Window 1] Python API server (port 8765)
   [Window 2] Tauri dev (Vite + WebView)
   
   ↓ You edit src/app/components/FittingPipeline.tsx
@@ -113,7 +113,7 @@ npm install
 ### Mode 1: `dev.bat` ⭐ **RECOMMENDED for development**
 
 Double-click `dev.bat`. Opens 2 windows:
-- Python API server (port 8000)
+- Python API server (port 8765)
 - Tauri dev window (auto-opens, HMR enabled)
 
 **Edit `.tsx` → GUI auto-refreshes in < 1s.** No rebuild needed.
@@ -152,12 +152,12 @@ User double-clicks .msi, gets Start Menu + Desktop shortcut.
 Start API standalone:
 ```bash
 python -m spicebuilder.api.scripts.run_api
-# http://127.0.0.1:8000
+# http://127.0.0.1:8765
 ```
 
 Test:
 ```bash
-curl http://127.0.0.1:8000/api/health
+curl http://127.0.0.1:8765/api/health
 ```
 
 ---

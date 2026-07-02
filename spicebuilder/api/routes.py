@@ -5,6 +5,7 @@ import asyncio
 import os
 import uuid
 from pathlib import Path
+import numpy as np
 
 from fastapi import APIRouter, HTTPException
 
@@ -13,9 +14,14 @@ from .models import (
     LoadProjectRequest, FitRequest, ExportRequest,
     LoadProjectResponse, FitResponse, TaskInfo, ProjectModelResponse,
     ExportResponse, CurveResponse, ModelParamInfo, HealthResponse,
+    SimulateRequest, SimulateResponse, FitSingleRequest, FitSingleResponse,
+    LoadCsvRequest, LoadCsvResponse,
 )
 
 from spicebuilder.data.loader_sdh import load_sdh_excel
+from spicebuilder.data.loader_csv import (
+    load_idvg_csv, load_idvd_csv, load_cv_csv, load_qg_csv, load_body_diode_csv
+)
 from spicebuilder.data.simdata import SimData
 
 
@@ -76,6 +82,7 @@ def _populate_fit_cache(project, engine) -> None:
 from spicebuilder.models.bsim3 import BSIM3Model, PARAM_SPECS
 from spicebuilder.models.init_values import init_from_key_params
 from spicebuilder.fitting.optimizer import Optimizer
+from spicebuilder.fitting.stage import Stage
 from spicebuilder.strategy.sgt_6stage import build_sgt_engine
 from spicebuilder.models.exporter import LibExporter
 from spicebuilder.simulator.evaluator import LTspiceEvaluator
@@ -178,6 +185,30 @@ def get_project(project_id: str):
     }
 
 
+# Return the full dataset summary for a project.  Used by the GUI when
+# switching between already-loaded projects (e.g. selectProject action)
+# to repopulate the in-memory dataset without re-reading the Excel file.
+# The raw curve arrays are NOT included - the GUI fetches them lazily
+# via /curves/{type} as needed.
+@router.get("/projects/{project_id}/dataset")
+def get_project_dataset(project_id: str):
+    project = state.projects.get(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    ds = project.dataset
+    return {
+        "project_id": project.id,
+        "name": project.name,
+        "device_info": getattr(ds, "device_info", None),
+        "key_params": getattr(ds, "key_params", None),
+        "n_idvg_vds5": len(getattr(ds, "idvg_vds5", []) or []),
+        "n_idvg_vds05": len(getattr(ds, "idvg_vds05", []) or []),
+        "n_idvd": len(getattr(ds, "idvd", []) or []),
+        "n_cv_vds": len(getattr(ds, "cv_vds", []) or []),
+        "n_body_diode": len(getattr(ds, "body_diode", []) or []),
+    }
+
+
 # ============================================================
 #  Fitting - run + task tracking
 # ============================================================
@@ -191,6 +222,12 @@ def _make_progress_callback(task: "Task") -> "callable":
     # Closure captures task; reads total_stages / max_loops from the first
     # callback invocation (subsequent calls ignore different totals).
     def _cb(stage_name, stage_idx, total_stages, status, loop_idx, max_loops):
+        # Always surface the most recent stage name + loop index so the
+        # GUI can render the active stage without inferring from a
+        # progress fraction.  The fraction is only updated on completion
+        # so that polling shows smooth advancement.
+        task.current_stage = stage_name
+        task.current_loop = int(loop_idx) + 1
         if status != "complete":
             return
         total_steps = max(1, total_stages * max_loops)
@@ -278,6 +315,12 @@ async def _fit_task_wrapper(project_id: str, req: FitRequest, task_id: str):
         task.status = "running"
         await loop.run_in_executor(None, _run_fit_sync, project, req, task)
         task.status = "completed"
+    except asyncio.CancelledError:
+        # User-requested cancellation.  Surface the state so the frontend
+        # polling loop can stop without timing out.
+        task.status = "cancelled"
+        task.error = "cancelled by user"
+        task.progress = 1.0
     except Exception as e:
         task.status = "failed"
         task.error = str(e)
@@ -312,6 +355,20 @@ async def start_fit(project_id: str, req: FitRequest):
 
 
 @router.get("/tasks/{task_id}", response_model=TaskInfo)
+@router.post('/tasks/{task_id}/cancel')
+async def cancel_task(task_id: str):
+    task = state.tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, 'Task not found')
+    if task.status in ('completed', 'failed', 'cancelled'):
+        return {'task_id': task_id, 'status': task.status, 'cancelled': False, 'reason': 'task already finished'}
+    aio = getattr(task, 'asyncio_task', None)
+    if aio is not None and not aio.done():
+        aio.cancel()
+    task.status = 'cancelled'
+    task.error = 'cancelled by user'
+    task.progress = 1.0
+    return {'task_id': task_id, 'status': 'cancelled', 'cancelled': True}
 def get_task(task_id: str):
     task = state.tasks.get(task_id)
     if not task:
@@ -320,7 +377,7 @@ def get_task(task_id: str):
         id=task.id,
         type=task.type,
         status=task.status,
-        progress=task.progress,
+        progress=task.progress, current_stage=getattr(task, "current_stage", ""), current_loop=getattr(task, "current_loop", 0),
         result=task.result,
         error=task.error,
         created_at=task.created_at,
@@ -412,6 +469,217 @@ def export_project(project_id: str, req: ExportRequest):
         success=True,
         file_path=str(path.resolve()),
         n_bytes=n_bytes,
+    )
+
+
+# ============================================================
+#  Simulate - real-time curve with parameter overrides
+# ============================================================
+
+@router.post("/projects/{project_id}/simulate", response_model=SimulateResponse)
+def simulate_curve(project_id: str, req: SimulateRequest):
+    """Evaluate Id-Vg or Id-Vd curve with arbitrary parameter overrides.
+
+    This endpoint creates a temporary BSIM3Model, applies param_overrides,
+    then runs LTspice to get the simulated curve — without modifying the
+    project's stored model or triggering a full fit pipeline.
+    """
+    project = state.projects.get(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # Clone the project's model and apply overrides
+    sim_model = BSIM3Model(name=project.model.name)
+    init_from_key_params(sim_model, project.dataset.key_params)
+    # Copy current (possibly fitted) values first
+    for name in project.model._values:
+        try:
+            sim_model.set(name, project.model.get(name))
+        except (KeyError, ValueError):
+            pass
+    # Apply user overrides
+    for name, val in req.param_overrides.items():
+        try:
+            sim_model.set(name, val)
+        except (KeyError, ValueError):
+            pass  # Silently skip unknown params
+
+    ltspice_ok = True
+    try:
+        evaluator = LTspiceEvaluator(subckt_name="SDH10N2P1", rg_ohm=1.6, verbose=False)
+    except Exception:
+        ltspice_ok = False
+        evaluator = None
+
+    metadata = {"ltspice_available": ltspice_ok}
+
+    if req.curve_type == "idvg":
+        # Choose Vgs grid from dataset
+        if req.vds <= 1.0:
+            raw_points = project.dataset.idvg_vds05
+        else:
+            raw_points = project.dataset.idvg_vds5
+
+        if not raw_points:
+            raise HTTPException(400, f"No Id-Vg data for Vds={req.vds}V")
+
+        sd = SimData.from_idvg(raw_points, temperature_c=25, vds_v=req.vds)
+        vgs_grid = sd.ivar.tolist()
+        meas = sd.dvar.tolist()
+        metadata["vds_v"] = req.vds
+        metadata["temperature_c"] = 25
+
+        if ltspice_ok:
+            sim_arr = evaluator.eval_idvg(sim_model, sd.ivar, vds=req.vds)
+            sim = sim_arr.tolist()
+        else:
+            sim = [1e-12] * len(vgs_grid)
+
+    elif req.curve_type == "idvd":
+        if not project.dataset.idvd:
+            raise HTTPException(400, "No Id-Vd data in dataset")
+
+        sd = SimData.from_idvd(project.dataset.idvd, vgs_v=req.vgs_v, temperature_c=25)
+        vds_grid = sd.ivar.tolist()
+        meas = sd.dvar.tolist()
+        metadata["vgs_v"] = req.vgs_v
+        metadata["temperature_c"] = 25
+
+        if ltspice_ok:
+            sim_arr = evaluator.eval_idvd(sim_model, sd.ivar, vgs=req.vgs_v, vds_max=req.vds_max)
+            sim = sim_arr.tolist()
+        else:
+            sim = [1e-12] * len(vds_grid)
+
+    else:
+        raise HTTPException(400, f"Unknown curve_type: {req.curve_type}")
+
+    return SimulateResponse(
+        curve_type=req.curve_type,
+        ivar=vgs_grid if req.curve_type == "idvg" else vds_grid,
+        sim=sim,
+        meas=meas,
+        metadata=metadata,
+    )
+
+
+# ============================================================
+#  Fit single curve (区间拟合)
+# ============================================================
+
+@router.post("/projects/{project_id}/fit_single", response_model=FitSingleResponse)
+def fit_single_curve(project_id: str, req: FitSingleRequest):
+    """在用户选定区间内拟合单条曲线，返回最优参数 + 全段仿真。
+
+    用 LTspice eval_idvg/eval_idvd 作为目标函数，只用 [vmin, vmax] 内残差。
+    """
+    import time as _time
+    project = state.projects.get(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # 取数据
+    if req.curve_type == "idvg":
+        if req.vds <= 1.0:
+            raw = project.dataset.idvg_vds05
+        else:
+            raw = project.dataset.idvg_vds5
+        if not raw:
+            raise HTTPException(400, f"No IdVg data at Vds={req.vds}V")
+        sd_full = SimData.from_idvg(raw, temperature_c=25, vds_v=req.vds)
+        vgs_full = sd_full.ivar
+        meas_full = sd_full.dvar
+        # 区间过滤
+        sd_range = sd_full.filter_range(req.vmin, req.vmax)
+        if sd_range.ivar.size == 0:
+            raise HTTPException(400, f"No data in range [{req.vmin}, {req.vmax}]")
+    elif req.curve_type == "idvd":
+        raw = project.dataset.idvd
+        if not raw:
+            raise HTTPException(400, "No IdVd data")
+        sd_full = SimData.from_idvd(raw, vgs_v=req.vgs_v, temperature_c=25)
+        vds_full = sd_full.ivar
+        meas_full = sd_full.dvar
+        sd_range = sd_full.filter_range(req.vmin, req.vmax)
+        if sd_range.ivar.size == 0:
+            raise HTTPException(400, f"No data in range [{req.vmin}, {req.vmax}]")
+    else:
+        raise HTTPException(400, f"Unknown curve_type: {req.curve_type}")
+
+    # 在 metadata 中锁定区间（Stage 会读取 vmin/vmax 过滤点）
+    sd_range.metadata["vmin"] = req.vmin
+    sd_range.metadata["vmax"] = req.vmax
+
+    # 跑 stage 拟合
+    stage = Stage(
+        name=f"RangeFit_{req.curve_type}",
+        simdata=[sd_range],
+        param_names=req.param_names,
+        model=project.model,
+        error_func="log",
+        simulator=LTspiceEvaluator(subckt_name="SDH10N2P1", rg_ohm=1.6, verbose=False),
+    )
+
+    t0 = _time.time()
+    opt = Optimizer(method="trf")
+    result = stage.run(opt)
+    dt = _time.time() - t0
+
+    # 重新跑全段仿真（最终模型）
+    if req.curve_type == "idvg":
+        sim_full = stage.simulator.eval_idvg(project.model, vgs_full, vds=req.vds)
+    else:
+        sim_full = stage.simulator.eval_idvd(
+            project.model, vds_full, vgs=req.vgs_v, vds_max=float(vds_full.max() * 1.1),
+        )
+
+    # 把拟合结果参数写回 project.model（持久化）
+    for pname, val in result.fitted_params.items():
+        try:
+            project.model.set(pname, val)
+        except (KeyError, ValueError):
+            pass
+
+    return FitSingleResponse(
+        fitted_params={k: float(v) for k, v in result.fitted_params.items()},
+        ivar=vgs_full.tolist() if req.curve_type == "idvg" else vds_full.tolist(),
+        sim=sim_full.tolist(),
+        meas=meas_full.tolist(),
+        rms=float(result.rms) if not np.isnan(result.rms) else 0.0,
+        r_squared=float(result.r_squared) if not np.isnan(result.r_squared) else 0.0,
+        iterations=int(result.iterations),
+        success=bool(result.success),
+    )
+
+
+@router.post("/projects/{project_id}/load_csv", response_model=LoadCsvResponse)
+def load_csv(project_id: str, req: LoadCsvRequest):
+    """加载单条 CSV 曲线为 SimData，返回 ivar/dvar。"""
+    path = Path(req.csv_path)
+    if not path.exists():
+        raise HTTPException(404, f"CSV not found: {req.csv_path}")
+
+    try:
+        if req.curve_type == "idvg":
+            sd = load_idvg_csv(path)
+        elif req.curve_type == "idvd":
+            sd = load_idvd_csv(path)
+        elif req.curve_type == "cv":
+            sd = load_cv_csv(path)
+        elif req.curve_type == "qg":
+            sd = load_qg_csv(path)
+        elif req.curve_type == "body_diode":
+            sd = load_body_diode_csv(path)
+        else:
+            raise HTTPException(400, f"Unknown curve_type: {req.curve_type}")
+    except Exception as e:
+        raise HTTPException(400, f"Failed to parse CSV: {e}")
+
+    return LoadCsvResponse(
+        curve_type=sd.curve_type,
+        ivar=sd.ivar.tolist(),
+        dvar=sd.dvar.tolist(),
+        metadata=sd.metadata,
     )
 
 

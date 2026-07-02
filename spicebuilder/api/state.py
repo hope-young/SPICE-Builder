@@ -28,6 +28,8 @@ class Task:
     type: str
     status: str  # "queued" / "running" / "completed" / "failed"
     progress: float = 0.0
+    current_stage: str = ""
+    current_loop: int = 0
     result: dict = field(default_factory=dict)
     error: str = ""
     created_at: str = ""
