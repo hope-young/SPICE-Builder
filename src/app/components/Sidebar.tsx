@@ -14,16 +14,9 @@ interface NavItem {
 }
 
 const navItems: NavItem[] = [
-  { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { id: "data", label: "Data", icon: Database },
-  { id: "curve", label: "Curve", icon: TrendingUp },
-  { id: "singlefit", label: "Single Fit", icon: Activity },
-  { id: "model", label: "Model", icon: Cpu },
-  { id: "fitting", label: "Fitting", icon: Sliders },
-  { id: "explore", label: "Explore", icon: Zap },
-  { id: "validate", label: "Validate", icon: CheckCircle2 },
-  { id: "export", label: "Export", icon: Download },
-  { id: "settings", label: "Settings", icon: Settings },
+  { id: "workbench", label: "Workbench",  icon: Zap },
+  { id: "explore",   label: "Explore",    icon: Activity },
+  { id: "settings",  label: "Settings",   icon: Settings },
 ];
 
 interface SidebarProps {
@@ -130,36 +123,7 @@ export function Sidebar({ activeNav, onNavChange }: SidebarProps) {
 
       {/* Navigation */}
       <nav style={{ flex: 1, padding: "8px 8px", overflowY: "auto" }}>
-        <div
-          style={{
-            fontSize: 10,
-            color: "var(--muted)",
-            marginBottom: 4,
-            paddingLeft: 4,
-            textTransform: "uppercase",
-            letterSpacing: "0.05em",
-          }}
-        >
-          Workflow
-        </div>
-        {navItems.slice(0, 7).map((item) => (
-          <NavItem key={item.id} item={item} active={activeNav === item.id} onClick={() => onNavChange(item.id)} />
-        ))}
-
-        <div
-          style={{
-            fontSize: 10,
-            color: "var(--muted)",
-            marginTop: 12,
-            marginBottom: 4,
-            paddingLeft: 4,
-            textTransform: "uppercase",
-            letterSpacing: "0.05em",
-          }}
-        >
-          Output
-        </div>
-        {navItems.slice(7).map((item) => (
+        {navItems.map((item) => (
           <NavItem key={item.id} item={item} active={activeNav === item.id} onClick={() => onNavChange(item.id)} />
         ))}
       </nav>

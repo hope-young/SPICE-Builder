@@ -1,82 +1,83 @@
-"""Test fitting engine end-to-end"""
-import sys
-sys.stdout.reconfigure(encoding='utf-8')
+"""Tests for fitting orchestration without depending on a local LTspice install."""
 
-from spicebuilder.data.loader_sdh import load_sdh_excel
+import numpy as np
+import pytest
+
 from spicebuilder.data.simdata import SimData
-from spicebuilder.models import BSIM3Model, init_from_key_params
-from spicebuilder.fitting import Optimizer, Stage, Engine
-from spicebuilder.fitting.error_funcs import rms_log, rms_linear
+from spicebuilder.fitting import Engine, Optimizer, Stage
+from spicebuilder.models import BSIM3Model
 
-# 加载数据
-ds = load_sdh_excel('datademo/SDH10N2P1WC-AA_SPICE_Data.xlsx')
-print(f'Loaded: {ds.device_info.part_number}')
 
-# 创建 SimData
-idvg_25c = SimData.from_idvg(ds.idvg_vds5, temperature_c=25, vds_v=5.0)
-idvd_v5 = SimData.from_idvd(ds.idvd, vgs_v=5.0, temperature_c=25)
-idvd_v10 = SimData.from_idvd(ds.idvd, vgs_v=10.0, temperature_c=25)
-cv_ciss = SimData.from_cv(ds.cv_vds, cap_type='ciss')
-cv_coss = SimData.from_cv(ds.cv_vds, cap_type='coss')
-body_25c = SimData.from_body_diode(ds.body_diode, temperature_c=25)
+class DeterministicIdVgSimulator:
+    """Small deterministic evaluator with the same method shape Stage needs."""
 
-print(f'SimData: {idvg_25c.n_points}, {idvd_v5.n_points}, {idvd_v10.n_points}, {cv_ciss.n_points}, {cv_coss.n_points}, {body_25c.n_points}')
+    @staticmethod
+    def _idvg(vgs: np.ndarray, vth0: float) -> np.ndarray:
+        overdrive = np.maximum(vgs - vth0, 0.0)
+        return 1e-12 + 1e-3 * overdrive**2
 
-# 创建 model
-model = BSIM3Model(name='nmos1')
-init_from_key_params(model, ds.key_params)
-print(f'\\nModel init: VTH0={model.get("VTH0")}, U0={model.get("U0")}')
+    def eval_idvg(self, model: BSIM3Model, vgs_arr: np.ndarray, vds: float = 5.0) -> np.ndarray:
+        _ = vds
+        return self._idvg(vgs_arr, model.get("VTH0"))
 
-# 创建 optimizer
-opt = Optimizer(method='trf')
-opt.set_max_iter(200)
-opt.set_eps1(1e-3)
-opt.set_eps2(1e-3)
-opt.set_eps3(1e-3)
 
-# 创建 6 个 stage
-print('\\n=== 6 阶段拟合 ===')
+def make_idvg_data(target_vth0: float = 3.35) -> SimData:
+    vgs = np.linspace(2.5, 5.0, 36)
+    ids = DeterministicIdVgSimulator._idvg(vgs, target_vth0)
+    return SimData(
+        name="IdVg_25C",
+        curve_type="IdVg",
+        data={"ivar": vgs, "dvar": ids},
+        metadata={"temperature_c": 25, "vds_v": 5.0, "vmin": 3.0, "vmax": 5.0},
+    )
 
-# S1: Threshold
-s1 = Stage("S1_Threshold", [idvg_25c],
-           param_names=["VTH0", "K1", "K2", "NFACTOR"],
-           model=model, error_func="log")
-r1 = s1.run(opt)
-print(f'S1: success={r1.success}, RMS={r1.rms:.4f}, VTH0={model.get("VTH0"):.3f}')
 
-# S3: Linear Mobility
-s3 = Stage("S3_Linear_Mob", [idvg_25c],
-           param_names=["U0", "UA", "UB", "UC"],
-           model=model, error_func="log")
-r3 = s3.run(opt)
-print(f'S3: success={r3.success}, RMS={r3.rms:.4f}, U0={model.get("U0"):.1f}')
+def test_stage_requires_simulator():
+    with pytest.raises(ValueError, match="必须传入 LTspice simulator"):
+        Stage(
+            "S1_Threshold",
+            [make_idvg_data()],
+            param_names=["VTH0"],
+            model=BSIM3Model(name="nmos1"),
+        )
 
-# S4: Saturation
-s4 = Stage("S4_Saturation", [idvd_v5, idvd_v10],
-           param_names=["VSAT", "A0", "AGS", "KETA", "RD", "RS"],
-           model=model, error_func="log")
-r4 = s4.run(opt)
-print(f'S4: success={r4.success}, RMS={r4.rms:.4f}, VSAT={model.get("VSAT"):.0e}')
 
-# S6: Capacitance
-s6 = Stage("S6_Capacitance", [cv_ciss, cv_coss],
-           param_names=["CGSO", "CGDO", "CGBO", "MJ", "MJSW"],
-           model=model, error_func="linear")
-r6 = s6.run(opt)
-print(f'S6: success={r6.success}, RMS={r6.rms:.4f}, CGSO={model.get("CGSO"):.3e}')
+def test_stage_fits_with_simulator_contract():
+    model = BSIM3Model(name="nmos1")
+    model.set_initial("VTH0", 3.0)
+    stage = Stage(
+        "S1_Threshold",
+        [make_idvg_data(target_vth0=3.35)],
+        param_names=["VTH0"],
+        model=model,
+        error_func="log",
+        simulator=DeterministicIdVgSimulator(),
+    )
+    optimizer = Optimizer(method="trf").set_max_iter(80).set_eps1(1e-9).set_eps2(1e-9).set_eps3(1e-9)
 
-# Engine 跑全 pipeline
-print('\\n=== Engine 跑全 4 阶段 ===')
-engine = Engine([s1, s3, s4, s6], error_threshold=0.5, max_loops=2)
-result = engine.run(opt)
-print(f'Engine: success={result.success}, RMS={result.total_rms:.4f}, iter={result.iterations}')
-print(f'  Message: {result.message}')
+    result = stage.run(optimizer)
 
-# 打印最终参数
-print('\\n=== Final fitted parameters ===')
-for p in model.get_params_by_stage('S1'):
-    print(f'  S1: {p} = {model.get(p):.4g} (init was {model._initial.get(p, "?")})')
-for p in model.get_params_by_stage('S3'):
-    print(f'  S3: {p} = {model.get(p):.4g}')
+    assert result.success
+    assert result.r_squared > 0.99
+    assert model.get("VTH0") == pytest.approx(3.35, abs=0.03)
+    assert stage.simdata[0].fit is not None
 
-print('\\n✓ Fitting test passed!')
+
+def test_engine_runs_stage_pipeline():
+    model = BSIM3Model(name="nmos1")
+    stage = Stage(
+        "S1_Threshold",
+        [make_idvg_data(target_vth0=3.25)],
+        param_names=["VTH0"],
+        model=model,
+        error_func="log",
+        simulator=DeterministicIdVgSimulator(),
+    )
+    optimizer = Optimizer(method="trf").set_max_iter(80)
+    engine = Engine([stage], error_threshold=0.05, max_loops=2)
+
+    result = engine.run(optimizer)
+
+    assert result.success
+    assert result.total_rms < 0.05
+    assert len(result.stage_results) == 1

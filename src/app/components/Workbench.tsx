@@ -1,0 +1,499 @@
+// Workbench.tsx - Fit Project Tree 工作台（接 Figma v2 设计稿）
+// 顶部菜单栏/工具栏在 App.tsx 的 MenuBar/路由里统一实现，本组件只负责 Tree 部分。
+import { useState, useMemo } from "react";
+import {
+  ChevronRight, ChevronDown, Plus,
+  CheckCircle2, Circle, Minus,
+} from "lucide-react";
+import { useApp } from "../../lib/store";
+import { SingleCurveFit } from "./SingleCurveFit";
+
+const C = {
+  pageBg:    "#F6F7F9",
+  panelBg:   "#FFFFFF",
+  border:    "#D7DDE5",
+  borderMd:  "#BFC9D4",
+  primary:   "#0D7F8F",
+  primaryLt: "#DFF4F6",
+  success:   "#2D8A4E",
+  error:     "#BF3A30",
+  text:      "#1A2633",
+  textSm:    "#6B7A8D",
+  textXs:    "#8D9BAA",
+  selectedBg:  "#E5F3F6",
+  selectedBdr: "#0D7F8F",
+};
+const ff   = "'Inter','Segoe UI',system-ui,sans-serif";
+const mono = "'JetBrains Mono','Consolas',monospace";
+
+type FitStatus = "done" | "queued" | "running" | "empty" | "error";
+
+interface TreeChild {
+  id: string;
+  label: string;
+  status: FitStatus;
+  r2: string | null;
+  pts: number;
+  bias?: string;
+  csvFile?: string;
+  range?: string;
+  weight?: number;
+  type?: string;
+}
+interface TreeFeature {
+  id: string;
+  label: string;
+  tag: "live" | "next";
+  canAdd: boolean;
+  addLabel?: string;
+  children: TreeChild[];
+}
+
+function StatusIcon({ status }: { status: FitStatus }) {
+  if (status === "done")    return <CheckCircle2 size={12} color={C.success} />;
+  if (status === "running") return <Circle size={12} color={C.primary} style={{ animation: "pulse 1s infinite" }} />;
+  if (status === "queued")  return <Circle size={12} color={C.textXs} />;
+  if (status === "error")   return <Minus size={12} color={C.error} />;
+  return <Circle size={12} color={C.border} />;
+}
+function useTreeData() {
+  const { dataset, fitResult } = useApp();
+  return useMemo<TreeFeature[]>(() => {
+    const haveData = !!dataset;
+    const points = (arr?: unknown[] | null) => (Array.isArray(arr) ? arr.length : 0);
+    const idvg_pts = points(dataset?.idvg_vds5) || points(dataset?.idvg_vds05);
+    const idvd_pts = points(dataset?.idvd);
+    const r2 =
+      fitResult?.success && fitResult.r_squared != null
+        ? fitResult.r_squared.toFixed(3)
+        : null;
+    const idvg_done = !!fitResult?.success && idvg_pts > 0;
+    const idvd_done = !!fitResult?.success && idvd_pts > 0;
+
+    return [
+      {
+        id: "idvg", label: "IdVg / Transfer", tag: "live", canAdd: true, addLabel: "Add Vds step",
+        children: [
+          { id: "idvg_05", label: "IdVg @ Vds=0.5V", status: idvg_done ? "done" : (haveData ? "queued" : "empty"),
+            r2: idvg_done ? r2 : null, pts: points(dataset?.idvg_vds05),
+            bias: "Vds=0.5V", csvFile: "IdVg.csv", range: "Vgs 0–10V", weight: 1.0, type: "IdVg" },
+          { id: "idvg_5",  label: "IdVg @ Vds=5V",   status: idvg_done ? "done" : (haveData ? "queued" : "empty"),
+            r2: idvg_done ? r2 : null, pts: points(dataset?.idvg_vds5),
+            bias: "Vds=5V", csvFile: "IdVg.csv", range: "Vgs 0–10V", weight: 1.0, type: "IdVg" },
+        ],
+      },
+      {
+        id: "idvd", label: "IdVd / Output", tag: "live", canAdd: true, addLabel: "Add Vgs step",
+        children: [
+          { id: "idvd_default", label: "IdVd @ Vgs=10V", status: idvd_done ? "done" : (haveData ? "queued" : "empty"),
+            r2: idvd_done ? r2 : null, pts: idvd_pts,
+            bias: "Vgs=10V", csvFile: "IdVd.csv", range: "Vds 0–30V", weight: 1.0, type: "IdVd" },
+        ],
+      },
+      { id: "bv",         label: "BV / Leakage",      tag: "next", canAdd: false, children: [
+        { id: "bvdss",  label: "BVDSS", status: "empty", r2: null, pts: 0, type: "BV" },
+        { id: "idss",   label: "IDSS",  status: "empty", r2: null, pts: 0, type: "BV" },
+        { id: "igss_p", label: "IGSS+", status: "empty", r2: null, pts: 0, type: "BV" },
+        { id: "igss_n", label: "IGSS−", status: "empty", r2: null, pts: 0, type: "BV" },
+      ]},
+      { id: "bodydiode",  label: "Body Diode",        tag: "next", canAdd: false, children: [
+        { id: "isvsd", label: "Is-Vsd", status: "empty", r2: null, pts: 0, type: "BodyDiode" },
+        { id: "qrr",   label: "Qrr",    status: "empty", r2: null, pts: 0, type: "BodyDiode" },
+      ]},
+      { id: "cv", label: "CV / Capacitance", tag: "next", canAdd: false, children: [
+        { id: "ciss", label: "Ciss", status: "empty", r2: null, pts: 0, type: "CV" },
+        { id: "coss", label: "Coss", status: "empty", r2: null, pts: 0, type: "CV" },
+        { id: "crss", label: "Crss", status: "empty", r2: null, pts: 0, type: "CV" },
+      ]},
+      { id: "qg", label: "Qg / Gate Charge", tag: "next", canAdd: false, children: [
+        { id: "qg_total", label: "Qg total", status: "empty", r2: null, pts: 0, type: "Qg" },
+        { id: "qgs",      label: "Qgs",      status: "empty", r2: null, pts: 0, type: "Qg" },
+        { id: "qgd",      label: "Qgd",      status: "empty", r2: null, pts: 0, type: "Qg" },
+      ]},
+      { id: "dpt", label: "DPT / Switching", tag: "next", canAdd: false, children: [
+        { id: "dpt_on",  label: "Turn-on",  status: "empty", r2: null, pts: 0, type: "DPT" },
+        { id: "dpt_off", label: "Turn-off", status: "empty", r2: null, pts: 0, type: "DPT" },
+      ]},
+    ];
+  }, [dataset, fitResult]);
+}
+/* ============================================================
+   Fit Project Tree（v2 设计稿关键组件，核心改造点）
+============================================================ */
+function FitProjectTree({
+  treeData, checkedFeatures, checkedChildren, expandedFeatures,
+  selectedId, onToggleFeature, onToggleChild, onToggleExpand,
+  onSelect, onAddStep,
+}: {
+  treeData: TreeFeature[];
+  checkedFeatures: Set<string>;
+  checkedChildren: Set<string>;
+  expandedFeatures: Set<string>;
+  selectedId: string | null;
+  onToggleFeature: (id: string) => void;
+  onToggleChild: (id: string) => void;
+  onToggleExpand: (id: string) => void;
+  onSelect: (id: string) => void;
+  onAddStep: (featureId: string) => void;
+}) {
+  return (
+    <div style={{ flex: 1, overflowY: "auto", fontSize: 11, fontFamily: ff, minHeight: 0 }}>
+      <style>{`
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+        ::-webkit-scrollbar { width:5px; height:5px; }
+        ::-webkit-scrollbar-track { background:transparent; }
+        ::-webkit-scrollbar-thumb { background:${C.borderMd}; border-radius:3px; }
+      `}</style>
+      <div style={{
+        padding: "7px 10px 4px",
+        borderBottom: `1px solid ${C.border}`,
+        fontSize: 10, color: C.textXs,
+        textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600,
+      }}>
+        Fit Project
+      </div>
+
+      {treeData.map((feat) => {
+        const isNext = feat.tag === "next";
+        const isExpanded = expandedFeatures.has(feat.id);
+        const isFeatChecked = checkedFeatures.has(feat.id);
+
+        return (
+          <div key={feat.id}>
+            {/* Feature row */}
+            <div
+              onClick={() => onSelect(feat.id)}
+              style={{
+                display: "flex", alignItems: "center", gap: 5,
+                padding: "5px 10px 5px 6px",
+                backgroundColor: selectedId === feat.id ? C.selectedBg : "transparent",
+                borderLeft: selectedId === feat.id ? `2px solid ${C.selectedBdr}` : "2px solid transparent",
+                cursor: "pointer", userSelect: "none",
+              }}
+              onMouseEnter={(e) => {
+                if (selectedId !== feat.id)
+                  (e.currentTarget as HTMLElement).style.backgroundColor = "#EFF1F4";
+              }}
+              onMouseLeave={(e) => {
+                if (selectedId !== feat.id)
+                  (e.currentTarget as HTMLElement).style.backgroundColor = "transparent";
+              }}
+            >
+              <button
+                onClick={(e) => { e.stopPropagation(); onToggleExpand(feat.id); }}
+                style={{
+                  border: "none", background: "transparent",
+                  cursor: "pointer", padding: 0,
+                  display: "flex", color: C.textSm, flexShrink: 0,
+                }}
+              >
+                {isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+              </button>
+
+              <div
+                onClick={(e) => { e.stopPropagation(); if (!isNext) onToggleFeature(feat.id); }}
+                style={{
+                  width: 13, height: 13, borderRadius: 3, flexShrink: 0,
+                  border: `1.5px solid ${isFeatChecked && !isNext ? C.primary : C.borderMd}`,
+                  backgroundColor: isFeatChecked && !isNext ? C.primary : isNext ? C.pageBg : "#fff",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  cursor: isNext ? "default" : "pointer",
+                }}
+              >
+                {isFeatChecked && !isNext && (
+                  <div style={{
+                    width: 7, height: 7,
+                    backgroundColor: "#fff", borderRadius: 1,
+                    clipPath: "polygon(14% 44%,0 65%,50% 100%,100% 16%,80% 0%,43% 62%)",
+                  }} />
+                )}
+              </div>
+
+              <span style={{
+                flex: 1, fontWeight: 600, fontSize: 11,
+                color: isNext ? C.textXs : C.text,
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+              }}>
+                {feat.label}
+              </span>
+
+              <span style={{
+                fontSize: 9, padding: "1px 5px", borderRadius: 2,
+                fontWeight: 600, letterSpacing: "0.04em",
+                backgroundColor: isNext ? "#F0F1F3" : C.primaryLt,
+                color: isNext ? C.textXs : C.primary,
+              }}>
+                {feat.tag.toUpperCase()}
+              </span>
+            </div>
+            {/* Children */}
+            {isExpanded && (
+              <div>
+                {feat.children.map((child) => {
+                  const isChildChecked = checkedChildren.has(child.id);
+                  const isSelected = selectedId === child.id;
+                  return (
+                    <div
+                      key={child.id}
+                      onClick={() => onSelect(child.id)}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 5,
+                        padding: "4px 10px 4px 28px",
+                        backgroundColor: isSelected ? C.selectedBg : "transparent",
+                        borderLeft: isSelected ? `2px solid ${C.selectedBdr}` : "2px solid transparent",
+                        cursor: "pointer",
+                      }}
+                      onMouseEnter={(e) => {
+                        if (!isSelected)
+                          (e.currentTarget as HTMLElement).style.backgroundColor = "#EFF1F4";
+                      }}
+                      onMouseLeave={(e) => {
+                        if (!isSelected)
+                          (e.currentTarget as HTMLElement).style.backgroundColor = "transparent";
+                      }}
+                    >
+                      <div
+                        onClick={(e) => { e.stopPropagation(); onToggleChild(child.id); }}
+                        style={{
+                          width: 12, height: 12, borderRadius: 3, flexShrink: 0,
+                          border: `1.5px solid ${isChildChecked ? C.primary : C.borderMd}`,
+                          backgroundColor: isChildChecked ? C.primary : "#fff",
+                          display: "flex", alignItems: "center", justifyContent: "center",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {isChildChecked && (
+                          <div style={{
+                            width: 6, height: 6,
+                            backgroundColor: "#fff", borderRadius: 1,
+                            clipPath: "polygon(14% 44%,0 65%,50% 100%,100% 16%,80% 0%,43% 62%)",
+                          }} />
+                        )}
+                      </div>
+                      <StatusIcon status={child.status} />
+                      <span style={{
+                        flex: 1, overflow: "hidden",
+                        textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        fontSize: 11, color: C.text,
+                      }}>
+                        {child.label}
+                      </span>
+
+                      {child.r2 && (
+                        <span style={{
+                          fontSize: 10, fontFamily: mono,
+                          color: C.success, flexShrink: 0,
+                        }}>
+                          {child.r2}
+                        </span>
+                      )}
+                      {child.pts > 0 && (
+                        <span style={{ fontSize: 9, color: C.textXs, flexShrink: 0 }}>
+                          {child.pts}pt
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {feat.canAdd && !isNext && (
+                  <button
+                    onClick={() => onAddStep(feat.id)}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 5,
+                      padding: "3px 10px 4px 32px",
+                      border: "none", cursor: "pointer",
+                      backgroundColor: "transparent",
+                      fontFamily: ff, width: "100%",
+                      color: C.primary, fontSize: 10,
+                    }}
+                    onMouseEnter={(e) =>
+                      ((e.currentTarget as HTMLElement).style.backgroundColor = "#EFF1F4")
+                    }
+                    onMouseLeave={(e) =>
+                      ((e.currentTarget as HTMLElement).style.backgroundColor = "transparent")
+                    }
+                  >
+                    <Plus size={10} />{feat.addLabel}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+/* ============================================================
+   Selected Item Panel
+============================================================ */
+function SelectedItemPanel({
+  selectedId, treeData,
+}: {
+  selectedId: string | null;
+  treeData: TreeFeature[];
+}) {
+  const info = useMemo(() => {
+    if (!selectedId) return null;
+    for (const feat of treeData) {
+      if (feat.id === selectedId) return { type: "feature" as const, feat, child: null };
+      for (const child of feat.children) {
+        if (child.id === selectedId) return { type: "child" as const, feat, child };
+      }
+    }
+    return null;
+  }, [selectedId, treeData]);
+
+  return (
+    <div style={{
+      borderTop: `1px solid ${C.border}`,
+      backgroundColor: C.panelBg,
+      padding: "8px 10px",
+      flexShrink: 0,
+    }}>
+      <div style={{
+        display: "flex", justifyContent: "space-between",
+        alignItems: "center", marginBottom: 7,
+      }}>
+        <span style={{
+          fontSize: 10, fontWeight: 600, color: C.textSm,
+          textTransform: "uppercase", letterSpacing: "0.05em",
+        }}>
+          Selected
+        </span>
+        {info && (
+          <button style={{
+            fontSize: 10, padding: "2px 7px", borderRadius: 3,
+            border: `1px solid ${C.border}`, backgroundColor: C.panelBg,
+            cursor: "pointer", color: C.textSm, fontFamily: ff,
+          }}>
+            Edit
+          </button>
+        )}
+      </div>
+
+      {info?.child ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          {([
+            ["Type",   info.child.type || "—"],
+            ["Bias",   info.child.bias || "—"],
+            ["Range",  info.child.range || "—"],
+            ["CSV",    info.child.csvFile || "—"],
+            ["Weight", info.child.weight != null ? String(info.child.weight) : "—"],
+            ["Status", info.child.status],
+          ] as [string, string][]).map(([k, v]) => (
+            <div key={k} style={{ display: "flex", gap: 6, fontSize: 10 }}>
+              <span style={{ color: C.textXs, width: 44, flexShrink: 0 }}>{k}</span>
+              <span style={{
+                color: C.text,
+                fontFamily: k === "CSV" ? mono : ff,
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+              }}>
+                {v}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ fontSize: 10, color: C.textXs, fontStyle: "italic" }}>
+          {selectedId ? "Select a step for details" : "No item selected"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   Workbench 顶层组件
+============================================================ */
+export interface WorkbenchProps {
+  onOpenSettings?: () => void;
+  onOpenFitting?: () => void;
+}
+
+export function Workbench(props: WorkbenchProps) {
+  const treeData = useTreeData();
+  const [checkedFeatures, setCheckedFeatures]   = useState<Set<string>>(new Set(["idvg", "idvd"]));
+  const [checkedChildren, setCheckedChildren]   = useState<Set<string>>(new Set());
+  const [expandedFeatures, setExpandedFeatures] = useState<Set<string>>(new Set(["idvg", "idvd"]));
+  const [selectedId, setSelectedId] = useState<string | null>("idvg_5");
+
+  const toggleFeature = (id: string) =>
+    setCheckedFeatures((prev) => {
+      const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s;
+    });
+  const toggleChild = (id: string) =>
+    setCheckedChildren((prev) => {
+      const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s;
+    });
+  const toggleExpand = (id: string) =>
+    setExpandedFeatures((prev) => {
+      const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s;
+    });
+  const handleAddStep = (featureId: string) => {
+    const newId = `${featureId}_user_${Date.now()}`;
+    setSelectedId(newId);
+    console.info("[Workbench] add step:", featureId, newId);
+  };
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "row",
+        height: "100%",
+        backgroundColor: C.pageBg,
+        fontFamily: ff,
+        fontSize: 12,
+        overflow: "hidden",
+        pointerEvents: "auto",
+      }}
+    >
+      {/* Fit Project Tree 列 */}
+      <div
+        style={{
+          width: 320,
+          minWidth: 320,
+          display: "flex",
+          flexDirection: "column",
+          borderRight: `1px solid ${C.border}`,
+          backgroundColor: C.panelBg,
+          overflow: "hidden",
+          pointerEvents: "auto",
+        }}
+      >
+        <FitProjectTree
+          treeData={treeData}
+          checkedFeatures={checkedFeatures}
+          checkedChildren={checkedChildren}
+          expandedFeatures={expandedFeatures}
+          selectedId={selectedId}
+          onToggleFeature={toggleFeature}
+          onToggleChild={toggleChild}
+          onToggleExpand={toggleExpand}
+          onSelect={setSelectedId}
+          onAddStep={handleAddStep}
+        />
+        <SelectedItemPanel selectedId={selectedId} treeData={treeData} />
+      </div>
+
+      {/* 主区：嵌入 SingleCurveFit（hideChrome 关闭其内置菜单栏/工具栏） */}
+      <div
+        style={{
+          flex: 1,
+          minWidth: 0,
+          display: "flex",
+          flexDirection: "column",
+          backgroundColor: C.pageBg,
+          overflow: "hidden",
+          pointerEvents: "auto",
+        }}
+      >
+        <SingleCurveFit hideChrome />
+      </div>
+    </div>
+  );
+}
+
+export default Workbench;

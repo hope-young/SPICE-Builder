@@ -1,0 +1,2196 @@
+// SingleCurveFit.tsx - 单曲线 IdVg 拟合工作流（独立页面，无 project_id）
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import type { ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, ReferenceLine, Legend
+} from "recharts";
+import {
+  Upload, Play, Pause, Plus, CheckCircle2, CircleMinus, Trash2, GripVertical,
+  ChevronRight, LayoutGrid, AlignJustify, AlignLeft, Download, Square, Activity
+} from "lucide-react";
+import { Button } from "./ui";
+import { csvLoad, csvSimulate, csvFitStream, csvDualFitStream } from "../../lib/api";
+import { useApp } from "../../lib/store";
+import { BSIM3_PARAMS } from "../../lib/constants";
+import { ParamSliders } from "./ParamSliders";
+
+/* =========================================================================
+   Plan: 单曲线 IdVg 拟合（解耦 project_id + 区间拖动）
+   - 数据源: 用户用 open_excel_file 选 CSV, 不需要去 Data 页面加载
+   - 流程: Load CSV -> 自动按 IdVg 渲染 -> 拖动区间 -> 勾选参数 -> Fit
+   - 后端使用 /api/csv/* stateless 接口
+   - 区间通过 recharts 上的 ReferenceLine + 透明覆盖层 div 实现拖动
+   ========================================================================= */
+
+const MARGIN = { top: 16, right: 32, bottom: 24, left: 56 };  // 与 recharts LineChart 一致
+
+type StopPreset = "fast" | "balanced" | "precise" | "custom";
+type FitTargetId = "idvg" | "idvd" | "bv" | "diode" | "cv" | "qg" | "dpt";
+type LayoutMode = "grid" | "vertical" | "horizontal";
+
+const FIT_TARGET_TEMPLATES: Array<{
+  id: FitTargetId;
+  label: string;
+  hint: string;
+  children: string[];
+  implemented: boolean;
+}> = [
+  {
+    id: "idvg",
+    label: "IdVg / Transfer",
+    hint: "Vds 可自定义",
+    children: ["IdVg @ Vds=0.5V", "IdVg @ Vds=5V"],
+    implemented: true,
+  },
+  {
+    id: "idvd",
+    label: "IdVd / Output",
+    hint: "Vgs 可自定义",
+    children: ["IdVd @ Vgs=5V", "IdVd @ Vgs=6V", "IdVd @ Vgs=10V"],
+    implemented: false,
+  },
+  {
+    id: "bv",
+    label: "BV / Leakage",
+    hint: "击穿与漏电",
+    children: ["BVDSS", "IDSS", "IGSS+", "IGSS-"],
+    implemented: false,
+  },
+  {
+    id: "diode",
+    label: "Body Diode",
+    hint: "体二极管",
+    children: ["Is-Vsd", "Qrr"],
+    implemented: false,
+  },
+  {
+    id: "cv",
+    label: "CV / Capacitance",
+    hint: "电容曲线",
+    children: ["Ciss", "Coss", "Crss"],
+    implemented: false,
+  },
+  {
+    id: "qg",
+    label: "Qg / Gate Charge",
+    hint: "栅电荷",
+    children: ["Qg total", "Qgs", "Qgd"],
+    implemented: false,
+  },
+  {
+    id: "dpt",
+    label: "DPT / Switching",
+    hint: "动态验证",
+    children: ["Turn-on", "Turn-off"],
+    implemented: false,
+  },
+];
+
+const STOP_PRESETS: Record<Exclude<StopPreset, "custom">, {
+  label: string;
+  r2_log: number;
+  r2_linear: number;
+  ftol: number;
+  xtol: number;
+  gtol: number;
+  max_nfev: number;
+}> = {
+  fast: { label: "快速", r2_log: 0.99, r2_linear: 0.99, ftol: 1e-4, xtol: 1e-4, gtol: 1e-4, max_nfev: 50 },
+  balanced: { label: "标准", r2_log: 0.99, r2_linear: 0.99, ftol: 1e-6, xtol: 1e-6, gtol: 1e-6, max_nfev: 120 },
+  precise: { label: "精细", r2_log: 0.99, r2_linear: 0.99, ftol: 1e-8, xtol: 1e-8, gtol: 1e-8, max_nfev: 300 },
+};
+
+const WB = {
+  pageBg: "#F6F7F9",
+  panelBg: "#FFFFFF",
+  menuBg: "#EAECF0",
+  border: "#D7DDE5",
+  borderMd: "#BFC9D4",
+  primary: "#0D7F8F",
+  primaryLt: "#DFF4F6",
+  text: "#1A2633",
+  textMd: "#3D4F61",
+  textSm: "#6B7A8D",
+  textXs: "#8D9BAA",
+  warning: "#B45309",
+  shadow: "0 2px 8px rgba(0,0,0,0.12)",
+};
+
+const WORKBENCH_MENUS: Record<string, string[]> = {
+  文件: ["导入 CSV", "导出结果", "—", "关闭项目"],
+  编辑: ["重置当前参数", "锁定已拟合参数"],
+  视图: ["Grid 多图布局", "Vertical 纵向布局", "Horizontal 横向布局"],
+  拟合: ["仿真当前 Step", "拟合当前 Step", "拟合勾选 IdVg", "停止拟合"],
+  帮助: ["关于 SpiceBuilder"],
+};
+
+function WorkbenchMenuBar({
+  onAction,
+  onLayout,
+}: {
+  onAction: (action: string) => void;
+  onLayout: (layout: LayoutMode) => void;
+}) {
+  const [open, setOpen] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (event: MouseEvent) => {
+      if (!ref.current?.contains(event.target as Node)) setOpen(null);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  const handleItem = (item: string) => {
+    setOpen(null);
+    if (item === "导入 CSV") onAction("import");
+    if (item === "导出结果") onAction("export");
+    if (item === "重置当前参数") onAction("reset-current");
+    if (item === "锁定已拟合参数") onAction("lock-fitted");
+    if (item === "Grid 多图布局") onLayout("grid");
+    if (item === "Vertical 纵向布局") onLayout("vertical");
+    if (item === "Horizontal 横向布局") onLayout("horizontal");
+    if (item === "仿真当前 Step") onAction("simulate");
+    if (item === "拟合当前 Step") onAction("fit-current");
+    if (item === "拟合勾选 IdVg") onAction("fit-selected");
+    if (item === "停止拟合") onAction("stop");
+    if (item === "关于 SpiceBuilder") onAction("about");
+  };
+
+  return (
+    <div
+      ref={ref}
+      style={{
+        height: 28,
+        display: "flex",
+        alignItems: "center",
+        background: WB.menuBg,
+        borderBottom: `1px solid ${WB.border}`,
+        paddingLeft: 8,
+        flexShrink: 0,
+        userSelect: "none",
+      }}
+    >
+      <span style={{ fontSize: 12, fontWeight: 700, color: WB.primary, paddingRight: 10 }}>SpiceBuilder</span>
+      <div style={{ width: 1, height: 16, background: WB.border, marginRight: 6 }} />
+      {Object.keys(WORKBENCH_MENUS).map(menu => (
+        <div key={menu} style={{ position: "relative" }}>
+          <button
+            type="button"
+            onClick={() => setOpen(open === menu ? null : menu)}
+            onMouseEnter={() => { if (open) setOpen(menu); }}
+            style={{
+              height: 28,
+              padding: "0 10px",
+              border: 0,
+              cursor: "pointer",
+              background: open === menu ? WB.primaryLt : "transparent",
+              color: open === menu ? WB.primary : WB.text,
+              fontSize: 12,
+            }}
+          >
+            {menu}
+          </button>
+          {open === menu && (
+            <div
+              style={{
+                position: "absolute",
+                top: 28,
+                left: 0,
+                zIndex: 1000,
+                minWidth: 190,
+                padding: "3px 0",
+                background: WB.panelBg,
+                border: `1px solid ${WB.border}`,
+                borderRadius: 4,
+                boxShadow: WB.shadow,
+              }}
+            >
+              {WORKBENCH_MENUS[menu].map((item, idx) => item === "—" ? (
+                <div key={`${menu}-${idx}`} style={{ height: 1, background: WB.border, margin: "3px 0" }} />
+              ) : (
+                <button
+                  key={item}
+                  type="button"
+                  onClick={() => handleItem(item)}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    textAlign: "left",
+                    padding: "5px 14px",
+                    border: 0,
+                    cursor: "pointer",
+                    background: "transparent",
+                    color: WB.text,
+                    fontSize: 12,
+                  }}
+                  onMouseEnter={e => { e.currentTarget.style.background = WB.primaryLt; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ToolButton({
+  children,
+  active,
+  primary,
+  disabled,
+  onClick,
+  title,
+}: {
+  children: ReactNode;
+  active?: boolean;
+  primary?: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 5,
+        padding: "5px 10px",
+        borderRadius: 4,
+        border: primary ? 0 : `1px solid ${active ? WB.primary : WB.border}`,
+        background: primary ? WB.primary : active ? WB.primaryLt : WB.panelBg,
+        color: primary ? "#fff" : active ? WB.primary : disabled ? WB.textXs : WB.textMd,
+        fontSize: 12,
+        fontWeight: 600,
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.5 : 1,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function WorkbenchToolbar({
+  layout,
+  isRunning,
+  loadedCount,
+  activeStepName,
+  canImport,
+  canSimulate,
+  canFit,
+  onLayout,
+  onAction,
+}: {
+  layout: LayoutMode;
+  isRunning: boolean;
+  loadedCount: number;
+  activeStepName: string;
+  canImport: boolean;
+  canSimulate: boolean;
+  canFit: boolean;
+  onLayout: (layout: LayoutMode) => void;
+  onAction: (action: string) => void;
+}) {
+  return (
+    <div
+      style={{
+        height: 44,
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "0 14px",
+        borderBottom: `1px solid ${WB.border}`,
+        background: WB.panelBg,
+        flexShrink: 0,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: WB.textSm, minWidth: 0 }}>
+        <span style={{ color: WB.textXs }}>Project</span>
+        <ChevronRight size={11} color={WB.textXs} />
+        <span style={{ color: WB.textMd, fontWeight: 600 }}>Power MOS</span>
+        <ChevronRight size={11} color={WB.textXs} />
+        <span style={{ color: WB.text, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {activeStepName}
+        </span>
+        <span style={{ fontSize: 10, color: WB.textXs, paddingLeft: 4 }}>{loadedCount} loaded</span>
+      </div>
+
+      <div style={{ flex: 1 }} />
+
+      <div style={{ display: "flex", border: `1px solid ${WB.border}`, borderRadius: 5, overflow: "hidden" }}>
+        {([
+          { id: "grid" as LayoutMode, icon: <LayoutGrid size={13} />, label: "Grid" },
+          { id: "vertical" as LayoutMode, icon: <AlignLeft size={13} />, label: "Vertical" },
+          { id: "horizontal" as LayoutMode, icon: <AlignJustify size={13} />, label: "Horizontal" },
+        ]).map(item => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => onLayout(item.id)}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+              padding: "5px 10px",
+              border: 0,
+              cursor: "pointer",
+              fontSize: 12,
+              background: layout === item.id ? WB.primary : "transparent",
+              color: layout === item.id ? "#fff" : WB.textSm,
+            }}
+          >
+            {item.icon}{item.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ width: 1, height: 24, background: WB.border }} />
+
+      <ToolButton disabled={!canImport} onClick={() => onAction("import")} title="加载当前 step 的 CSV">
+        <Upload size={13} />Import
+      </ToolButton>
+      <ToolButton disabled={!canSimulate} onClick={() => onAction("simulate")} title="用当前参数仿真当前 step">
+        <Activity size={13} />Simulate
+      </ToolButton>
+      <ToolButton primary disabled={!canFit || isRunning} onClick={() => onAction("fit-selected")} title="一个已加载 step 时执行单拟合，两个及以上执行联合 IdVg 拟合">
+        <Play size={13} />Fit Selected
+      </ToolButton>
+      <ToolButton disabled={!isRunning} onClick={() => onAction("stop")} title="停止当前拟合，并保存当前最好结果">
+        <Square size={13} />Stop
+      </ToolButton>
+      <ToolButton onClick={() => onAction("export")} title="导出结果入口">
+        <Download size={13} />Export
+      </ToolButton>
+    </div>
+  );
+}
+
+type CurveRaw = { ivar: number[]; dvar: number[]; meta: Record<string, unknown> };
+
+type FitHistoryPoint = {
+  step: number;
+  params: Record<string, number>;
+  sim: number[];
+  r2_linear: number;
+  r2_log: number;
+  ftol_metric: number;
+  xtol_metric: number;
+  gtol_metric: number;
+  fit_rms: number;
+  bound_events?: Array<Record<string, unknown>>;
+};
+
+type TransferStep = {
+  id: string;
+  name: string;
+  vds: number;
+  csvPath: string;
+  raw: CurveRaw | null;
+  simCurve: number[];
+  vmin: number;
+  vmax: number;
+  status: "empty" | "loaded" | "simulated" | "fitted";
+  rms: number | null;
+  r2Log: number | null;
+  r2Linear: number | null;
+  fitHistory: FitHistoryPoint[];
+  selectedForFit: boolean;
+  fittedParams?: Record<string, number>;
+};
+
+function makeTransferStep(index: number, vds: number): TransferStep {
+  return {
+    id: `step-${Date.now()}-${index}`,
+    name: `IdVg @ Vds=${vds}V`,
+    vds,
+    csvPath: "",
+    raw: null,
+    simCurve: [],
+    vmin: 3.5,
+    vmax: 5.0,
+    status: "empty",
+    rms: null,
+    r2Log: null,
+    r2Linear: null,
+    fitHistory: [],
+    selectedForFit: true,
+  };
+}
+
+function fmtParam(v: number | undefined): string {
+  if (v === undefined || !Number.isFinite(v)) return "—";
+  if (v === 0) return "0";
+  const a = Math.abs(v);
+  if (a >= 1e4 || a < 1e-3) return v.toExponential(4);
+  return Number.parseFloat(v.toPrecision(6)).toString();
+}
+
+function fmtTol(v: number): string {
+  if (!Number.isFinite(v)) return "1e-6";
+  if (v === 0) return "0";
+  return v.toExponential(0);
+}
+
+function positiveOrNull(v: number | null | undefined): number | null {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+}
+
+export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false }: { hideChrome?: boolean; hideFitTargetsPanel?: boolean } = {}) {
+  const { setLog } = useApp();
+  const [steps, setSteps] = useState<TransferStep[]>(() => [
+    makeTransferStep(1, 0.5),
+    makeTransferStep(2, 5.0),
+  ]);
+  const [activeStep, setActiveStep] = useState(0);
+  const [selectedFitTargets, setSelectedFitTargets] = useState<Set<FitTargetId>>(
+    () => new Set(FIT_TARGET_TEMPLATES.map(item => item.id))
+  );
+  const [activeTreeItem, setActiveTreeItem] = useState<FitTargetId | "idvg-step">("idvg");
+  const [expandedFitTargets, setExpandedFitTargets] = useState<Set<FitTargetId>>(
+    () => new Set(FIT_TARGET_TEMPLATES.map(item => item.id))
+  );
+  // ---- 文件 ----
+  const [csvPath, setCsvPath] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // ---- 数据 ----
+  const [raw, setRaw] = useState<{ ivar: number[]; dvar: number[]; meta: Record<string, unknown> } | null>(null);
+  const [simCurve, setSimCurve] = useState<number[]>([]);
+
+  // ---- 区间 ----
+  // 默认 3.5-5V, 避开亚阈值仪器噪声 (Vgs<3.5V 是 30mA 噪声地板)
+  const [vmin, setVmin] = useState(3.5);
+  const [vmax, setVmax] = useState(5.0);
+  const [vds, setVds] = useState(0.5);  // 曲线 1 的 Vds 偏置 (V)
+  const [dragging, setDragging] = useState<null | "min" | "max">(null);
+
+  // ---- 参数 ----
+  const [pvals, setPvals] = useState<Record<string, number>>(() => {
+    const m: Record<string, number> = {};
+    BSIM3_PARAMS.forEach(p => { m[p.name] = p.default; });
+    return m;
+  });
+  // 默认勾选 8 个对 IdVg 形状最关键的参数 (VTH0+U0+TOX+UA+UB+VSAT+A0+AGS)
+  // 5 参数时线性 R² 只有 0.48, 加上 A0/AGS (CLM) 才能 0.99+
+  // 9+ 会触发 overfit, 慎用
+  const [checked, setChecked] = useState<Set<string>>(
+    new Set(["VTH0", "U0", "TOX", "UA", "UB", "VSAT", "A0", "AGS"])
+  );
+  const [lockedParams, setLockedParams] = useState<Set<string>>(new Set());
+  const [customBounds, setCustomBounds] = useState<Record<string, { min?: string; max?: string }>>({});
+
+  // ---- 拟合 ----
+  const [fitting, setFitting] = useState(false);
+  const [fitRMS, setFitRMS] = useState<number | null>(null);
+  const [fitR2, setFitR2] = useState<number | null>(null);
+  const [fitR2Linear, setFitR2Linear] = useState<number | null>(null);
+  const [stopPreset, setStopPreset] = useState<StopPreset>("balanced");
+  const [fitStop, setFitStop] = useState({
+    r2_log: STOP_PRESETS.balanced.r2_log,
+    r2_linear: STOP_PRESETS.balanced.r2_linear,
+    ftol: STOP_PRESETS.balanced.ftol,
+    xtol: STOP_PRESETS.balanced.xtol,
+    gtol: STOP_PRESETS.balanced.gtol,
+    max_nfev: STOP_PRESETS.balanced.max_nfev,
+  });
+  const [activeAreaMm2, setActiveAreaMm2] = useState(10.0);
+  const [cellPitchUm, setCellPitchUm] = useState(2.0);
+  const [fitHistory, setFitHistory] = useState<FitHistoryPoint[]>([]);
+  // 拟合收敛动画播放
+  const [animPlaying, setAnimPlaying] = useState(false);
+  const [animIndex, setAnimIndex] = useState(0);
+  const [plotSplit, setPlotSplit] = useState(0.7);
+  const [draggingSplit, setDraggingSplit] = useState(false);
+  const [yScaleMode, setYScaleMode] = useState<"linear" | "log">("linear");
+  const [workbenchLayout, setWorkbenchLayout] = useState<LayoutMode>("grid");
+  const [protectPrevious, setProtectPrevious] = useState(true);
+  const [protectWeight, setProtectWeight] = useState(0.4);
+  const [dragStepId, setDragStepId] = useState<string | null>(null);
+  const [dragOverStepIndex, setDragOverStepIndex] = useState<number | null>(null);
+  // 侧边栏 Tab 切换: "steps" = Transfer Steps + 数据 + 区间, "params" = BSIM3 参数
+  const [sidePanelTab, setSidePanelTab] = useState<"steps" | "params">("steps");
+  // ParamSliders 回调包装 (避免 JSX-in-JSX prop 嵌入)
+  const onBoundsChange = useCallback((name: string, next: { min?: string; max?: string }) => {
+    setCustomBounds(prev => ({ ...prev, [name]: next }));
+  }, []);
+  const onResetBounds = useCallback((name: string) => {
+    setCustomBounds(prev => { const n = { ...prev }; delete n[name]; return n; });
+  }, []);
+  const onResetCatBounds = useCallback((cat: string) => {
+    setCustomBounds(prev => { const n = { ...prev } as Record<string, { min?: string; max?: string }>; for (const p of BSIM3_PARAMS.filter(item => item.category === cat)) delete (n as Record<string, { min?: string; max?: string }>)[p.name]; return n; });
+  }, []);
+
+
+  // ---- 防抖 ----
+  const pendingRef = useRef<Record<string, number>>({});
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const animTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const chartPaneRef = useRef<HTMLDivElement>(null);
+  const stepRowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const stepDragRef = useRef<{ stepId: string; startY: number; active: boolean } | null>(null);
+  const suppressStepClickRef = useRef(false);
+
+  // mount 时 log 一次 (开发模式)
+  useEffect(() => {
+    setLog("info", "TransferFit mounted");
+    return () => setLog("info", "TransferFit unmounted");
+  }, [setLog]);
+
+  // 拟合收敛动画自动播放: 抽样到 ~30 帧, 200ms 一步
+  useEffect(() => {
+    if (!animPlaying) {
+      if (animTimerRef.current !== null) {
+        clearTimeout(animTimerRef.current);
+        animTimerRef.current = null;
+      }
+      return;
+    }
+    const total = fitHistory.length;
+    if (total === 0) return;
+    const targetFrames = 30;
+    const stepInterval = Math.max(1, Math.floor(total / targetFrames));
+    if (animIndex >= total - 1) {
+      setAnimPlaying(false);
+      return;
+    }
+    animTimerRef.current = setTimeout(() => {
+      setAnimIndex(i => Math.min(i + stepInterval, total - 1));
+    }, 200);
+    return () => {
+      if (animTimerRef.current !== null) clearTimeout(animTimerRef.current);
+    };
+  }, [animPlaying, animIndex, fitHistory.length]);
+
+  useEffect(() => {
+    if (!draggingSplit) return;
+    const onMove = (e: MouseEvent) => {
+      const rect = chartPaneRef.current?.getBoundingClientRect();
+      if (!rect || rect.height <= 0) return;
+      const next = (e.clientY - rect.top) / rect.height;
+      setPlotSplit(Math.max(0.45, Math.min(0.85, next)));
+    };
+    const onUp = () => setDraggingSplit(false);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [draggingSplit]);
+
+  // 拟合取消: AbortController 让 fetch 中断
+  const fitAbortRef = useRef<AbortController | null>(null);
+
+  const currentStepPatch = useCallback((overrides: Partial<TransferStep> = {}): TransferStep => ({
+    ...steps[activeStep],
+    csvPath,
+    raw,
+    simCurve,
+    vmin,
+    vmax,
+    vds,
+    rms: fitRMS,
+    r2Log: fitR2,
+    r2Linear: fitR2Linear,
+    fitHistory,
+    ...overrides,
+  }), [steps, activeStep, csvPath, raw, simCurve, vmin, vmax, vds, fitRMS, fitR2, fitR2Linear, fitHistory]);
+
+  const updateActiveStep = useCallback((overrides: Partial<TransferStep> = {}) => {
+    setSteps(prev => prev.map((step, idx) => (
+      idx === activeStep
+        ? {
+            ...step,
+            csvPath,
+            raw,
+            simCurve,
+            vmin,
+            vmax,
+            vds,
+            rms: fitRMS,
+            r2Log: fitR2,
+            r2Linear: fitR2Linear,
+            fitHistory,
+            ...overrides,
+          }
+        : step
+    )));
+  }, [activeStep, csvPath, raw, simCurve, vmin, vmax, vds, fitRMS, fitR2, fitR2Linear, fitHistory]);
+
+  const loadStepIntoEditor = useCallback((step: TransferStep) => {
+    setCsvPath(step.csvPath);
+    setRaw(step.raw);
+    setSimCurve(step.simCurve);
+    setVmin(step.vmin);
+    setVmax(step.vmax);
+    setVds(step.vds);
+    setFitRMS(step.rms);
+    setFitR2(step.r2Log);
+    setFitR2Linear(step.r2Linear);
+    setFitHistory(step.fitHistory ?? []);
+    setAnimIndex(0);
+    setAnimPlaying(false);
+  }, []);
+
+  const onSelectStep = useCallback((idx: number) => {
+    if (idx === activeStep || fitting) return;
+    const saved = currentStepPatch();
+    setSteps(prev => prev.map((step, i) => i === activeStep ? saved : step));
+    loadStepIntoEditor(idx === activeStep ? saved : steps[idx]);
+    setActiveStep(idx);
+  }, [activeStep, currentStepPatch, fitting, loadStepIntoEditor, steps]);
+
+  const onAddStep = useCallback(() => {
+    if (fitting) return;
+    const saved = currentStepPatch();
+    const nextVds = steps.length === 0 ? 0.5 : steps[steps.length - 1].vds;
+    const next = makeTransferStep(steps.length + 1, nextVds);
+    setSteps(prev => prev.map((step, i) => i === activeStep ? saved : step).concat(next));
+    loadStepIntoEditor(next);
+    setActiveStep(steps.length);
+  }, [activeStep, currentStepPatch, fitting, loadStepIntoEditor, steps]);
+
+  const onDeleteStep = useCallback((idx: number) => {
+    if (fitting || steps.length <= 1) return;
+    const saved = currentStepPatch();
+    const materialized = steps.map((step, i) => i === activeStep ? saved : step);
+    const nextSteps = materialized.filter((_, i) => i !== idx);
+    const nextActive = idx === activeStep
+      ? Math.min(idx, nextSteps.length - 1)
+      : idx < activeStep
+        ? activeStep - 1
+        : activeStep;
+    setSteps(nextSteps);
+    setActiveStep(nextActive);
+    loadStepIntoEditor(nextSteps[nextActive]);
+  }, [activeStep, currentStepPatch, fitting, loadStepIntoEditor, steps]);
+
+  const onReorderStep = useCallback((fromId: string, insertIdx: number) => {
+    if (fitting) return;
+    const saved = currentStepPatch();
+    const materialized = steps.map((step, i) => i === activeStep ? saved : step);
+    const fromIdx = materialized.findIndex(step => step.id === fromId);
+    if (fromIdx < 0) return;
+    const activeId = materialized[activeStep]?.id;
+    const next = [...materialized];
+    const [moved] = next.splice(fromIdx, 1);
+    const normalizedInsertIdx = Math.max(0, Math.min(insertIdx, materialized.length));
+    const adjustedInsertIdx = fromIdx < normalizedInsertIdx
+      ? normalizedInsertIdx - 1
+      : normalizedInsertIdx;
+    if (fromIdx === adjustedInsertIdx) return;
+    next.splice(adjustedInsertIdx, 0, moved);
+    const nextActive = Math.max(0, next.findIndex(step => step.id === activeId));
+    setSteps(next);
+    setActiveStep(nextActive);
+    loadStepIntoEditor(next[nextActive]);
+  }, [activeStep, currentStepPatch, fitting, loadStepIntoEditor, steps]);
+
+  const getStepInsertIndex = useCallback((clientY: number) => {
+    for (let idx = 0; idx < steps.length; idx += 1) {
+      const rect = stepRowRefs.current[steps[idx].id]?.getBoundingClientRect();
+      if (!rect) continue;
+      if (clientY < rect.top + rect.height / 2) return idx;
+    }
+    return steps.length;
+  }, [steps]);
+
+  useEffect(() => {
+    const onMove = (e: PointerEvent) => {
+      const drag = stepDragRef.current;
+      if (!drag || fitting) return;
+      const moved = Math.abs(e.clientY - drag.startY);
+      if (!drag.active && moved < 5) return;
+      if (!drag.active) {
+        drag.active = true;
+        suppressStepClickRef.current = true;
+        setDragStepId(drag.stepId);
+      }
+      setDragOverStepIndex(getStepInsertIndex(e.clientY));
+    };
+    const onUp = (e: PointerEvent) => {
+      const drag = stepDragRef.current;
+      if (!drag) return;
+      stepDragRef.current = null;
+      if (drag.active && !fitting) {
+        onReorderStep(drag.stepId, getStepInsertIndex(e.clientY));
+      }
+      setDragStepId(null);
+      setDragOverStepIndex(null);
+      window.setTimeout(() => {
+        suppressStepClickRef.current = false;
+      }, 0);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  }, [fitting, getStepInsertIndex, onReorderStep]);
+
+  const onCancelFit = useCallback(() => {
+    if (fitAbortRef.current) {
+      fitAbortRef.current.abort();
+      setLog("warn", "Fit cancelled by user");
+    }
+  }, [setLog]);
+
+  const onToggleFitTarget = useCallback((id: FitTargetId, on: boolean) => {
+    setSelectedFitTargets(prev => {
+      const next = new Set(prev);
+      on ? next.add(id) : next.delete(id);
+      return next;
+    });
+  }, []);
+
+  const onToggleStepFit = useCallback((idx: number, on: boolean) => {
+    setSteps(prev => prev.map((step, i) => (
+      i === idx ? { ...step, selectedForFit: on } : step
+    )));
+  }, []);
+
+  // 动画播放时, 实时显示对应 step 的 sim 曲线
+  const displaySim = animPlaying && fitHistory.length > 0
+    ? fitHistory[animIndex]?.sim ?? simCurve
+    : simCurve;
+  const displayParams = animPlaying && fitHistory.length > 0
+    ? fitHistory[animIndex]?.params ?? pvals
+    : pvals;
+
+  // ---- 绘图域（clientX → 数据 X）----
+  const plotRef = useRef<HTMLDivElement>(null);
+  const xDomain = useMemo(() => {
+    if (!raw || raw.ivar.length === 0) return [0, 1] as [number, number];
+    return [Math.min(...raw.ivar), Math.max(...raw.ivar)];
+  }, [raw]);
+  const plotMetrics = useRef<{ left: number; right: number; top: number; bottom: number } | null>(null);
+
+  const measurePlotArea = useCallback(() => {
+    const root = plotRef.current;
+    if (!root) return null;
+    const svg = root.querySelector("svg.recharts-surface") as SVGSVGElement | null;
+    const clipRect = root.querySelector("clipPath rect") as SVGRectElement | null;
+    if (!svg || !clipRect) return null;
+
+    const svgRect = svg.getBoundingClientRect();
+    const viewBox = svg.viewBox.baseVal;
+    const scaleX = viewBox.width > 0 ? svgRect.width / viewBox.width : 1;
+    const scaleY = viewBox.height > 0 ? svgRect.height / viewBox.height : 1;
+    const x = Number(clipRect.getAttribute("x") ?? 0);
+    const y = Number(clipRect.getAttribute("y") ?? 0);
+    const width = Number(clipRect.getAttribute("width") ?? 0);
+    const height = Number(clipRect.getAttribute("height") ?? 0);
+    if (!Number.isFinite(width) || width <= 0) return null;
+
+    return {
+      left: svgRect.left + x * scaleX,
+      right: svgRect.left + (x + width) * scaleX,
+      top: svgRect.top + y * scaleY,
+      bottom: svgRect.top + (y + height) * scaleY,
+    };
+  }, []);
+
+  // 测量绘图区
+  useEffect(() => {
+    if (!plotRef.current) return;
+    const update = () => {
+      const measured = measurePlotArea();
+      if (measured) {
+        plotMetrics.current = measured;
+        return;
+      }
+      const r = plotRef.current!.getBoundingClientRect();
+      plotMetrics.current = {
+        left: r.left + MARGIN.left,
+        right: r.left + r.width - MARGIN.right,
+        top: r.top + MARGIN.top,
+        bottom: r.top + r.height - MARGIN.bottom,
+      };
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(plotRef.current);
+    window.addEventListener("resize", update);
+    return () => { ro.disconnect(); window.removeEventListener("resize", update); };
+  }, [xDomain, raw, measurePlotArea]);
+
+  const pixelToDataX = useCallback((clientX: number): number | null => {
+    const metrics = measurePlotArea() ?? plotMetrics.current;
+    if (!metrics) return null;
+    const axisLeft = metrics.left;
+    const axisWidth = metrics.right - metrics.left;
+    if (axisWidth === 0) return null;
+    return xDomain[0] + ((clientX - axisLeft) / axisWidth) * (xDomain[1] - xDomain[0]);
+  }, [xDomain, measurePlotArea]);
+
+  // ---- 拖动全局事件 ----
+  useEffect(() => {
+    if (dragging === null) return;
+    const onMove = (e: MouseEvent) => {
+      const x = pixelToDataX(e.clientX);
+      if (x === null) return;
+      if (dragging === "min") {
+        setVmin(prev => Math.max(xDomain[0], Math.min(x, vmax - 0.05)));
+      } else {
+        setVmax(prev => Math.min(xDomain[1], Math.max(x, vmin + 0.05)));
+      }
+    };
+    const onUp = () => setDragging(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [dragging, vmin, vmax, pixelToDataX, xDomain]);
+
+  // 决定离鼠标最近的线
+  const decideLine = useCallback((dataX: number): null | "min" | "max" => {
+    const dMin = Math.abs(dataX - vmin);
+    const dMax = Math.abs(dataX - vmax);
+    const threshold = (xDomain[1] - xDomain[0]) * 0.03; // 3% domain
+    if (Math.min(dMin, dMax) > threshold) return null;
+    return dMin < dMax ? "min" : "max";
+  }, [vmin, vmax, xDomain]);
+
+  const onOverlayMouseDown = useCallback((e: React.MouseEvent) => {
+    const x = pixelToDataX(e.clientX);
+    if (x === null) return;
+    const line = decideLine(x);
+    if (line) {
+      setDragging(line);
+      e.preventDefault();
+    }
+  }, [pixelToDataX, decideLine]);
+
+  // 计算 hover 光标样式
+  const [hoverCursor, setHoverCursor] = useState("crosshair");
+  const onOverlayMouseMove = useCallback((e: React.MouseEvent) => {
+    const x = pixelToDataX(e.clientX);
+    if (x === null) { setHoverCursor("crosshair"); return; }
+    const dMin = Math.abs(x - vmin);
+    const dMax = Math.abs(x - vmax);
+    const threshold = (xDomain[1] - xDomain[0]) * 0.03;
+    setHoverCursor(Math.min(dMin, dMax) < threshold ? "ew-resize" : "crosshair");
+  }, [pixelToDataX, vmin, vmax, xDomain]);
+
+  // ---- 加载 CSV: 优先用 Tauri invoke, fallback 用浏览器 file input ----
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const loadCsvData = useCallback(async (path: string) => {
+    setCsvPath(path);
+    setLog("info", `Loading CSV: ${path}`);
+    const r = await csvLoad(path);
+    console.log("[loadCsvData] received", r.ivar.length, "points, path:", path);
+    console.log("[loadCsvData] first ivar/dvar:", r.ivar[0], r.dvar[0], r.ivar[r.ivar.length-1], r.dvar[r.dvar.length-1]);
+    setLog("success", `Loaded ${r.ivar.length} pts from ${path.split(/[/\\]/).pop()}`);
+    const a = r.ivar[0], b = r.ivar[r.ivar.length - 1];
+    const nextRaw = { ivar: r.ivar, dvar: r.dvar, meta: r.metadata };
+    setRaw(nextRaw);
+    const nextVmin = Math.round((a + (b - a) * 0.4) * 2) / 2;
+    const nextVmax = Math.round((a + (b - a) * 0.6) * 2) / 2;
+    const nextSim = new Array(r.ivar.length).fill(0);
+    setVmin(nextVmin);
+    setVmax(nextVmax);
+    setSimCurve(nextSim);
+    setFitRMS(null);
+    setFitR2(null);
+    setFitR2Linear(null);
+    setFitHistory([]);
+    setAnimIndex(0);
+    setAnimPlaying(false);
+    setSteps(prev => prev.map((step, idx) => idx === activeStep ? {
+      ...step,
+      csvPath: path,
+      raw: nextRaw,
+      simCurve: nextSim,
+      vmin: nextVmin,
+      vmax: nextVmax,
+      vds,
+      status: "loaded",
+      rms: null,
+      r2Log: null,
+      r2Linear: null,
+      fitHistory: [],
+    } : step));
+  }, [activeStep, setLog, vds]);
+
+  const onLoad = useCallback(async () => {
+    setLoading(true);
+    try {
+      // 优先 Tauri invoke (有 native dialog)
+      let csvPath: string | null = null;
+      try {
+        csvPath = await invoke<string>("open_excel_file");
+      } catch {
+        csvPath = null;
+      }
+
+      // 检查是否拿到的是文件路径而不是误解析的 File 对象
+      if (csvPath && typeof csvPath === "string" && csvPath.endsWith(".csv")) {
+        await loadCsvData(csvPath);
+        return;
+      }
+
+      // Fallback: 浏览器模式下直接用 <input type="file"> + 上传到临时后端
+      csvPath = await pickCsvInBrowser();
+      if (csvPath) await loadCsvData(csvPath);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  }, [loadCsvData]);
+
+  // 在浏览器里通过 file input + 后端 upload 拿到路径
+  const pickCsvInBrowser = useCallback(async (): Promise<string | null> => {
+    return new Promise((resolve) => {
+      // 创建一个临时 file input
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = ".csv";
+      input.onchange = async () => {
+        const file = input.files?.[0];
+        if (!file) return resolve(null);
+        // 上传到后端临时目录（一个新端点 /csv/upload）
+        const form = new FormData();
+        form.append("file", file);
+        try {
+          const res = await fetch("http://127.0.0.1:8765/api/csv/upload", {
+            method: "POST",
+            body: form,
+          });
+          if (!res.ok) { alert("上传失败"); return resolve(null); }
+          const data = await res.json();
+          resolve(data.csv_path);
+        } catch (e) {
+          alert(`上传失败: ${e}`);
+          resolve(null);
+        }
+      };
+      input.click();
+    });
+  }, []);
+
+  const powerParams = useMemo(() => ({
+    active_area_mm2: Math.min(Math.max(Number(activeAreaMm2) || 10.0, 1e-6), 1e6),
+    cell_pitch_um: Math.min(Math.max(Number(cellPitchUm) || 2.0, 0.01), 1000),
+  }), [activeAreaMm2, cellPitchUm]);
+
+  // ---- 实时 LTspice 仿真（防抖 300ms）----
+  const doSim = useCallback(async (params: Record<string, number>) => {
+    if (!csvPath) return;
+    setSimulating(true);
+    try {
+      const r = await csvSimulate(csvPath, {
+        curveType: "idvg",
+        paramOverrides: params,
+        vds,
+        powerParams,
+      });
+      setSimCurve(r.sim);
+      setSteps(prev => prev.map((step, idx) => idx === activeStep ? {
+        ...step,
+        simCurve: r.sim,
+        status: step.status === "fitted" ? "fitted" : "simulated",
+      } : step));
+    } catch (e) {
+      console.error("simulate failed:", e);
+    } finally {
+      setSimulating(false);
+    }
+  }, [activeStep, csvPath, vds, powerParams]);
+
+  // 参数变化 -> 防抖刷新 sim
+  const [simulating, setSimulating] = useState(false);
+  const onParamChange = useCallback((name: string, value: number) => {
+    setPvals(prev => ({ ...prev, [name]: value }));
+    pendingRef.current = { ...pendingRef.current, [name]: value };
+    if (timerRef.current !== null) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => {
+      void doSim({ ...pvals, ...pendingRef.current });
+      pendingRef.current = {};
+    }, 300);
+  }, [doSim, pvals]);
+
+  const onCheck = useCallback((name: string, on: boolean) => {
+    if (lockedParams.has(name)) return;
+    setChecked(prev => {
+      const n = new Set(prev);
+      on ? n.add(name) : n.delete(name);
+      return n;
+    });
+  }, [lockedParams]);
+
+  const onToggleLock = useCallback((name: string) => {
+    setLockedParams(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) {
+        next.delete(name);
+      } else {
+        next.add(name);
+        setChecked(old => {
+          const n = new Set(old);
+          n.delete(name);
+          return n;
+        });
+      }
+      return next;
+    });
+  }, []);
+
+  const fitParamNames = useMemo(() => (
+    Array.from(checked).filter(name => !lockedParams.has(name))
+  ), [checked, lockedParams]);
+
+  const lockParamsAfterFit = useCallback((names: string[]) => {
+    if (names.length === 0) return;
+    setLockedParams(prev => {
+      const next = new Set(prev);
+      names.forEach(name => next.add(name));
+      return next;
+    });
+    setChecked(prev => {
+      const next = new Set(prev);
+      names.forEach(name => next.delete(name));
+      return next;
+    });
+  }, []);
+
+  const applyActiveFitHistory = useCallback((history: FitHistoryPoint[]) => {
+    setFitHistory(history);
+    setSteps(prev => prev.map((step, idx) => (
+      idx === activeStep ? { ...step, fitHistory: history } : step
+    )));
+  }, [activeStep]);
+
+  const onReset = useCallback((name: string) => {
+    const spec = BSIM3_PARAMS.find(p => p.name === name);
+    if (!spec) return;
+    onParamChange(name, spec.default);
+  }, [onParamChange]);
+
+  const onResetCat = useCallback((cat: string) => {
+    const catP = BSIM3_PARAMS.filter(p => p.category === cat);
+    const next = { ...pvals };
+    catP.forEach(p => { next[p.name] = p.default; });
+    setPvals(next);
+    if (timerRef.current !== null) clearTimeout(timerRef.current);
+    void doSim(next);
+  }, [pvals, doSim]);
+
+  const parseBound = useCallback((rawValue: string | undefined, fallback: number): number => {
+    if (rawValue === undefined || rawValue.trim() === "" || rawValue.trim() === "-") return fallback;
+    const value = Number.parseFloat(rawValue);
+    return Number.isFinite(value) ? value : fallback;
+  }, []);
+
+  const fitParamBounds = useMemo(() => {
+    const out: Record<string, [number, number]> = {};
+    for (const name of fitParamNames) {
+      const spec = BSIM3_PARAMS.find(p => p.name === name);
+      if (!spec) continue;
+      const cb = customBounds[name];
+      const lo = parseBound(cb?.min, spec.lower);
+      const hi = parseBound(cb?.max, spec.upper);
+      if (Number.isFinite(lo) && Number.isFinite(hi) && lo < hi) {
+        out[name] = [lo, hi];
+      }
+    }
+    return out;
+  }, [fitParamNames, customBounds, parseBound]);
+
+  const protectedCurves = useMemo(() => {
+    if (!protectPrevious) return [];
+    return steps.slice(0, activeStep)
+      .filter(step => step.status === "fitted" && step.csvPath && step.raw)
+      .map(step => ({
+        csvPath: step.csvPath,
+        vds: step.vds,
+        vmin: step.vmin,
+        vmax: step.vmax,
+        weight: protectWeight,
+      }));
+  }, [activeStep, protectPrevious, protectWeight, steps]);
+
+  const fitStopPayload = useMemo(() => ({
+    r2_log: Math.min(Math.max(Number(fitStop.r2_log) || 0.99, 0), 0.999999),
+    r2_linear: Math.min(Math.max(Number(fitStop.r2_linear) || 0.99, 0), 0.999999),
+    ftol: Math.min(Math.max(Number(fitStop.ftol) || 1e-6, 1e-12), 1e-2),
+    xtol: Math.min(Math.max(Number(fitStop.xtol) || 1e-6, 1e-12), 1e-2),
+    gtol: Math.min(Math.max(Number(fitStop.gtol) || 1e-6, 1e-12), 1e-2),
+    max_nfev: Math.min(Math.max(Math.round(Number(fitStop.max_nfev) || 120), 5), 10000),
+  }), [fitStop]);
+
+  const updateStopValue = useCallback((key: keyof typeof fitStop, value: number) => {
+    setStopPreset("custom");
+    setFitStop(prev => ({ ...prev, [key]: value }));
+  }, []);
+
+  const applyStopPreset = useCallback((preset: StopPreset) => {
+    setStopPreset(preset);
+    if (preset !== "custom") {
+      const next = STOP_PRESETS[preset];
+      setFitStop({
+        ftol: next.ftol,
+        xtol: next.xtol,
+        gtol: next.gtol,
+        max_nfev: next.max_nfev,
+        r2_log: next.r2_log,
+        r2_linear: next.r2_linear,
+      });
+    }
+  }, []);
+
+  // ---- Fit ----
+  const onFit = useCallback(async () => {
+    setFitting(true);
+    setFitRMS(null);
+    setFitR2(null);
+    setFitR2Linear(null);
+    applyActiveFitHistory([]);
+    setAnimIndex(0);
+    setAnimPlaying(false);
+    // 创建 AbortController 用于取消
+    const abort = new AbortController();
+    fitAbortRef.current = abort;
+    let bestPoint: FitHistoryPoint | null = null;
+    const isBetterPoint = (next: FitHistoryPoint, best: FitHistoryPoint | null): boolean => {
+      if (!best) return true;
+      const nextRms = Number.isFinite(next.fit_rms) && next.fit_rms > 0 ? next.fit_rms : Number.POSITIVE_INFINITY;
+      const bestRms = Number.isFinite(best.fit_rms) && best.fit_rms > 0 ? best.fit_rms : Number.POSITIVE_INFINITY;
+      if (Number.isFinite(nextRms) || Number.isFinite(bestRms)) return nextRms < bestRms;
+      return (next.r2_log + next.r2_linear) > (best.r2_log + best.r2_linear);
+    };
+    const commitPoint = (point: FitHistoryPoint, reason: string) => {
+      setSimCurve(point.sim);
+      setPvals(prev => ({ ...prev, ...point.params }));
+      pendingRef.current = {};
+      setFitRMS(point.fit_rms);
+      setFitR2(point.r2_log);
+      setFitR2Linear(point.r2_linear);
+      setSteps(prev => prev.map((step, idx) => idx === activeStep ? {
+        ...step,
+        csvPath,
+        raw,
+        simCurve: point.sim,
+        vmin,
+        vmax,
+        vds,
+        status: "fitted",
+        rms: point.fit_rms,
+        r2Log: point.r2_log,
+        r2Linear: point.r2_linear,
+        fitHistory: step.fitHistory,
+        fittedParams: point.params,
+      } : step));
+      lockParamsAfterFit(Object.keys(point.params));
+      setLog("success", `${reason}: saved current best, RMS=${point.fit_rms.toFixed(4)}, R²(log)=${point.r2_log.toFixed(4)}, R²(linear)=${point.r2_linear.toFixed(4)}`);
+    };
+    const enrichMetrics = (point: FitHistoryPoint, prev: FitHistoryPoint | undefined): FitHistoryPoint => {
+      const fitRms = point.fit_rms > 0 ? point.fit_rms : Math.max(1e-12, 1 - point.r2_log);
+      if (!prev) return { ...point, fit_rms: fitRms };
+      const prevRms = prev.fit_rms > 0 ? prev.fit_rms : Math.max(1e-12, 1 - prev.r2_log);
+      const cost = fitRms * fitRms;
+      const prevCost = prevRms * prevRms;
+      const keys = Array.from(new Set([...Object.keys(point.params), ...Object.keys(prev.params)]));
+      const delta = keys.map(k => (point.params[k] ?? 0) - (prev.params[k] ?? 0));
+      const curr = keys.map(k => point.params[k] ?? 0);
+      const norm = (arr: number[]) => Math.sqrt(arr.reduce((s, v) => s + v * v, 0));
+      const ftolLocal = Math.abs(prevCost - cost) / Math.max(Math.abs(prevCost), Math.abs(cost), 1e-30);
+      const xtolLocal = norm(delta) / (1 + norm(curr));
+      const gtolLocal = Math.abs(prevRms - fitRms) / Math.max(Math.abs(prevRms), Math.abs(fitRms), 1e-30);
+      return {
+        ...point,
+        fit_rms: fitRms,
+        ftol_metric: point.ftol_metric > 0 ? point.ftol_metric : ftolLocal,
+        xtol_metric: point.xtol_metric > 0 ? point.xtol_metric : xtolLocal,
+        gtol_metric: point.gtol_metric > 0 ? point.gtol_metric : gtolLocal,
+      };
+    };
+    let committedEarlyStop = false;
+    try {
+      const params = fitParamNames;
+      if (!csvPath || !raw) {
+        setFitting(false);
+        return;
+      }
+      if (!selectedFitTargets.has("idvg")) {
+        setLog("warn", "IdVg / Transfer 未勾选，无法执行当前 IdVg 拟合。");
+        setFitting(false);
+        return;
+      }
+      if (!steps[activeStep]?.selectedForFit) {
+        setLog("warn", "当前 IdVg step 未勾选，不会参与拟合。请先在左侧 tree 勾选该 step。");
+        setFitting(false);
+        return;
+      }
+      if (params.length === 0) {
+        setLog("warn", "没有可拟合参数：已勾选的参数都被锁住了，请先解锁或重新勾选参数。");
+        setFitting(false);
+        return;
+      }
+      const protectText = protectedCurves.length > 0 ? `, protect=${protectedCurves.length} step(s), weight=${protectWeight}` : "";
+      setLog("info", `Fit start: Vds=${vds}V, range [${vmin.toFixed(2)}, ${vmax.toFixed(2)}] V${protectText}, AA=${powerParams.active_area_mm2}mm², pitch=${powerParams.cell_pitch_um}µm, stop=R²log:${fitStopPayload.r2_log.toFixed(3)}, R²lin:${fitStopPayload.r2_linear.toFixed(3)}, ftol:${fmtTol(fitStopPayload.ftol)}, xtol:${fmtTol(fitStopPayload.xtol)}, gtol:${fmtTol(fitStopPayload.gtol)}, max_nfev:${fitStopPayload.max_nfev}, params=${params.join(",")}`);
+      setSimulating(true);
+      let stepCount = 0;
+      const streamedHistory: FitHistoryPoint[] = [];
+      let lastBoundEventCount = 0;
+      for await (const ev of csvFitStream({
+        csvPath,
+        paramNames: params,
+        paramBounds: fitParamBounds,
+        initialParams: pvals,
+        protectCurves: protectedCurves,
+        vmin, vmax, vds, historyInterval: 1,
+        stop: fitStopPayload,
+        powerParams,
+        signal: abort.signal,
+      })) {
+          if (ev.kind === "step" && ev.sim && ev.params) {
+            stepCount++;
+            const point = enrichMetrics({
+              step: ev.step,
+              params: ev.params,
+              sim: ev.sim as number[],
+              r2_linear: ev.r2_linear ?? ev.r2 ?? 0,
+              r2_log: ev.r2_log ?? 0,
+              ftol_metric: ev.ftol_metric ?? 0,
+              xtol_metric: ev.xtol_metric ?? 0,
+              gtol_metric: ev.gtol_metric ?? 0,
+              fit_rms: ev.fit_rms ?? 0,
+              bound_events: ev.bound_events ?? [],
+            }, streamedHistory[streamedHistory.length - 1]);
+            if (isBetterPoint(point, bestPoint)) bestPoint = point;
+            streamedHistory.push(point);
+            applyActiveFitHistory([...streamedHistory]);
+            setSimCurve(point.sim);
+            setPvals(prev => ({ ...prev, ...ev.params }));
+            const eventCount = point.bound_events?.length ?? 0;
+            if (eventCount > lastBoundEventCount) {
+              const latest = point.bound_events?.slice(lastBoundEventCount) ?? [];
+              const summary = latest
+                .map(e => `${String(e.param)}:${String(e.side)}`)
+                .join(", ");
+              setLog("warn", `Bounds hit: ${summary}`);
+              lastBoundEventCount = eventCount;
+            }
+            if (point.r2_log >= fitStopPayload.r2_log && point.r2_linear >= fitStopPayload.r2_linear) {
+              commitPoint(point, "R² stop reached");
+              committedEarlyStop = true;
+              abort.abort();
+              break;
+            }
+          } else if (ev.kind === "final" || (ev.fitted_params && ev.ivar)) {
+            const r2Log = ev.r2_log ?? ev.r2 ?? null;
+            if (ev.sim && ev.fitted_params) {
+              const finalPoint = {
+                step: ev.step ?? -1,
+                params: ev.fitted_params,
+                sim: ev.sim,
+                r2_linear: ev.r2_linear ?? ev.r2 ?? 0,
+                r2_log: ev.r2_log ?? ev.r2 ?? 0,
+                ftol_metric: ev.ftol_metric ?? streamedHistory[streamedHistory.length - 1]?.ftol_metric ?? 0,
+                xtol_metric: ev.xtol_metric ?? streamedHistory[streamedHistory.length - 1]?.xtol_metric ?? 0,
+                gtol_metric: ev.gtol_metric ?? streamedHistory[streamedHistory.length - 1]?.gtol_metric ?? 0,
+                fit_rms: ev.fit_rms ?? ev.rms ?? 0,
+                bound_events: ev.bound_events ?? [],
+              };
+              if (streamedHistory.length === 0 || streamedHistory[streamedHistory.length - 1].sim !== finalPoint.sim) {
+                streamedHistory.push(finalPoint);
+                applyActiveFitHistory([...streamedHistory]);
+              }
+              if (isBetterPoint(finalPoint, bestPoint)) bestPoint = finalPoint;
+            }
+            setSimCurve(ev.sim!);
+            setPvals(prev => ({ ...prev, ...ev.fitted_params! }));
+            setFitRMS(ev.rms ?? null);
+            setFitR2(r2Log);
+            setFitR2Linear(ev.r2_linear ?? null);
+            setSteps(prev => prev.map((step, idx) => idx === activeStep ? {
+              ...step,
+              csvPath,
+              raw,
+              simCurve: ev.sim ?? step.simCurve,
+              vmin,
+              vmax,
+              vds,
+              status: "fitted",
+              rms: ev.rms ?? null,
+              r2Log,
+              r2Linear: ev.r2_linear ?? null,
+              fitHistory: streamedHistory,
+              fittedParams: ev.fitted_params,
+            } : step));
+            if (ev.success !== false) lockParamsAfterFit(params);
+            if ((ev.bound_events?.length ?? 0) > lastBoundEventCount) {
+              const latest = ev.bound_events?.slice(lastBoundEventCount) ?? [];
+              const summary = latest
+                .map(e => `${String(e.param)}:${String(e.side)}`)
+                .join(", ");
+              setLog("warn", `Bounds hit: ${summary}`);
+            }
+            const stopReason = ev.optimizer_message ? `, stop="${ev.optimizer_message}"` : "";
+            const evalText = ev.nfev ? `, nfev=${ev.nfev}` : "";
+            const logLevel = ev.success === false ? "warn" : "success";
+            setLog(logLevel, `Fit done: ${stepCount} steps${evalText}, RMS=${ev.rms?.toFixed(4)}, R²(log)=${r2Log?.toFixed(4)}, R²(linear)=${ev.r2_linear?.toFixed(4)}${stopReason}`);
+          } else if (ev.kind === "error") {
+            throw new Error(ev.error);
+          }
+        }
+    } catch (e: any) {
+      if (e?.name === "AbortError" || /aborted|cancel/i.test(String(e?.message))) {
+        if (committedEarlyStop) {
+          // Already saved the R²-qualified point.
+        } else if (bestPoint) {
+          commitPoint(bestPoint, "Fit stopped by user");
+        } else {
+          setLog("info", "Fit aborted");
+        }
+      } else {
+        console.error("fit failed:", e);
+        setLog("error", `Fit failed: ${e?.message ?? e}`);
+      }
+    } finally {
+      fitAbortRef.current = null;
+      setSimulating(false);
+      setFitting(false);
+    }
+  }, [activeStep, csvPath, raw, fitParamNames, fitParamBounds, protectedCurves, protectWeight, fitStopPayload, powerParams, pvals, selectedFitTargets, steps, vmin, vmax, vds, setLog, applyActiveFitHistory, lockParamsAfterFit]);
+
+  const onJointFit = useCallback(async () => {
+    const saved = currentStepPatch();
+    const materialized = steps.map((step, idx) => idx === activeStep ? saved : step);
+    if (!selectedFitTargets.has("idvg")) {
+      setLog("warn", "IdVg / Transfer 未勾选，当前只有 IdVg 已接入真实拟合。");
+      return;
+    }
+    const loadedSteps = materialized
+      .map((step, idx) => ({ step, idx }))
+      .filter(({ step }) => step.selectedForFit && step.csvPath && step.raw);
+
+    if (loadedSteps.length < 2) {
+      setLog("warn", "IdVg joint fit needs at least 2 checked and loaded steps");
+      return;
+    }
+
+    const params = fitParamNames;
+    if (params.length === 0) {
+      setLog("warn", "没有可拟合参数：已勾选的参数都被锁住了，请先解锁或重新勾选参数。");
+      return;
+    }
+
+    setFitting(true);
+    applyActiveFitHistory([]);
+    setAnimIndex(0);
+    setAnimPlaying(false);
+    setSimulating(true);
+
+    const abort = new AbortController();
+    fitAbortRef.current = abort;
+    const enrichJointMetrics = (point: FitHistoryPoint, prev: FitHistoryPoint | undefined): FitHistoryPoint => {
+      const fitRms = point.fit_rms > 0 ? point.fit_rms : Math.max(1e-12, 1 - point.r2_log);
+      if (!prev) return { ...point, fit_rms: fitRms };
+      const prevRms = prev.fit_rms > 0 ? prev.fit_rms : Math.max(1e-12, 1 - prev.r2_log);
+      const cost = fitRms * fitRms;
+      const prevCost = prevRms * prevRms;
+      const keys = Array.from(new Set([...Object.keys(point.params), ...Object.keys(prev.params)]));
+      const delta = keys.map(k => (point.params[k] ?? 0) - (prev.params[k] ?? 0));
+      const curr = keys.map(k => point.params[k] ?? 0);
+      const norm = (arr: number[]) => Math.sqrt(arr.reduce((s, v) => s + v * v, 0));
+      const ftolLocal = Math.abs(prevCost - cost) / Math.max(Math.abs(prevCost), Math.abs(cost), 1e-30);
+      const xtolLocal = norm(delta) / (1 + norm(curr));
+      const gtolLocal = Math.abs(prevRms - fitRms) / Math.max(Math.abs(prevRms), Math.abs(fitRms), 1e-30);
+      return {
+        ...point,
+        fit_rms: fitRms,
+        ftol_metric: point.ftol_metric > 0 ? point.ftol_metric : ftolLocal,
+        xtol_metric: point.xtol_metric > 0 ? point.xtol_metric : xtolLocal,
+        gtol_metric: point.gtol_metric > 0 ? point.gtol_metric : gtolLocal,
+      };
+    };
+
+    try {
+      const loadedStepIndexes = new Set(loadedSteps.map(item => item.idx));
+      const preparedSteps = materialized.map((step, idx) => (
+        loadedStepIndexes.has(idx) ? { ...step, fitHistory: [] } : step
+      ));
+      setSteps(preparedSteps);
+      const curveText = loadedSteps
+        .map(({ step }, i) => `Step${i + 1}:Vds=${step.vds}V,[${step.vmin.toFixed(2)},${step.vmax.toFixed(2)}]`)
+        .join("; ");
+      setLog("info", `Joint fit start: ${loadedSteps.length} steps, ${curveText}, params=${params.join(",")}`);
+
+      let stepCount = 0;
+      let lastBoundEventCount = 0;
+      let currentSteps = preparedSteps;
+      const historiesByStep = new Map<number, FitHistoryPoint[]>();
+      loadedSteps.forEach(({ idx }) => historiesByStep.set(idx, []));
+
+      for await (const ev of csvDualFitStream({
+        curves: loadedSteps.map(({ step }) => ({
+          csvPath: step.csvPath,
+          vds: step.vds,
+          vmin: step.vmin,
+          vmax: step.vmax,
+          weight: 1.0,
+        })),
+        paramNames: params,
+        paramBounds: fitParamBounds,
+        initialParams: pvals,
+        historyInterval: 1,
+        powerParams,
+        stop: fitStopPayload,
+        signal: abort.signal,
+      })) {
+        if (ev.kind === "step" && ev.curves && ev.params) {
+          stepCount++;
+          setPvals(prev => ({ ...prev, ...ev.params }));
+          pendingRef.current = {};
+
+          ev.curves.forEach(curve => {
+            const stepIdx = loadedSteps[curve.index]?.idx;
+            if (stepIdx === undefined) return;
+            const prevHistory = historiesByStep.get(stepIdx) ?? [];
+            const point = enrichJointMetrics({
+              step: ev.step,
+              params: ev.params!,
+              sim: curve.sim,
+              r2_linear: curve.r2_linear,
+              r2_log: curve.r2_log,
+              ftol_metric: ev.ftol_metric ?? 0,
+              xtol_metric: ev.xtol_metric ?? 0,
+              gtol_metric: ev.gtol_metric ?? 0,
+              fit_rms: ev.fit_rms ?? 0,
+              bound_events: ev.bound_events ?? [],
+            }, prevHistory[prevHistory.length - 1]);
+            historiesByStep.set(stepIdx, [...prevHistory, point]);
+          });
+
+          const nextSteps = currentSteps.map((step, idx) => {
+            const loadedIdx = loadedSteps.findIndex(item => item.idx === idx);
+            const curve = loadedIdx >= 0 ? ev.curves?.find(c => c.index === loadedIdx) : undefined;
+            if (!curve) return step;
+            return {
+              ...step,
+              simCurve: curve.sim,
+              status: "simulated" as const,
+              rms: ev.fit_rms ?? step.rms,
+              r2Log: curve.r2_log,
+              r2Linear: curve.r2_linear,
+              fitHistory: historiesByStep.get(idx) ?? step.fitHistory,
+            };
+          });
+          currentSteps = nextSteps;
+          setSteps(nextSteps);
+
+          const activeLoadedIdx = loadedSteps.findIndex(item => item.idx === activeStep);
+          const activeCurve = activeLoadedIdx >= 0 ? ev.curves.find(c => c.index === activeLoadedIdx) : undefined;
+          if (activeCurve) {
+            const activeHistory = historiesByStep.get(activeStep) ?? [];
+            setFitHistory(activeHistory);
+            setSimCurve(activeCurve.sim);
+            setFitRMS(activeHistory[activeHistory.length - 1]?.fit_rms ?? ev.fit_rms ?? null);
+            setFitR2(activeCurve.r2_log);
+            setFitR2Linear(activeCurve.r2_linear);
+          }
+
+          const eventCount = ev.bound_events?.length ?? 0;
+          if (eventCount > lastBoundEventCount) {
+            const latest = ev.bound_events?.slice(lastBoundEventCount) ?? [];
+            const summary = latest.map(e => `${String(e.param)}:${String(e.side)}`).join(", ");
+            setLog("warn", `Bounds hit: ${summary}`);
+            lastBoundEventCount = eventCount;
+          }
+        } else if (ev.kind === "final" && ev.curves && ev.fitted_params) {
+          const fittedParams = ev.fitted_params;
+          setPvals(prev => ({ ...prev, ...fittedParams }));
+          pendingRef.current = {};
+
+          const nextSteps = currentSteps.map((step, idx) => {
+            const loadedIdx = loadedSteps.findIndex(item => item.idx === idx);
+            const curve = loadedIdx >= 0 ? ev.curves?.find(c => c.index === loadedIdx) : undefined;
+            if (!curve) return step;
+            return {
+              ...step,
+              simCurve: curve.sim,
+              status: "fitted" as const,
+              rms: ev.rms ?? null,
+              r2Log: curve.r2_log,
+              r2Linear: curve.r2_linear,
+              fitHistory: historiesByStep.get(idx) ?? step.fitHistory,
+              fittedParams,
+            };
+          });
+          currentSteps = nextSteps;
+          setSteps(nextSteps);
+
+          const activeLoadedIdx = loadedSteps.findIndex(item => item.idx === activeStep);
+          const activeCurve = activeLoadedIdx >= 0 ? ev.curves.find(c => c.index === activeLoadedIdx) : undefined;
+          if (activeCurve) {
+            setSimCurve(activeCurve.sim);
+            setFitRMS(ev.rms ?? null);
+            setFitR2(activeCurve.r2_log);
+            setFitR2Linear(activeCurve.r2_linear);
+          } else {
+            setFitRMS(ev.rms ?? null);
+            setFitR2(ev.r_squared ?? null);
+            setFitR2Linear(ev.r_squared_linear ?? null);
+          }
+          if (ev.success !== false) lockParamsAfterFit(params);
+
+          const perCurveText = ev.curves
+            .map((curve, idx) => `Step${idx + 1}: R²log=${curve.r2_log.toFixed(4)}, R²lin=${curve.r2_linear.toFixed(4)}`)
+            .join("; ");
+          const stopReason = ev.optimizer_message ? `, stop="${ev.optimizer_message}"` : "";
+          const evalText = ev.nfev ? `, nfev=${ev.nfev}` : "";
+          setLog(
+            ev.success === false ? "warn" : "success",
+            `Joint fit done: ${stepCount} steps${evalText}, RMS=${ev.rms?.toFixed(4)}, pooled R²log=${ev.r_squared?.toFixed(4)}, pooled R²lin=${ev.r_squared_linear?.toFixed(4)}${stopReason}; ${perCurveText}`
+          );
+        } else if (ev.kind === "error") {
+          throw new Error(ev.error);
+        }
+      }
+    } catch (e: any) {
+      if (e?.name === "AbortError" || /aborted|cancel/i.test(String(e?.message))) {
+        setLog("info", "Joint fit aborted");
+      } else {
+        console.error("joint fit failed:", e);
+        setLog("error", `Joint fit failed: ${e?.message ?? e}`);
+      }
+    } finally {
+      fitAbortRef.current = null;
+      setSimulating(false);
+      setFitting(false);
+    }
+  }, [activeStep, fitParamNames, currentStepPatch, fitParamBounds, fitStopPayload, pvals, powerParams, selectedFitTargets, setLog, steps, applyActiveFitHistory, lockParamsAfterFit]);
+
+  // ---- 图表数据 (动画时显示动画帧的 sim) ----
+  const chartData = useMemo(() => {
+    if (!raw) return [];
+    return raw.ivar.map((x, i) => ({
+      x,
+      meas: yScaleMode === "log" ? positiveOrNull(raw.dvar[i]) : raw.dvar[i],
+      sim: yScaleMode === "log" ? positiveOrNull(displaySim[i]) : displaySim[i] ?? null,
+    }));
+  }, [raw, displaySim, yScaleMode]);
+
+  const logYDomain = useMemo(() => {
+    const vals = chartData
+      .flatMap(d => [d.meas, d.sim])
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0);
+    if (vals.length === 0) return [1e-12, 1] as [number, number];
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const lo = 10 ** Math.floor(Math.log10(Math.max(min, 1e-30)));
+    const hi = 10 ** Math.ceil(Math.log10(Math.max(max, lo * 10)));
+    return [lo, hi] as [number, number];
+  }, [chartData]);
+
+  const convergenceData = useMemo(() => (
+    fitHistory.map((h, idx) => ({
+      step: idx + 1,
+      r2_log: h.r2_log,
+      r2_linear: h.r2_linear,
+      ftol_metric: h.ftol_metric > 0 ? h.ftol_metric : 1e-12,
+      xtol_metric: h.xtol_metric > 0 ? h.xtol_metric : 1e-12,
+      gtol_metric: h.gtol_metric > 0 ? h.gtol_metric : 1e-12,
+    }))
+  ), [fitHistory]);
+
+  const convergenceRightDomain = useMemo(() => {
+    const vals = convergenceData
+      .flatMap(d => [d.ftol_metric, d.xtol_metric, d.gtol_metric])
+      .filter(v => Number.isFinite(v) && v > 0);
+    if (vals.length === 0) return [1e-12, 1] as [number, number];
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const lo = 10 ** Math.floor(Math.log10(Math.max(min, 1e-12)));
+    const hi = 10 ** Math.ceil(Math.log10(Math.max(max, lo * 10)));
+    return [lo, hi] as [number, number];
+  }, [convergenceData]);
+
+  const fittedParamRows = useMemo(() => {
+    const latest = fitHistory.length > 0 ? fitHistory[fitHistory.length - 1].params : pvals;
+    const names = fitHistory.length > 0 ? Object.keys(latest) : Array.from(checked);
+    return names.slice(0, 10).map(name => {
+      const spec = BSIM3_PARAMS.find(p => p.name === name);
+      return {
+        name,
+        value: latest[name] ?? pvals[name],
+        unit: spec?.unit ?? "",
+      };
+    });
+  }, [checked, fitHistory, pvals]);
+
+  const inRange = raw ? raw.ivar.filter(v => v >= vmin && v <= vmax).length : 0;
+  const fileName = csvPath.split(/[/\\]/).pop() ?? "";
+  const loadedStepCount = useMemo(() => {
+    const saved = currentStepPatch();
+    return steps.filter((step, idx) => {
+      const s = idx === activeStep ? saved : step;
+      return Boolean(s.selectedForFit && s.csvPath && s.raw);
+    }).length;
+  }, [activeStep, currentStepPatch, steps]);
+  const fitScopeSummary = useMemo(() => {
+    const selected = FIT_TARGET_TEMPLATES.filter(item => selectedFitTargets.has(item.id));
+    const count = selected.length;
+    const mode = count === 0 ? "No Fit Target" : count === 1 ? "Auto Single Fit" : "Auto Joint Fit";
+    return {
+      count,
+      mode,
+      labels: selected.map(item => item.label),
+      implementedCount: selected.filter(item => item.implemented).length,
+    };
+  }, [selectedFitTargets]);
+
+  const runWorkbenchAction = useCallback((action: string) => {
+    if (action === "import") {
+      void onLoad();
+      return;
+    }
+    if (action === "simulate") {
+      void doSim(pvals);
+      return;
+    }
+    if (action === "fit-current") {
+      void onFit();
+      return;
+    }
+    if (action === "fit-selected") {
+      if (loadedStepCount >= 2) {
+        void onJointFit();
+      } else {
+        void onFit();
+      }
+      return;
+    }
+    if (action === "stop") {
+      onCancelFit();
+      return;
+    }
+    if (action === "export") {
+      setLog("info", "Export 入口已保留，后续会接入模型/报告导出。");
+      return;
+    }
+    if (action === "reset-current") {
+      for (const name of Array.from(checked)) onReset(name);
+      setLog("info", "已重置当前勾选参数。");
+      return;
+    }
+    if (action === "lock-fitted") {
+      const fitted = steps.flatMap(step => step.fittedParams ? Object.keys(step.fittedParams) : []);
+      if (fitted.length === 0) {
+        setLog("warn", "当前还没有可锁定的拟合参数。");
+        return;
+      }
+      lockParamsAfterFit(Array.from(new Set(fitted)));
+      setLog("success", `已锁定 ${new Set(fitted).size} 个拟合参数。`);
+      return;
+    }
+    if (action === "about") {
+      setLog("info", "SpiceBuilder Workbench: 多电性曲线 SPICE 参数提取工作台。");
+    }
+  }, [checked, doSim, loadedStepCount, lockParamsAfterFit, onCancelFit, onFit, onJointFit, onLoad, onReset, pvals, setLog, steps]);
+
+  const canWorkbenchSimulate = Boolean(raw && !fitting && !simulating && selectedFitTargets.has("idvg"));
+  const canWorkbenchFit = Boolean(
+    selectedFitTargets.has("idvg") &&
+    ((raw && steps[activeStep]?.selectedForFit) || loadedStepCount >= 2)
+  );
+
+  return (
+    <div style={{
+      display: "flex",
+      flexDirection: "column",
+      height: "100%",
+      minHeight: 0,
+      overflow: "hidden",
+      background: WB.pageBg,
+    }}>
+      <style>{`
+        .spice-workbench ::-webkit-scrollbar { width: 6px; height: 6px; }
+        .spice-workbench ::-webkit-scrollbar-track { background: transparent; }
+        .spice-workbench ::-webkit-scrollbar-thumb { background: ${WB.borderMd}; border-radius: 3px; }
+      `}</style>
+      {!hideChrome && (<>
+        <WorkbenchMenuBar onAction={runWorkbenchAction} onLayout={setWorkbenchLayout} />
+        <WorkbenchToolbar
+          layout={workbenchLayout}
+          isRunning={fitting}
+          loadedCount={loadedStepCount}
+          activeStepName={steps[activeStep]?.name ?? `IdVg @ Vds=${vds}V`}
+          canImport={!loading && !fitting}
+          canSimulate={canWorkbenchSimulate}
+          canFit={canWorkbenchFit}
+          onLayout={setWorkbenchLayout}
+          onAction={runWorkbenchAction}
+        />
+      </>)}
+      <div className="spice-workbench" style={{ flex: 1, display: "flex", minHeight: 0, overflow: "hidden" }}>
+      {!hideFitTargetsPanel && (
+        <div style={{ width: 270, minWidth: 240, borderRight: "1px solid var(--border)", background: WB.panelBg, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)", fontSize: 12, fontWeight: 700 }}>
+            Electrical Targets
+          </div>
+          <div style={{ flex: 1, overflow: "auto", padding: 8 }}>
+            {FIT_TARGET_TEMPLATES.map(target => {
+              const checkedTarget = selectedFitTargets.has(target.id);
+              const expanded = expandedFitTargets.has(target.id);
+              return (
+                <div key={target.id} style={{ borderBottom: "1px solid var(--border)", padding: "6px 0" }}>
+                  <div
+                    onClick={() => setActiveTreeItem(target.id)}
+                    style={{ display: "flex", alignItems: "center", gap: 7, padding: "4px 2px", background: activeTreeItem === target.id ? WB.primaryLt : "transparent", cursor: "pointer" }}
+                  >
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setExpandedFitTargets(prev => {
+                          const next = new Set(prev);
+                          next.has(target.id) ? next.delete(target.id) : next.add(target.id);
+                          return next;
+                        });
+                      }}
+                      style={{ border: 0, background: "transparent", padding: 0, cursor: "pointer", display: "flex", color: WB.textSm }}
+                      title={expanded ? "Collapse" : "Expand"}
+                    >
+                      <ChevronRight size={13} style={{ transform: expanded ? "rotate(90deg)" : "none" }} />
+                    </button>
+                    <input
+                      type="checkbox"
+                      checked={checkedTarget}
+                      disabled={!target.implemented}
+                      onChange={e => onToggleFitTarget(target.id, e.target.checked)}
+                      title={target.implemented ? "参与拟合队列" : "后续版本开放"}
+                    />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: target.implemented ? WB.text : WB.textXs, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {target.label}
+                      </div>
+                      <div style={{ fontSize: 10, color: WB.textXs, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {target.hint}
+                      </div>
+                    </div>
+                    <span style={{ fontSize: 9, color: target.implemented ? WB.primary : WB.textXs, border: `1px solid ${target.implemented ? WB.primaryLt : WB.border}`, borderRadius: 3, padding: "1px 4px" }}>
+                      {target.implemented ? "LIVE" : "NEXT"}
+                    </span>
+                  </div>
+                  {expanded && (
+                    <div style={{ padding: "4px 0 0 30px", display: "flex", flexDirection: "column", gap: 4 }}>
+                      {target.children.map(child => (
+                        <div key={child} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6, alignItems: "center", fontSize: 10, color: target.implemented ? WB.textMd : WB.textXs }}>
+                          <button
+                            type="button"
+                            onClick={() => setActiveTreeItem(target.id === "idvg" ? "idvg-step" : target.id)}
+                            disabled={!target.implemented}
+                            style={{ textAlign: "left", border: 0, background: "transparent", padding: "3px 0", color: "inherit", cursor: target.implemented ? "pointer" : "default", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                          >
+                            {child}
+                          </button>
+                          <span>{target.id === "idvg" ? `${loadedStepCount} loaded` : "config"}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ borderTop: "1px solid var(--border)", padding: 10, fontSize: 10, color: WB.textSm }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+              <span>Mode</span><strong style={{ color: WB.text }}>{fitScopeSummary.mode}</strong>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span>Active targets</span><strong style={{ color: WB.primary }}>{fitScopeSummary.implementedCount}/{fitScopeSummary.count}</strong>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ===== 右栏: 曲线图 + 拖动覆盖层 ===== */}
+      <div style={{
+        flex: 1, minWidth: 360, display: "flex", flexDirection: "column",
+        overflow: "hidden",
+      }}>
+        <div style={{
+          padding: "12px 16px",
+          borderBottom: "1px solid var(--border)",
+          fontWeight: 600, fontSize: 13,
+          display: "flex", alignItems: "center", gap: 8,
+        }}>
+          Transfer characteristic · {steps[activeStep]?.name ?? `IdVg @ Vds=${vds}V`}
+          {dragging && <span style={{ fontSize: 10, color: "var(--primary)" }}>拖动 {dragging === "min" ? "min" : "max"} 线...</span>}
+        </div>
+        <div ref={chartPaneRef} style={{ flex: 1, minHeight: 400, display: "flex", flexDirection: "column", background: "#fff", overflow: "hidden", position: "relative" }}>
+          {!raw ? (
+            <div style={{
+              color: "var(--muted)", textAlign: "center",
+              marginTop: 80, fontSize: 14,
+            }}>
+              点 "Load CSV" 加载数据
+            </div>
+          ) : (
+            <>
+              <div
+                ref={plotRef}
+                style={{
+                  flex: `0 0 ${plotSplit * 100}%`,
+                  minHeight: 180,
+                  position: "relative",
+                  display: "flex",
+                  flexDirection: "column",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2, position: "relative", zIndex: 12 }}>
+                  <div style={{ fontSize: 10, color: "var(--muted)", flex: 1 }}>Vds = {vds} V</div>
+                  <div style={{ display: "inline-flex", border: "1px solid var(--border)", borderRadius: 4, overflow: "hidden" }}>
+                    {(["linear", "log"] as const).map(mode => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setYScaleMode(mode)}
+                        style={{
+                          border: 0,
+                          padding: "2px 7px",
+                          fontSize: 10,
+                          cursor: "pointer",
+                          background: yScaleMode === mode ? "var(--primary)" : "var(--surface)",
+                          color: yScaleMode === mode ? "#fff" : "var(--text)",
+                        }}
+                      >
+                        {mode === "linear" ? "Linear" : "Log"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={chartData} margin={MARGIN}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                    <XAxis dataKey="x" tick={{ fontSize: 10 }} type="number"
+                      domain={[xDomain[0], xDomain[1]]} allowDataOverflow />
+                    <YAxis
+                      tick={{ fontSize: 10 }}
+                      allowDataOverflow
+                      scale={yScaleMode === "log" ? "log" : "auto"}
+                      domain={yScaleMode === "log" ? logYDomain : ["auto", "auto"]}
+                      tickFormatter={v => yScaleMode === "log" ? Number(v).toExponential(0) : String(v)}
+                    />
+                    <Tooltip
+                      formatter={(v: number) => Number(v).toExponential(3)}
+                      labelFormatter={v => `Vgs=${(v as number).toFixed(3)}`}
+                      contentStyle={{ fontSize: 11 }}
+                    />
+                    <Legend wrapperStyle={{ fontSize: 11 }} />
+                    <ReferenceLine x={vmin} stroke="var(--warning)" strokeDasharray="4 2" strokeWidth={2} />
+                    <ReferenceLine x={vmax} stroke="var(--warning)" strokeDasharray="4 2" strokeWidth={2} />
+                    <Line type="monotone" dataKey="meas" stroke="#9ca3af" strokeWidth={1.5} dot={false} name="Measured" isAnimationActive={false} />
+                    <Line
+                      type="monotone"
+                      dataKey="sim"
+                      stroke="#0d99ff"
+                      strokeWidth={0}
+                      dot={{ r: 2.5, fill: "#0d99ff", stroke: "#fff", strokeWidth: 0.8 }}
+                      activeDot={{ r: 4, fill: "#0d99ff", stroke: "#fff", strokeWidth: 1 }}
+                      name="Simulated"
+                      isAnimationActive={false}
+                      connectNulls
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+                <div
+                  onMouseDown={(e) => {
+                    setDraggingSplit(true);
+                    e.preventDefault();
+                  }}
+                  style={{
+                    position: "absolute",
+                    left: 0,
+                    right: 0,
+                    bottom: -4,
+                    height: 8,
+                    cursor: "row-resize",
+                    background: draggingSplit ? "rgba(13,153,255,0.16)" : "transparent",
+                    zIndex: 5,
+                  }}
+                  title="拖动调整上下图区域比例"
+                />
+              </div>
+
+              <div style={{ height: 1, background: "var(--border)", flexShrink: 0 }} />
+
+              <div style={{ flex: 1, minHeight: 120, display: "grid", gridTemplateColumns: "minmax(260px, 2fr) minmax(220px, 1fr)", gap: 12, padding: "10px 12px 12px" }}>
+                <div style={{ minHeight: 0, display: "flex", flexDirection: "column" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, flex: 1 }}>Convergence</div>
+                    <span
+                      title="R²(log)：先对 Id 取 log10 再计算 R²，更关注阈值区、低电流区和跨数量级趋势。"
+                      style={{ fontSize: 10, color: "#0d99ff", border: "1px solid rgba(13,153,255,0.35)", borderRadius: 4, padding: "1px 4px", cursor: "help" }}
+                    >
+                      R²(log)
+                    </span>
+                    <span
+                      title="R²(linear)：直接用原始 Id 计算 R²，更关注大电流区的绝对电流误差。"
+                      style={{ fontSize: 10, color: "#059669", border: "1px solid rgba(16,185,129,0.35)", borderRadius: 4, padding: "1px 4px", cursor: "help" }}
+                    >
+                      R²(lin)
+                    </span>
+                  </div>
+                  {convergenceData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={convergenceData} margin={{ top: 8, right: 42, bottom: 18, left: 36 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                        <XAxis dataKey="step" tick={{ fontSize: 10 }} />
+                        <YAxis yAxisId="left" tick={{ fontSize: 10 }} domain={[0, 1]} />
+                        <YAxis
+                          yAxisId="right"
+                          orientation="right"
+                          tick={{ fontSize: 10 }}
+                          scale="log"
+                          domain={convergenceRightDomain}
+                          tickFormatter={v => Number(v).toExponential(0)}
+                          width={42}
+                        />
+                        <Tooltip
+                          formatter={(v: number, name: string) => {
+                            const n = Number(v);
+                            const value = String(name).startsWith("R²") ? n.toFixed(4) : n.toExponential(2);
+                            return [value, name];
+                          }}
+                          labelFormatter={v => `step ${v}`}
+                          contentStyle={{ fontSize: 11 }}
+                        />
+                        <Legend wrapperStyle={{ fontSize: 10 }} />
+                        <Line yAxisId="left" type="monotone" dataKey="r2_log" stroke="#0d99ff" strokeWidth={1.8} dot={false} name="R²(log)" isAnimationActive={false} />
+                        <Line yAxisId="left" type="monotone" dataKey="r2_linear" stroke="#10b981" strokeWidth={1.2} dot={false} name="R²(linear)" isAnimationActive={false} />
+                        <Line yAxisId="right" type="monotone" dataKey="ftol_metric" stroke="#f59e0b" strokeWidth={1} dot={false} name="Δcost(ftol)" isAnimationActive={false} connectNulls />
+                        <Line yAxisId="right" type="monotone" dataKey="xtol_metric" stroke="#8b5cf6" strokeWidth={1} dot={false} name="Δx(xtol)" isAnimationActive={false} connectNulls />
+                        <Line yAxisId="right" type="monotone" dataKey="gtol_metric" stroke="#ef4444" strokeWidth={1} dot={false} name="Δrms(gtol)" isAnimationActive={false} connectNulls />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <div style={{ color: "var(--muted)", fontSize: 12, paddingTop: 24 }}>拟合开始后显示收敛曲线</div>
+                  )}
+                </div>
+                <div style={{ minHeight: 0, overflow: "auto", borderLeft: "1px solid var(--border)", paddingLeft: 12 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6 }}>Fit Params</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "64px 1fr 38px", gap: 4, fontSize: 10, color: "var(--muted)", marginBottom: 4 }}>
+                    <span>Param</span><span>Value</span><span>Unit</span>
+                  </div>
+                  {fittedParamRows.map(row => (
+                    <div key={row.name} style={{ display: "grid", gridTemplateColumns: "64px 1fr 38px", gap: 4, alignItems: "center", fontSize: 11, lineHeight: 1.6 }}>
+                      <span style={{ fontFamily: "monospace", fontWeight: 700 }}>{row.name}</span>
+                      <span style={{ fontFamily: "monospace", color: "var(--primary)" }}>{fmtParam(row.value)}</span>
+                      <span style={{ color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis" }}>{row.unit}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div
+                onMouseDown={onOverlayMouseDown}
+                onMouseMove={onOverlayMouseMove}
+                style={{
+                  position: "absolute",
+                  top: 24,
+                  left: 0,
+                  right: 0,
+                  height: `calc(${plotSplit * 100}% - 24px)`,
+                  cursor: dragging ? "ew-resize" : hoverCursor,
+                  userSelect: "none",
+                  pointerEvents: "auto",
+                }}
+              />
+            </>
+          )}
+    </div>
+      <div style={{ width: 390, minWidth: 340, borderLeft: "1px solid var(--border)", background: WB.panelBg, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ display: "flex", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+          {(["steps", "params"] as const).map(tab => (
+            <button
+              key={tab}
+              type="button"
+              onClick={() => setSidePanelTab(tab)}
+              style={{
+                flex: 1,
+                border: 0,
+                borderBottom: sidePanelTab === tab ? `2px solid ${WB.primary}` : "2px solid transparent",
+                background: sidePanelTab === tab ? WB.primaryLt : "transparent",
+                color: sidePanelTab === tab ? WB.primary : WB.textSm,
+                padding: "9px 8px",
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: "pointer",
+              }}
+            >
+              {tab === "steps" ? "Target Config" : "BSIM Params"}
+            </button>
+          ))}
+        </div>
+        {sidePanelTab === "steps" ? (
+          <div style={{ flex: 1, overflow: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 12 }}>
+            <section>
+              <div style={{ fontSize: 11, fontWeight: 800, marginBottom: 8 }}>Transfer Steps</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {steps.map((step, idx) => (
+                  <div
+                    key={step.id}
+                    ref={el => { stepRowRefs.current[step.id] = el; }}
+                    onPointerDown={e => { stepDragRef.current = { stepId: step.id, startY: e.clientY, active: false }; }}
+                    onClick={() => {
+                      if (suppressStepClickRef.current) {
+                        suppressStepClickRef.current = false;
+                        return;
+                      }
+                      onSelectStep(idx);
+                    }}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "18px 1fr auto",
+                      gap: 6,
+                      alignItems: "center",
+                      padding: "7px 8px",
+                      border: `1px solid ${idx === activeStep ? WB.primary : WB.border}`,
+                      background: idx === activeStep ? WB.primaryLt : WB.panelBg,
+                      opacity: dragStepId === step.id ? 0.55 : 1,
+                      cursor: "pointer",
+                    }}
+                  >
+                    <GripVertical size={13} color={WB.textXs} />
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 11, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{step.name}</div>
+                      <div style={{ fontSize: 10, color: WB.textXs }}>{step.status} · R² {step.r2Log != null ? step.r2Log.toFixed(3) : "—"}</div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={idx === activeStep ? currentStepPatch().selectedForFit : step.selectedForFit}
+                      onClick={e => e.stopPropagation()}
+                      onChange={e => {
+                        const selectedForFit = e.target.checked;
+                        setSteps(prev => prev.map((item, itemIdx) => itemIdx === idx ? { ...item, selectedForFit } : item));
+                      }}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                <Button size="sm" variant="outline" onClick={onAddStep} disabled={fitting}><Plus size={13} />Add</Button>
+                <Button size="sm" variant="outline" onClick={() => onDeleteStep(activeStep)} disabled={fitting || steps.length <= 1}><Trash2 size={13} />Delete</Button>
+              </div>
+            </section>
+
+            <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <label style={{ fontSize: 10, color: WB.textSm }}>Vds (V)<input type="number" value={vds} step={0.1} onChange={e => setVds(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+              <label style={{ fontSize: 10, color: WB.textSm }}>Vmin<input type="number" value={vmin} step={0.05} onChange={e => setVmin(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+              <label style={{ fontSize: 10, color: WB.textSm }}>Vmax<input type="number" value={vmax} step={0.05} onChange={e => setVmax(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+              <label style={{ fontSize: 10, color: WB.textSm }}>Points<input readOnly value={inRange} style={{ width: "100%", marginTop: 3 }} /></label>
+            </section>
+
+            <section>
+              <div style={{ fontSize: 11, fontWeight: 800, marginBottom: 8 }}>Stop Criteria</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <label style={{ fontSize: 10, color: WB.textSm }}>Preset<select value={stopPreset} onChange={e => {
+                  const next = e.target.value as StopPreset;
+                  setStopPreset(next);
+                  if (next !== "custom") setFitStop(STOP_PRESETS[next]);
+                }} style={{ width: "100%", marginTop: 3 }}>
+                  <option value="fast">Fast</option><option value="balanced">Balanced</option><option value="precise">Precise</option><option value="custom">Custom</option>
+                </select></label>
+                <label style={{ fontSize: 10, color: WB.textSm }}>Max nfev<input type="number" value={fitStop.max_nfev} onChange={e => updateStopValue("max_nfev", Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+                <label style={{ fontSize: 10, color: WB.textSm }}>R² log<input type="number" value={fitStop.r2_log} step={0.001} onChange={e => updateStopValue("r2_log", Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+                <label style={{ fontSize: 10, color: WB.textSm }}>R² linear<input type="number" value={fitStop.r2_linear} step={0.001} onChange={e => updateStopValue("r2_linear", Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+              </div>
+            </section>
+
+            <section>
+              <div style={{ fontSize: 11, fontWeight: 800, marginBottom: 8 }}>Power Cell</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <label style={{ fontSize: 10, color: WB.textSm }}>Area mm²<input type="number" value={activeAreaMm2} step={0.1} onChange={e => setActiveAreaMm2(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+                <label style={{ fontSize: 10, color: WB.textSm }}>Pitch µm<input type="number" value={cellPitchUm} step={0.1} onChange={e => setCellPitchUm(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+              </div>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, fontSize: 11, color: WB.textSm }}>
+                <input type="checkbox" checked={protectPrevious} onChange={e => setProtectPrevious(e.target.checked)} />
+                Protect previous fitted curves
+              </label>
+              <label style={{ fontSize: 10, color: WB.textSm, display: "block", marginTop: 8 }}>Protect weight<input type="number" value={protectWeight} min={0} max={1} step={0.05} onChange={e => setProtectWeight(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+            </section>
+          </div>
+        ) : (
+          <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+            <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)", display: "flex", gap: 8, alignItems: "center" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 11, fontWeight: 800 }}>BSIM Parameters</div>
+                <div style={{ fontSize: 10, color: WB.textXs }}>{fitParamNames.length} selected · {lockedParams.size} locked</div>
+              </div>
+              <Button size="sm" variant="outline" onClick={() => setLockedParams(new Set())}>Unlock</Button>
+            </div>
+            <div style={{ flex: "1 1 58%", minHeight: 220, overflow: "auto", padding: 10 }}>
+              <ParamSliders
+                values={pvals}
+                checked={checked}
+                locked={lockedParams}
+                onChange={onParamChange}
+                onCheck={onCheck}
+                onToggleLock={onToggleLock}
+                onReset={onReset}
+                onResetCat={onResetCat}
+                bounds={customBounds}
+                onBoundsChange={onBoundsChange}
+                onResetBounds={onResetBounds}
+                onResetCatBounds={onResetCatBounds}
+              />
+            </div>
+            <div style={{ flex: "1 1 42%", minHeight: 150, borderTop: "1px solid var(--border)", overflow: "auto", padding: 10 }}>
+              <div style={{ fontSize: 11, fontWeight: 800, marginBottom: 7 }}>Iteration Trail</div>
+              {fitHistory.length === 0 ? (
+                <div style={{ fontSize: 11, color: WB.textXs }}>拟合开始后显示每轮 BSIM 参数和 R² 变化</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                  {fitHistory.slice(-12).map((point, idx) => (
+                    <button
+                      key={`${point.step}-${idx}`}
+                      type="button"
+                      onClick={() => {
+                        setPvals(prev => ({ ...prev, ...point.params }));
+                        setSimCurve(point.sim);
+                        setAnimIndex(Math.max(0, fitHistory.findIndex(item => item === point)));
+                      }}
+                      style={{ border: "1px solid var(--border)", background: idx === fitHistory.slice(-12).length - 1 ? WB.primaryLt : WB.panelBg, padding: 6, textAlign: "left", cursor: "pointer" }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontWeight: 700 }}>
+                        <span>Step {point.step}</span>
+                        <span>R² {point.r2_log.toFixed(4)} / {point.r2_linear.toFixed(4)}</span>
+                      </div>
+                      <div style={{ marginTop: 3, fontFamily: "monospace", fontSize: 10, color: WB.textSm, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {Object.entries(point.params).slice(0, 5).map(([name, value]) => `${name}=${fmtParam(value)}`).join("  ")}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+    </div>
+    </div>
+  );
+}

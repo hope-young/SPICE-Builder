@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-const PYTHON_BASE_URL: &str = "http://127.0.0.1:8000";
+const PYTHON_BASE_URL: &str = "http://127.0.0.1:8765";
 
 #[derive(Serialize)]
 pub struct ApiResponse {
@@ -22,6 +22,12 @@ pub async fn call_api(
     endpoint: String,
     body: Option<String>,
 ) -> Result<ApiResponse, String> {
+    // debug: log body 长度 + 前 200 字符
+    if let Some(b) = body.as_ref() {
+        log::info!("[call_api] method={} endpoint={} body_len={} body_preview={}", method, endpoint, b.len(), &b.chars().take(200).collect::<String>());
+    } else {
+        log::info!("[call_api] method={} endpoint={} (no body)", method, endpoint);
+    }
     let url = format!("{}{}", PYTHON_BASE_URL, endpoint);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))  // 拟合可能耗时

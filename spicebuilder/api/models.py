@@ -38,6 +38,20 @@ class FitRequest(BaseModel):
     optimizer: FitOptimizerConfig = Field(default_factory=FitOptimizerConfig, description="Optimizer hyperparameters")
 
 
+class PowerMOSSubcktParamsRequest(BaseModel):
+    """Power MOSFET subckt wrapper parameters outside the BSIM3 core."""
+    include_diode: bool = Field(True, description="Include body diode model in the wrapper")
+    rg_ohm: float = Field(1.6, description="External gate resistance in Ohms")
+    rd_ext_ohm: Optional[float] = Field(None, description="External drain resistance; None = use BSIM RD")
+    rs_ext_ohm: Optional[float] = Field(None, description="External source resistance; None = use BSIM RS")
+    rdrift_ohm: float = Field(0.0, description="Optional drift-region series resistance")
+    rjfet_ohm: float = Field(0.0, description="Optional JFET-region series resistance")
+    cell_count: int = Field(20000, description="Equivalent parallel cell count")
+    cell_w_m: float = Field(0.2, description="Single-cell channel width in meters")
+    active_area_mm2: float = Field(10.0, description="Active area in mm^2")
+    cell_pitch_um: float = Field(2.0, description="Cell pitch in micrometers")
+
+
 class ExportRequest(BaseModel):
     """Request payload for POST /projects/{id}/export."""
     format: str = Field("B", description="A: pure BSIM3 .model, B: .subckt wrapper")
@@ -46,6 +60,7 @@ class ExportRequest(BaseModel):
     rd_ohm: Optional[float] = Field(None, description="Override RD in Ohms (None = use fitted)")
     rs_ohm: Optional[float] = Field(None, description="Override RS in Ohms (None = use fitted)")
     include_diode: bool = Field(True, description="Include body diode subcircuit")
+    power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None, description="Subckt-level Power MOS parameters")
 
     @field_validator('format')
     @classmethod
@@ -150,6 +165,7 @@ class SimulateRequest(BaseModel):
     vds: float = Field(5.0, description="Vds bias (V) for Id-Vg sweep")
     vgs_v: float = Field(10.0, description="Fixed Vgs bias (V) for Id-Vd sweep")
     vds_max: float = Field(12.0, description="Max Vds (V) for Id-Vd sweep")
+    power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None, description="Subckt-level Power MOS parameters")
 
 
 class SimulateResponse(BaseModel):
@@ -172,6 +188,7 @@ class FitSingleRequest(BaseModel):
     vmax: float = Field(..., description="Upper bound of fit range")
     vds: float = Field(5.0, description="Vds bias (V) for IdVg")
     vgs_v: float = Field(10.0, description="Fixed Vgs for IdVd")
+    power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None, description="Subckt-level Power MOS parameters")
 
 
 class FitSingleResponse(BaseModel):
@@ -181,8 +198,11 @@ class FitSingleResponse(BaseModel):
     sim: List[float] = Field(..., description="Full simulated curve")
     meas: List[float] = Field(..., description="Measured curve")
     rms: float = Field(..., description="Root mean square of fit error on interval")
-    r_squared: float = Field(..., description="R² on the fit interval")
+    r_squared: float = Field(..., description="R² (对数域)")
+    r_squared_linear: float = Field(0.0, description="R² (线性域)")
     iterations: int = Field(0)
+    nfev: int = Field(0, description="Number of objective function evaluations")
+    optimizer_message: str = Field("", description="Optimizer stop reason")
     success: bool = True
 
 
@@ -197,6 +217,128 @@ class LoadCsvResponse(BaseModel):
     ivar: List[float]
     dvar: List[float]
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class CsvLoadRequest(BaseModel):
+    """Stateless CSV load: 只读 CSV, 不需要 project state。"""
+    csv_path: str = Field(..., description="Absolute path to the CSV file")
+    curve_type: Literal["idvg", "idvd", "cv", "qg", "body_diode"] = Field("idvg")
+
+
+class CsvSimulateRequest(BaseModel):
+    """Stateless simulate: 给定 CSV + 参数覆盖, 跑 LTspice 返回 sim+meas。"""
+    csv_path: str = Field(..., description="CSV path")
+    curve_type: Literal["idvg", "idvd"] = Field("idvg")
+    param_overrides: Dict[str, float] = Field(default_factory=dict)
+    vds: float = Field(0.5)
+    vgs_v: float = Field(10.0)
+    vds_max: float = Field(12.0)
+    power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
+
+
+class CsvLoadResponse(BaseModel):
+    curve_type: str
+    ivar: List[float]
+    dvar: List[float]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class CsvSimulateResponse(BaseModel):
+    curve_type: str
+    ivar: List[float]
+    sim: List[float]
+    meas: List[float]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class CsvFitStopConfig(BaseModel):
+    """User-tunable termination conditions for SingleFit CSV optimization."""
+    r2_log: float = Field(0.99, description="Stop when log-domain R² reaches this value")
+    r2_linear: float = Field(0.99, description="Stop when linear-domain R² reaches this value")
+    ftol: float = Field(1e-6, description="Stop when objective improvement is below this tolerance")
+    xtol: float = Field(1e-6, description="Stop when parameter update is below this tolerance")
+    gtol: float = Field(1e-6, description="Stop when gradient norm is below this tolerance")
+    max_nfev: int = Field(120, description="Maximum main objective evaluations")
+
+
+class CsvFitRequest(BaseModel):
+    """Stateless fit: 区间拟合单个 CSV。"""
+    csv_path: str = Field(..., description="CSV path")
+    curve_type: Literal["idvg"] = Field("idvg")
+    param_names: List[str]
+    param_bounds: Dict[str, List[float]] = Field(default_factory=dict)
+    initial_params: Dict[str, float] = Field(default_factory=dict)
+    protect_curves: List[Dict[str, Any]] = Field(default_factory=list)
+    vmin: float
+    vmax: float
+    vds: float = Field(0.5)
+    history_interval: int = Field(0, description="每 N 步记录一次 history (0=不记录, 1=每步都记)")
+    power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
+    stop: CsvFitStopConfig = Field(default_factory=CsvFitStopConfig)
+
+
+class CsvFitHistoryPoint(BaseModel):
+    """单步拟合状态 (用于前端实时动画展示收敛过程)"""
+    step: int
+    params: Dict[str, float]
+    sim: List[float]  # 区间内的仿真曲线
+    r2_linear: float
+    r2_log: float = 0.0
+    ftol_metric: float = 0.0
+    xtol_metric: float = 0.0
+    gtol_metric: float = 0.0
+    fit_rms: float = 0.0
+    bound_events: List[Dict[str, Any]] = []
+
+
+class CsvFitResponse(BaseModel):
+    fitted_params: Dict[str, float]
+    ivar: List[float]
+    sim: List[float]
+    meas: List[float]
+    rms: float
+    r_squared: float
+    r_squared_linear: float = 0.0  # 线性域 R² (用户可看直观误差)
+    iterations: int = 0
+    nfev: int = 0
+    optimizer_message: str = ""
+    success: bool = True
+    history: List[CsvFitHistoryPoint] = []  # 收敛轨迹 (空列表=不记录)
+    bound_events: List[Dict[str, Any]] = []
+
+
+class CurveSpec(BaseModel):
+    """联合拟合中的一条曲线规格"""
+    csv_path: str = Field(..., description="CSV 路径")
+    vds: float = Field(..., description="该曲线的 Vds 偏置 (V)")
+    vmin: float = Field(..., description="拟合区间下限 Vgs")
+    vmax: float = Field(..., description="拟合区间上限 Vgs")
+    weight: float = Field(1.0, description="该曲线在联合 residual 中的权重")
+
+
+class DualFitRequest(BaseModel):
+    """联合拟合: 多条曲线共享参数。"""
+    curves: List[CurveSpec] = Field(..., description="至少 2 条曲线")
+    param_names: List[str]
+    param_bounds: Dict[str, List[float]] = Field(default_factory=dict)
+    initial_params: Dict[str, float] = Field(default_factory=dict)
+    history_interval: int = Field(0)
+    power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
+    stop: CsvFitStopConfig = Field(default_factory=CsvFitStopConfig)
+
+
+class DualFitResponse(BaseModel):
+    fitted_params: Dict[str, float]
+    # 每条曲线的 sim/meas/ivar/r2 全段
+    curves: List[Dict] = []  # [{ivar, sim, meas, r2_linear, vds, vmin, vmax}, ...]
+    rms: float
+    r_squared: float              # log 域, 全曲线池化
+    r_squared_linear: float       # linear 域, 全曲线池化
+    iterations: int = 0
+    nfev: int = 0
+    optimizer_message: str = ""
+    success: bool = True
+    history: List[Dict] = []      # [{step, params, r2_linear_per_curve}, ...]
 
 
 class ErrorResponse(BaseModel):

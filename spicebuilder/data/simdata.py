@@ -114,6 +114,26 @@ class SimData:
             err = (fit - self.dvar) / np.where(self.dvar != 0, self.dvar, 1.0)
         self.data['errors'] = err
 
+    def filter_range(self, vmin: float, vmax: float) -> "SimData":
+        """按区间过滤，只保留 ivar 在 [vmin, vmax] 内的点
+
+        用于用户选择 Vgs 区间后，只对该区间做拟合。
+        """
+        col = np.asarray(self.data["ivar"], dtype=float)
+        mask = (col >= vmin) & (col <= vmax)
+        new_data = {k: (np.asarray(v)[mask] if v is not None else None)
+                    for k, v in self.data.items()}
+        new_metadata = dict(self.metadata)
+        new_metadata["filter_applied"] = f"ivar in [{vmin:.3f}, {vmax:.3f}]"
+        new_metadata["vmin"] = vmin
+        new_metadata["vmax"] = vmax
+        return SimData(
+            name=self.name + "_range",
+            curve_type=self.curve_type,
+            data=new_data,
+            metadata=new_metadata,
+        )
+
     def filter(self, op: str, value: float, dtype: str = "ivar") -> "SimData":
         """按条件过滤数据点
 

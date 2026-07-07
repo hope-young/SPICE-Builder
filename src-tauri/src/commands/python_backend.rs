@@ -14,8 +14,8 @@ use serde::Serialize;
 #[allow(dead_code)]
 const PYTHON_HOST: &str = "127.0.0.1";
 #[allow(dead_code)]
-const PYTHON_PORT: u16 = 8000;
-const PYTHON_URL: &str = "http://127.0.0.1:8000";
+const PYTHON_PORT: u16 = 8765;
+const PYTHON_URL: &str = "http://127.0.0.1:8765";
 const PYTHON_API_MODULE: &str = "spicebuilder.api.scripts.run_api";
 const STARTUP_TIMEOUT_S: u64 = 15;
 
@@ -187,14 +187,17 @@ pub async fn start_python_backend(
 pub async fn stop_python_backend(
     state: State<'_, PythonBackendState>,
 ) -> Result<(), String> {
-    let mut child_lock = state.child.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(mut child) = child_lock.take() {
+    // Take child out of the lock BEFORE any await to avoid Send issue
+    let child_opt = {
+        let mut child_lock = state.child.lock().unwrap_or_else(|e| e.into_inner());
+        child_lock.take()
+    };
+
+    if let Some(mut child) = child_opt {
         child
             .start_kill()
             .map_err(|e| format!("Failed to kill process: {}", e))?;
-        // Reap the child to avoid leaving zombie processes on Linux
-        // and orphaned handles on Windows.  Wait with a short timeout
-        // so we do not block indefinitely on a misbehaving child.
+        // Reap the child — no lock held across this await
         match tokio::time::timeout(
             std::time::Duration::from_secs(5),
             child.wait(),
@@ -203,10 +206,8 @@ pub async fn stop_python_backend(
             Err(_) => log::warn!("Python backend kill timed out during wait"),
         }
     }
-    let mut running = state.running.lock().unwrap_or_else(|e| e.into_inner());
-    *running = false;
-    let mut pid = state.pid.lock().unwrap_or_else(|e| e.into_inner());
-    *pid = None;
+    *state.running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *state.pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(())
 }
 

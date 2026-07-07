@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 
 import numpy as np
 import time
@@ -36,6 +37,261 @@ class SimulationResult:
     elapsed_s: float = 0.0
     measurements: dict = field(default_factory=dict)
     error: str = ""
+
+
+def _descendant_pids(root_pid: int) -> set[int]:
+    """Return child process ids for a root process on Windows."""
+    if os.name != "nt":
+        return set()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot == INVALID_HANDLE_VALUE:
+            return set()
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            parent_to_children: dict[int, set[int]] = {}
+            if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                return set()
+            while True:
+                parent_to_children.setdefault(int(entry.th32ParentProcessID), set()).add(int(entry.th32ProcessID))
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(snapshot)
+
+        found: set[int] = set()
+        pending = list(parent_to_children.get(int(root_pid), set()))
+        while pending:
+            child = pending.pop()
+            if child in found:
+                continue
+            found.add(child)
+            pending.extend(parent_to_children.get(child, set()))
+        return found
+    except Exception:
+        return set()
+
+
+def _hide_windows_for_pids(pids: set[int], restore_hwnd: int | None = None) -> None:
+    """Hide visible top-level windows owned by process ids on Windows.
+
+    CREATE_NO_WINDOW only affects console windows.  LTspice is a GUI
+    executable, and some versions briefly create/activate a main window even
+    in batch mode.  Enumerating by PID lets us suppress those windows without
+    touching unrelated applications.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        target_pids = {int(pid) for pid in pids}
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def enum_proc(hwnd, _lparam):
+            win_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+            if win_pid.value in target_pids and user32.IsWindowVisible(hwnd):
+                user32.ShowWindow(hwnd, 0)  # SW_HIDE
+            return True
+
+        user32.EnumWindows(enum_proc, 0)
+
+        if restore_hwnd:
+            fg = user32.GetForegroundWindow()
+            fg_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+            if fg_pid.value in target_pids and user32.IsWindow(restore_hwnd):
+                user32.SetForegroundWindow(restore_hwnd)
+    except Exception:
+        # Window suppression is best effort; simulation should still proceed.
+        return
+
+
+def _start_window_suppression(pid: int) -> tuple[threading.Event, threading.Thread] | None:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        restore_hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        restore_hwnd = None
+
+    stop = threading.Event()
+
+    def run() -> None:
+        # Poll quickly because the LTspice flash is usually very short.
+        while not stop.is_set():
+            target_pids = {int(pid)} | _descendant_pids(pid)
+            _hide_windows_for_pids(target_pids, restore_hwnd)
+            stop.wait(0.01)
+
+    thread = threading.Thread(target=run, name="ltspice-window-suppression", daemon=True)
+    thread.start()
+    return stop, thread
+
+
+def _run_on_hidden_desktop(cmd: list[str], cwd: str, timeout_s: int) -> tuple[int, str, str, float]:
+    """Run a GUI executable on a hidden Windows desktop.
+
+    This is stronger than CREATE_NO_WINDOW because GUI windows are created on
+    another desktop object instead of the user's active desktop.  LTspice may
+    still create windows internally, but they should be unable to flash on top
+    of SpiceBuilder or steal mouse focus.
+    """
+    if os.name != "nt":
+        raise RuntimeError("hidden desktop is Windows-only")
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    desktop_name = "SpiceBuilder_LTspice"
+    desktop_path = f"winsta0\\{desktop_name}"
+    DESKTOP_ALL_ACCESS = 0x000F01FF
+    STARTF_USESHOWWINDOW = 0x00000001
+    SW_HIDE = 0
+    CREATE_NO_WINDOW = 0x08000000
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    WAIT_TIMEOUT = 0x00000102
+    WAIT_OBJECT_0 = 0x00000000
+    INFINITE = 0xFFFFFFFF
+
+    class STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE),
+        ]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD),
+        ]
+
+    user32.CreateDesktopW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+    ]
+    user32.CreateDesktopW.restype = wintypes.HANDLE
+    user32.OpenDesktopW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+    ]
+    user32.OpenDesktopW.restype = wintypes.HANDLE
+    user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    user32.CloseDesktop.restype = wintypes.BOOL
+
+    kernel32.CreateProcessW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.LPVOID, wintypes.LPVOID,
+        wintypes.BOOL, wintypes.DWORD, wintypes.LPVOID, wintypes.LPCWSTR,
+        ctypes.POINTER(STARTUPINFOW), ctypes.POINTER(PROCESS_INFORMATION),
+    ]
+    kernel32.CreateProcessW.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    desktop = user32.OpenDesktopW(desktop_name, 0, False, DESKTOP_ALL_ACCESS)
+    if not desktop:
+        desktop = user32.CreateDesktopW(desktop_name, None, None, 0, DESKTOP_ALL_ACCESS, None)
+    if not desktop:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    si = STARTUPINFOW()
+    si.cb = ctypes.sizeof(STARTUPINFOW)
+    si.lpDesktop = desktop_path
+    si.dwFlags = STARTF_USESHOWWINDOW
+    si.wShowWindow = SW_HIDE
+
+    pi = PROCESS_INFORMATION()
+    command_line = subprocess.list2cmdline(cmd)
+    command_buf = ctypes.create_unicode_buffer(command_line)
+
+    start = time.time()
+    try:
+        ok = kernel32.CreateProcessW(
+            str(cmd[0]),
+            command_buf,
+            None,
+            None,
+            False,
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+            None,
+            cwd,
+            ctypes.byref(si),
+            ctypes.byref(pi),
+        )
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        wait_ms = int(timeout_s * 1000) if timeout_s is not None else INFINITE
+        wait_result = kernel32.WaitForSingleObject(pi.hProcess, wait_ms)
+        if wait_result == WAIT_TIMEOUT:
+            kernel32.TerminateProcess(pi.hProcess, 1)
+            kernel32.WaitForSingleObject(pi.hProcess, 2000)
+            raise subprocess.TimeoutExpired(cmd, timeout_s)
+        if wait_result != WAIT_OBJECT_0:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(pi.hProcess, ctypes.byref(code))
+        return int(code.value), "", "", time.time() - start
+    finally:
+        if pi.hThread:
+            kernel32.CloseHandle(pi.hThread)
+        if pi.hProcess:
+            kernel32.CloseHandle(pi.hProcess)
+        if desktop:
+            user32.CloseDesktop(desktop)
 
 
 def find_ltspice() -> Optional[str]:
@@ -172,20 +428,57 @@ class LTspiceBackend:
         # -ascii: 输出 ASCII .raw 格式（而非二进制），便于解析
 
         start = time.time()
+        proc = None
+        suppressor = None
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                cwd=str(netlist_path.parent),
-                # 隐藏窗口
-                creationflags=0x08000000 if os.name == 'nt' else 0,  # CREATE_NO_WINDOW
-            )
-            elapsed = time.time() - start
-            stdout = proc.stdout or ""
-            stderr = proc.stderr or ""
+            if os.name == 'nt':
+                try:
+                    returncode, stdout, stderr, elapsed = _run_on_hidden_desktop(
+                        cmd, str(netlist_path.parent), timeout_s
+                    )
+                except Exception as hidden_err:
+                    if self.verbose:
+                        print(f"[LTspiceBackend] hidden desktop launch failed, fallback to Popen: {hidden_err}")
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0  # SW_HIDE
+                    creationflags = (
+                        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    )
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        cwd=str(netlist_path.parent),
+                        startupinfo=startupinfo,
+                        creationflags=creationflags,
+                    )
+                    suppressor = _start_window_suppression(proc.pid)
+                    stdout, stderr = proc.communicate(timeout=timeout_s)
+                    returncode = proc.returncode
+                    elapsed = time.time() - start
+            else:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=str(netlist_path.parent),
+                )
+                stdout, stderr = proc.communicate(timeout=timeout_s)
+                returncode = proc.returncode
+                elapsed = time.time() - start
+            stdout = stdout or ""
+            stderr = stderr or ""
         except subprocess.TimeoutExpired:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
             return SimulationResult(
                 success=False,
                 error=f"Timeout after {timeout_s}s",
@@ -200,6 +493,11 @@ class LTspiceBackend:
                 error=str(e),
                 elapsed_s=time.time() - start,
             )
+        finally:
+            if suppressor is not None:
+                stop, thread = suppressor
+                stop.set()
+                thread.join(timeout=0.2)
 
         # 解析输出
         log_path = netlist_path.with_suffix(".log")
@@ -212,7 +510,7 @@ class LTspiceBackend:
                 pass
 
         # 检查成功：log 中应包含 "Total elapsed time" 且无致命错误
-        success = "Total elapsed time" in log_text or proc.returncode == 0
+        success = "Total elapsed time" in log_text or returncode == 0
         error_lines = []
         for line in (log_text + stdout + stderr).splitlines():
             l = line.strip()
@@ -368,17 +666,19 @@ def gen_idvg_netlist(model_path: str,
                       vgs_step: float = 0.05,
                       vds_v: float = 0.05,
                       model_name: str = "nmos1",
-                      use_subckt: bool = True) -> str:
+                      use_subckt: bool = True,
+                      m_factor: int = 1) -> str:
     """生成 Id-Vg 扫描的 netlist
 
     Args:
         use_subckt: True=用 X<subckt_name> 调用，False=用 M<model_name> 直接调用
+        m_factor: 倍乘因子 (cell_count),直接放到 instance 行
     """
     abs_path = Path(model_path).resolve()
     if use_subckt:
-        x_line = f"X1 D G 0 {model_name}"
+        x_line = f"X1 D G 0 {model_name} M={m_factor}"
     else:
-        x_line = f"M1 D G 0 0 {model_name}"
+        x_line = f"M1 D G 0 0 {model_name} M={m_factor}"
     return f"""* Id-Vg scan, Vds={vds_v}V
 .include "{abs_path}"
 {x_line}
@@ -395,13 +695,14 @@ def gen_idvd_netlist(model_path: str,
                       vds_step: float = 0.05,
                       vgs_v: float = 10.0,
                       model_name: str = "nmos1",
-                      use_subckt: bool = True) -> str:
+                      use_subckt: bool = True,
+                      m_factor: int = 1) -> str:
     """生成 Id-Vd 扫描的 netlist"""
     abs_path = Path(model_path).resolve()
     if use_subckt:
-        x_line = f"X1 D G 0 {model_name}"
+        x_line = f"X1 D G 0 {model_name} M={m_factor}"
     else:
-        x_line = f"M1 D G 0 0 {model_name}"
+        x_line = f"M1 D G 0 0 {model_name} M={m_factor}"
     return f"""* Id-Vd scan, Vgs={vgs_v}V
 .include "{abs_path}"
 {x_line}

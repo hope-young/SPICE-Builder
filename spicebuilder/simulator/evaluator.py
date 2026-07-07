@@ -12,6 +12,7 @@ import numpy as np
 
 from spicebuilder.models.bsim3 import BSIM3Model
 from spicebuilder.models.exporter import LibExporter
+from spicebuilder.models.powermos import PowerMOSSubcktParams
 from spicebuilder.simulator.ltspice import (
     LTspiceBackend,
     gen_idvg_netlist,
@@ -34,13 +35,38 @@ class LTspiceEvaluator:
                  rg_ohm: float = 1.6,
                  backend: Optional[LTspiceBackend] = None,
                  work_dir: Optional[Path] = None,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 cell_count: int = 100,
+                 cell_w_m: float = 0.2,
+                 power_params: PowerMOSSubcktParams | dict | None = None):
         self.subckt_name = subckt_name
-        self.rg_ohm = rg_ohm
+        legacy_base = PowerMOSSubcktParams(
+            rg_ohm=rg_ohm,
+            cell_count=cell_count,
+            cell_w_m=cell_w_m,
+        )
+        if isinstance(power_params, dict):
+            pwr = PowerMOSSubcktParams.from_dict(power_params, base=legacy_base)
+        elif power_params is None:
+            pwr = PowerMOSSubcktParams()
+        else:
+            pwr = power_params
+        if power_params is None:
+            pwr = pwr.with_overrides(rg_ohm=rg_ohm, cell_count=cell_count, cell_w_m=cell_w_m)
+        else:
+            pwr = pwr.with_overrides(
+                rg_ohm=None if rg_ohm == 1.6 else rg_ohm,
+                cell_count=None if cell_count == 100 else cell_count,
+                cell_w_m=None if cell_w_m == 0.2 else cell_w_m,
+            )
+        self.power_params = pwr
+        self.rg_ohm = pwr.rg_ohm
         self.backend = backend or LTspiceBackend()
         self.work_dir = Path(work_dir) if work_dir else Path(tempfile.gettempdir())
         self.exporter = LibExporter(part_number="EVAL")
         self.verbose = verbose
+        self.cell_count = pwr.cell_count
+        self.cell_w_m = pwr.cell_w_m
         self.cache: dict = {}  # param_hash -> array
         self.stats = {"calls": 0, "cache_hits": 0, "time": 0.0}
 
@@ -64,7 +90,7 @@ class LTspiceEvaluator:
                 vals.append(f"{k}={model.get(k):.12g}")  # 提高精度 6g → 12g，避免缓存键冲突
             except (KeyError, ValueError):
                 pass
-        s = scenario + "|" + "|".join(vals)
+        s = scenario + "|" + self.power_params.cache_key() + "|" + "|".join(vals)
         if ivar is not None:
             # 加 ivar shape + min/max 到 key 以防不同长度复用
             s += f"|n={len(ivar)}|min={ivar.min():.4g}|max={ivar.max():.4g}"
@@ -76,7 +102,7 @@ class LTspiceEvaluator:
         lib_path = tmpdir / "model.lib"
         self.exporter.export_subckt(model, lib_path,
                                      subckt_name=self.subckt_name,
-                                     rg_ohm=self.rg_ohm)
+                                     power_params=self.power_params)
         return lib_path
 
     def eval_idvg(self,
@@ -107,7 +133,8 @@ class LTspiceEvaluator:
         step = (vgs_max - vgs_min) / max(1, n - 1)
         netlist = gen_idvg_netlist(str(lib_path), vgs_min=vgs_min, vgs_max=vgs_max,
                                     vgs_step=step, vds_v=vds,
-                                    model_name=self.subckt_name, use_subckt=True)
+                                    model_name=self.subckt_name, use_subckt=True,
+                                    m_factor=1)
         res = self.backend.run_netlist_text(netlist, timeout_s=15, cleanup=False)
         self.stats["time"] += time.time() - t0
 
@@ -155,7 +182,8 @@ class LTspiceEvaluator:
         n = len(vds_arr)
         step = vds_max / max(1, n - 1)
         netlist = gen_idvd_netlist(str(lib_path), vds_max=vds_max, vds_step=step,
-                                    vgs_v=vgs, model_name=self.subckt_name, use_subckt=True)
+                                    vgs_v=vgs, model_name=self.subckt_name, use_subckt=True,
+                                    m_factor=1)
         res = self.backend.run_netlist_text(netlist, timeout_s=15, cleanup=False)
         self.stats["time"] += time.time() - t0
 

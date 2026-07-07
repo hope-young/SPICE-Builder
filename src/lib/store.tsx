@@ -112,7 +112,8 @@ export interface AppState {
   currentStage: string;
   currentLoop: number;
   backendRunning: boolean;
-  logs: Array<{ ts: string; level: string; msg: string }>;
+  logs: Array<{ ts: string; level: string; msg: string }>;  // 初始空, 用 subscribeLogs 订阅
+  subscribeLogs: (cb: (logs: Array<{ts: string; level: string; msg: string}>) => void) => () => void;
 }
 
 export interface AppActions {
@@ -138,25 +139,34 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [currentStage, setCurrentStage] = useState<string>("");
   const [currentLoop, setCurrentLoop] = useState<number>(0);
   const [backendRunning, setBackendRunning] = useState(false);
-  const [logs, setLogs] = useState<Array<{ ts: string; level: string; msg: string }>>([]);
+  // logs 状态: 用 ref 存, 不触发外层 re-render (避免 input 焦点丢失)
+  // LogPanel 自己订阅 via setLog callback
+  const logsRef = useRef<Array<{ ts: string; level: string; msg: string }>>([]);
+  const logSubsRef = useRef<Set<(logs: Array<{ts: string; level: string; msg: string}>) => void>>(new Set());
 
   // Refs survive re-renders.  fitHandleRef lets onStop cancel the
   // currently-running task.  lastLoggedDecile fixes the stale-closure
   // bug in the old 10% progress log dedup.
   const fitHandleRef = useRef<FitHandle | null>(null);
   const lastLoggedDecile = useRef<number>(-1);
+  const backendRunningRef = useRef<boolean | null>(null);
   // Tracks an in-flight loadProject so a double-click on the Data
   // Browser upload button does not enqueue duplicate loads.
   const loadInFlightRef = useRef<string | null>(null);
 
   const setLog = useCallback((level: string, msg: string) => {
     const ts = new Date().toLocaleTimeString("en-GB", { hour12: false });
-    setLogs((prev) => [...prev.slice(-200), { ts, level, msg }]);
+    const entry = { ts, level, msg };
+    logsRef.current = [...logsRef.current.slice(-200), entry];
+    logSubsRef.current.forEach((fn) => (fn as (logs: typeof logsRef.current) => void)(logsRef.current));
   }, []);
 
   const refreshBackend = useCallback(async () => {
     const running = await api.checkBackend();
+    const prev = backendRunningRef.current;
+    backendRunningRef.current = running;
     setBackendRunning(running);
+    if (prev === running) return;
     if (running) setLog("info", "Python backend connected");
     else setLog("warn", "Python backend NOT running");
   }, [setLog]);
@@ -164,6 +174,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const startBackend = useCallback(async () => {
     setLog("info", "Starting Python backend...");
     const ok = await api.startBackend();
+    backendRunningRef.current = ok;
     setBackendRunning(ok);
     setLog(ok ? "success" : "error", ok ? "Python backend started" : "Backend start failed");
   }, [setLog]);
@@ -279,11 +290,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return path;
   }, [projectId, setLog]);
 
+  const subscribeLogs = useCallback((cb: (logs: Array<{ts: string; level: string; msg: string}>) => void) => {
+    logSubsRef.current.add(cb);
+    // 立即同步一次
+    cb(logsRef.current);
+    return () => {
+      logSubsRef.current.delete(cb);
+    };
+  }, []);
+
   return (
     <AppContext.Provider value={{
       projectId, dataset, model, fitResult, fitProgress, fitProgressStatus, currentStage, currentLoop,
-      backendRunning, logs,
+      backendRunning,
+      // logs 字段保留 (LogPanel 不再用, 别的组件可能用)
+      logs: [],
       loadProject, selectProject, runFit, cancelFit, exportLib, refreshBackend, startBackend, setLog,
+      subscribeLogs,
     }}>
       {children}
     </AppContext.Provider>

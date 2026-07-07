@@ -49,9 +49,9 @@ PARAM_SPECS: list[BSIM3ParamSpec] = [
     BSIM3ParamSpec("CDSCB",  0.0,   -1e-2,  1e-2,   "F/m^2",  "Subthreshold",  "S2", "体与沟道耦合电容"),
 
     # === Mobility (S3) ===
-    BSIM3ParamSpec("U0",     300.0,  50.0,  800.0, "cm^2/Vs","Mobility",      "S3", "低场迁移率（零偏，约束以防简化公式误判）"),
-    BSIM3ParamSpec("UA",     2.0e-9, 0.0,   1e-7,   "m/V",    "Mobility",      "S3", "迁移率一阶退化系数"),
-    BSIM3ParamSpec("UB",     5.0e-19,0.0,   1e-16,  "(m/V)^2","Mobility",      "S3", "迁移率二阶退化系数"),
+    BSIM3ParamSpec("U0",     450.0,  50.0,  10000.0, "cm^2/Vs","Mobility",     "S3", "低场迁移率（放宽上界到 10000 支持全段拟合）"),
+    BSIM3ParamSpec("UA",     1.0e-9, 0.0,   1.0e-6, "m/V",    "Mobility",      "S3", "迁移率一阶退化系数 (放宽上界以支持 5-6V 高 Vgs 区拟合)"),
+    BSIM3ParamSpec("UB",     5.0e-19,0.0,   1.0e-15,"(m/V)^2","Mobility",      "S3", "迁移率二阶退化系数 (放宽上界)"),
     BSIM3ParamSpec("UC",     5.0e-11,0.0,   1e-9,   "m/V^2",  "Mobility",      "S3", "迁移率体偏系数"),
 
     # === Saturation Velocity (S4) ===
@@ -133,6 +133,7 @@ class BSIM3Model:
         self._fitted: set[str] = set()
         # 初始值（用作 reset）
         self._initial: dict[str, float] = {}
+        self._bounds_overrides: dict[str, tuple[float, float]] = {}
         for spec in PARAM_SPECS:
             self._values[spec.name] = spec.default
             self._initial[spec.name] = spec.default
@@ -176,8 +177,19 @@ class BSIM3Model:
 
     def get_bounds(self, param: str) -> tuple[float, float]:
         name = self._strip_path(param)
+        if name in self._bounds_overrides:
+            return self._bounds_overrides[name]
         spec = SPEC_BY_NAME[name]
         return (spec.lower, spec.upper)
+
+    def set_bounds(self, param: str, lower: float, upper: float) -> None:
+        """Override optimizer/model bounds for a parameter."""
+        name = self._strip_path(param)
+        if name not in self._values:
+            raise KeyError(f"未知参数: {param}")
+        if lower >= upper:
+            raise ValueError(f"Invalid bounds for {name}: [{lower}, {upper}]")
+        self._bounds_overrides[name] = (float(lower), float(upper))
 
     def get_spec(self, param: str) -> BSIM3ParamSpec:
         return SPEC_BY_NAME[self._strip_path(param)]

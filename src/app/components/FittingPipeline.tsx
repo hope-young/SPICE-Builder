@@ -36,11 +36,14 @@ const SUB_STAGE_DEFS: { id: string; name: string; params: string[] }[] = [
 export function FittingPipeline() {
   const { projectId, fitResult, fitProgress, fitProgressStatus,
           currentStage, currentLoop,
-          runFit, cancelFit, logs, backendRunning, setLog } = useApp();
+          runFit, cancelFit, backendRunning, setLog, subscribeLogs } = useApp();
+  const [logs, setLogs] = useState<Array<{ts: string; level: string; msg: string}>>([]);
   const [running, setRunning] = useState(false);
   const [useLtspice, setUseLtspice] = useState(false);
   const [maxLoops, setMaxLoops] = useState(3);
   const logRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => subscribeLogs(setLogs), [subscribeLogs]);
 
   // 自动滚到 log 末尾
   useEffect(() => {

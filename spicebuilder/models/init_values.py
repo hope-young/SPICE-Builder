@@ -79,9 +79,9 @@ def init_from_key_params(model: BSIM3Model, kp: SpiceKeyParams) -> BSIM3Model:
     model.set_initial("CDSCB", 0.0)
 
     # === Mobility (S3) ===
-    # U0 经验值 (SGT 100V 典型 300 cm²/Vs，约束避免简化公式误判)
+    # U0 经验值 (SGT 100V 典型 450 cm²/Vs)
     u0_est = _gfs_to_u0(kp.gfs_25c_s)
-    model.set_initial("U0", 300)
+    model.set_initial("U0", 450)
     model.set_initial("UA", 2.0e-9)
     model.set_initial("UB", 5.0e-19)
     model.set_initial("UC", 5.0e-11)

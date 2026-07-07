@@ -1,8 +1,6 @@
 // types.ts - 与 Python API 对应的 TypeScript 类型
 
-export type NavSection =
-  | "dashboard" | "data" | "curve" | "model"
-  | "fitting" | "validate" | "export" | "settings";
+export type NavSection = "workbench" | "explore" | "settings";
 
 export interface DeviceInfo {
   part_number: string;
