@@ -40,6 +40,7 @@ pub fn run() {
             commands::python_backend::check_backend,
             // 文件
             commands::filesystem::open_excel_file,
+            commands::filesystem::open_spice_model_file,
             commands::filesystem::save_file_dialog,
             commands::filesystem::read_text_file,
             commands::filesystem::open_folder,

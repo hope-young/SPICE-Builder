@@ -236,6 +236,7 @@ function AppInner() {
     if (navTo) return setActiveNav(navTo);
     if (activeNav === "workbench") {
       if (_item.includes("导入 CSV")) dispatchWorkbenchAction("import");
+      if (_item.includes("导出 SPICE")) dispatchWorkbenchAction("export");
       if (_item.includes("仿真当前项")) dispatchWorkbenchAction("simulate");
       if (_item.includes("拟合勾选项") || _item.includes("拟合全部队列")) dispatchWorkbenchAction("fit-selected");
       if (_item.includes("停止拟合")) dispatchWorkbenchAction("stop");

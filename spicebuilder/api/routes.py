@@ -21,7 +21,7 @@ from .models import (
     LoadCsvRequest, LoadCsvResponse,
     CsvLoadRequest, CsvLoadResponse, CsvSimulateRequest, CsvSimulateResponse,
     CsvFitRequest, CsvFitResponse,
-    DualFitRequest, DualFitResponse,
+    DualFitRequest, DualFitResponse, CsvExportModelRequest,
 )
 
 from spicebuilder.data.loader_sdh import load_sdh_excel
@@ -961,6 +961,50 @@ def csv_load(req: CsvLoadRequest):
         dvar=sd.dvar.tolist(),
         metadata=sd.metadata,
     )
+
+
+@router.post("/csv/export_model", response_model=ExportResponse)
+def csv_export_model(req: CsvExportModelRequest):
+    """Export the current Workbench parameter set without requiring project state."""
+    out_path = Path(req.output_path).resolve()
+    if out_path.suffix.lower() != ".lib":
+        raise HTTPException(400, f"Expected .lib extension, got: {out_path.suffix}")
+    if not out_path.parent.is_dir():
+        raise HTTPException(400, f"Output directory does not exist: {out_path.parent}")
+    if not req.params:
+        raise HTTPException(400, "params is required")
+
+    model = BSIM3Model(name=req.model_name or "BSIM3_core")
+    for name, value in req.params.items():
+        try:
+            value_f = float(value)
+            if not np.isfinite(value_f):
+                raise ValueError(f"{value} is not finite")
+            model.set_unchecked(name, value_f)
+        except KeyError:
+            continue
+        except (TypeError, ValueError) as e:
+            raise HTTPException(400, f"Invalid parameter {name}: {e}")
+
+    exporter = LibExporter(part_number=req.subckt_name or "Workbench")
+    try:
+        fmt = str(req.format).upper()
+        if fmt in ("A", "BSIM3"):
+            path = exporter.export_bsim3(model, out_path, model_name=req.model_name or model.name)
+        else:
+            path = exporter.export_subckt(
+                model,
+                out_path,
+                subckt_name=req.subckt_name or "MY_MOSFET",
+                include_diode=req.include_diode,
+                rg_ohm=req.rg_ohm,
+                power_params=_power_params_from_request(req),
+            )
+    except Exception as e:
+        raise HTTPException(500, f"Export failed: {e}")
+
+    n_bytes = path.stat().st_size if path.exists() else 0
+    return ExportResponse(success=True, file_path=str(path.resolve()), n_bytes=n_bytes)
 
 
 @router.post("/csv/simulate", response_model=CsvSimulateResponse)

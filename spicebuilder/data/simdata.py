@@ -298,6 +298,26 @@ class SimData:
         )
 
     @classmethod
+    def from_qg(cls, points: list[dict], vds_v: float = 10.0) -> "SimData":
+        """从 Qg 点列表创建 SimData"""
+        filtered = [p for p in points if p.get('vds_v') == vds_v]
+        if not filtered:
+            raise ValueError(f"没有匹配的 Qg 点 (Vds={vds_v})")
+        filtered.sort(key=lambda p: p['vgs_v'])
+        ivar = np.array([p['vgs_v'] for p in filtered])
+        dvar = np.array([p['qg_nc'] for p in filtered])
+        return cls(
+            name=f"Qg_Vds{vds_v}V",
+            curve_type="Qg",
+            data={'ivar': ivar, 'dvar': dvar},
+            metadata={
+                'vds_v': vds_v,
+                'ivar_name': 'vgs_v',
+                'dvar_name': 'qg_nc',
+            }
+        )
+
+    @classmethod
     def from_body_diode(cls, points: list[dict], temperature_c: int = 25) -> "SimData":
         """从体二极管点列表创建 SimData"""
         filtered = [p for p in points if p.get('temperature_c') == temperature_c]

@@ -29,6 +29,26 @@ pub async fn open_excel_file(app: AppHandle) -> Result<String, String> {
     }
 }
 
+/// 打开文件对话框，选择 SPICE model/library 文件
+#[tauri::command]
+pub async fn open_spice_model_file(app: AppHandle) -> Result<String, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("SPICE model files", &["lib", "cir", "spice", "mod", "mdl"])
+        .add_filter("SPICE library", &["lib"])
+        .add_filter("All files", &["*"])
+        .set_title("Select SPICE model file")
+        .pick_file(move |file_path| {
+            let _ = tx.send(file_path);
+        });
+
+    match rx.await.map_err(|e| e.to_string())? {
+        Some(path) => Ok(path.to_string()),
+        None => Err("No file selected".to_string()),
+    }
+}
+
 /// 保存文件对话框（导出 .lib）
 #[tauri::command]
 pub async fn save_file_dialog(

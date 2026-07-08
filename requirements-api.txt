@@ -1,6 +1,6 @@
-# SpiceBuilder API 依赖
-# 核心依赖在 pyproject.toml 里
-# 这里只列 API 服务额外需要的
+# SpiceBuilder API dependencies
+# Core dependencies live in pyproject.toml.
+# This file keeps the API service extras for older setup docs.
 
 fastapi>=0.110
 uvicorn[standard]>=0.27

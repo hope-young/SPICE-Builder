@@ -11,7 +11,16 @@ import {
   ChevronRight, LayoutGrid, AlignJustify, AlignLeft, Download, Square, Activity
 } from "lucide-react";
 import { Button } from "./ui";
-import { csvLoad, csvSimulate, csvFitStream, csvDualFitStream } from "../../lib/api";
+import {
+  csvLoad,
+  csvSimulate,
+  csvFitStream,
+  csvDualFitStream,
+  csvExportModel,
+  isApiEndpointNotFound,
+  startBackend,
+  stopBackend,
+} from "../../lib/api";
 import { useApp } from "../../lib/store";
 import { BSIM3_PARAMS } from "../../lib/constants";
 import { ParamSliders } from "./ParamSliders";
@@ -24,7 +33,7 @@ import { ParamSliders } from "./ParamSliders";
    - 区间通过 recharts 上的 ReferenceLine + 透明覆盖层 div 实现拖动
    ========================================================================= */
 
-import { addWorkbenchActionListener } from "../../lib/events";
+import { addWorkbenchActionListener, dispatchWorkbenchState } from "../../lib/events";
 
 const MARGIN = { top: 16, right: 32, bottom: 24, left: 56 };  // 与 recharts LineChart 一致
 const CONFIG_PANEL_MIN_WIDTH = 340;
@@ -426,10 +435,23 @@ type TransferStep = {
   fittedParams?: Record<string, number>;
 };
 
-function makeTransferStep(index: number, vds: number): TransferStep {
+export type StepRuntimeSummary = {
+  id: string;
+  status: "empty" | "loaded" | "simulated" | "fitted" | "running";
+  csvPath: string;
+  pts: number;
+  vds: number;
+  vmin: number;
+  vmax: number;
+  r2Log: number | null;
+  r2Linear: number | null;
+  rms: number | null;
+};
+
+function makeTransferStep(index: number, vds: number, id?: string, name?: string): TransferStep {
   return {
-    id: `step-${Date.now()}-${index}`,
-    name: `IdVg @ Vds=${vds}V`,
+    id: id ?? `step-${Date.now()}-${index}`,
+    name: name ?? `IdVg @ Vds=${vds}V`,
     vds,
     csvPath: "",
     raw: null,
@@ -459,15 +481,116 @@ function fmtTol(v: number): string {
   return v.toExponential(0);
 }
 
+const SPICE_PARAM_NAMES = new Set(BSIM3_PARAMS.map(param => param.name.toUpperCase()));
+
+function parseSpiceNumber(raw: string): number | null {
+  const cleaned = raw
+    .trim()
+    .replace(/^\(/, "")
+    .replace(/[),]+$/, "")
+    .replace(/[dD]([+-]?\d+)$/, "e$1");
+  const match = cleaned.match(/^([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?)([a-zA-Z]*)$/);
+  if (!match) return null;
+  const base = Number(match[1]);
+  if (!Number.isFinite(base)) return null;
+  const suffix = match[2].toLowerCase();
+  const multipliers: Record<string, number> = {
+    f: 1e-15,
+    p: 1e-12,
+    n: 1e-9,
+    u: 1e-6,
+    m: 1e-3,
+    k: 1e3,
+    meg: 1e6,
+    g: 1e9,
+    t: 1e12,
+  };
+  if (!suffix) return base;
+  return suffix in multipliers ? base * multipliers[suffix] : null;
+}
+
+function stripSpiceComment(line: string): string {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith("*")) return "";
+  const semi = line.indexOf(";");
+  return semi >= 0 ? line.slice(0, semi) : line;
+}
+
+function parseSpiceParams(text: string): { params: Record<string, number>; unknown: string[]; invalid: string[] } {
+  const params: Record<string, number> = {};
+  const unknown = new Set<string>();
+  const invalid: string[] = [];
+  const normalized = text
+    .split(/\r?\n/)
+    .map(stripSpiceComment)
+    .filter(Boolean)
+    .map(line => line.replace(/^\s*\+\s*/, " "))
+    .join(" ")
+    .replace(/[()]/g, " ");
+
+  const tokenRegex = /(^|[\s,])([A-Za-z][A-Za-z0-9_]*)\s*=\s*([^\s,()]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = tokenRegex.exec(normalized)) !== null) {
+    const rawName = match[2].toUpperCase();
+    const rawValue = match[3];
+    if (!SPICE_PARAM_NAMES.has(rawName)) {
+      unknown.add(rawName);
+      continue;
+    }
+    const value = parseSpiceNumber(rawValue);
+    if (value === null || !Number.isFinite(value)) {
+      invalid.push(`${rawName}=${rawValue}`);
+      continue;
+    }
+    params[rawName] = value;
+  }
+
+  return { params, unknown: Array.from(unknown), invalid };
+}
+
 function positiveOrNull(v: number | null | undefined): number | null {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
 }
 
-export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false }: { hideChrome?: boolean; hideFitTargetsPanel?: boolean } = {}) {
+function parseBiasVoltage(bias: string | undefined, fallback: number): number {
+  if (!bias) return fallback;
+  const match = bias.match(/=\s*([-+]?\d*\.?\d+(?:e[-+]?\d+)?)/i);
+  const value = match ? Number(match[1]) : Number.NaN;
+  return Number.isFinite(value) ? value : fallback;
+}
+
+export function SingleCurveFit({
+  hideChrome = false,
+  hideFitTargetsPanel = false,
+  externalSelectedStep = null,
+  externalPowerCell = null,
+  onPowerCellChange = null,
+  onStepRuntimeChange = null,
+  selectedFitStepIds = null,
+}: {
+  hideChrome?: boolean;
+  hideFitTargetsPanel?: boolean;
+  externalSelectedStep?: {
+    id: string;
+    label: string;
+    type?: string;
+    bias?: string;
+    csvFile?: string;
+    range?: string;
+    weight?: number;
+  } | null;
+  externalPowerCell?: {
+    activeAreaMm2: number;
+    cellPitchUm: number;
+  } | null;
+  onPowerCellChange?: ((config: { activeAreaMm2: number; cellPitchUm: number }) => void) | null;
+  onStepRuntimeChange?: ((steps: StepRuntimeSummary[]) => void) | null;
+  selectedFitStepIds?: Set<string> | string[] | null;
+} = {}) {
   const { setLog } = useApp();
   const [steps, setSteps] = useState<TransferStep[]>(() => [
-    makeTransferStep(1, 0.5),
-    makeTransferStep(2, 5.0),
+    makeTransferStep(1, 0.5, "idvg_05", "IdVg @ Vds=0.5V"),
+    makeTransferStep(2, 5.0, "idvg_5", "IdVg @ Vds=5V"),
   ]);
   const [activeStep, setActiveStep] = useState(0);
   const [selectedFitTargets, setSelectedFitTargets] = useState<Set<FitTargetId>>(
@@ -477,6 +600,30 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
   const [expandedFitTargets, setExpandedFitTargets] = useState<Set<FitTargetId>>(
     () => new Set(FIT_TARGET_TEMPLATES.map(item => item.id))
   );
+
+  // Power Cell 配置：如果外部提供则使用外部的，否则使用本地状态
+  const [localActiveAreaMm2, setLocalActiveAreaMm2] = useState(10.0);
+  const [localCellPitchUm, setLocalCellPitchUm] = useState(2.0);
+
+  const activeAreaMm2 = externalPowerCell?.activeAreaMm2 ?? localActiveAreaMm2;
+  const cellPitchUm = externalPowerCell?.cellPitchUm ?? localCellPitchUm;
+
+  const setActiveAreaMm2 = useCallback((value: number) => {
+    if (onPowerCellChange && externalPowerCell) {
+      onPowerCellChange({ ...externalPowerCell, activeAreaMm2: value });
+    } else {
+      setLocalActiveAreaMm2(value);
+    }
+  }, [onPowerCellChange, externalPowerCell]);
+
+  const setCellPitchUm = useCallback((value: number) => {
+    if (onPowerCellChange && externalPowerCell) {
+      onPowerCellChange({ ...externalPowerCell, cellPitchUm: value });
+    } else {
+      setLocalCellPitchUm(value);
+    }
+  }, [onPowerCellChange, externalPowerCell]);
+
   // ---- 文件 ----
   const [csvPath, setCsvPath] = useState("");
   const [loading, setLoading] = useState(false);
@@ -521,8 +668,6 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
     gtol: STOP_PRESETS.balanced.gtol,
     max_nfev: STOP_PRESETS.balanced.max_nfev,
   });
-  const [activeAreaMm2, setActiveAreaMm2] = useState(10.0);
-  const [cellPitchUm, setCellPitchUm] = useState(2.0);
   const [fitHistory, setFitHistory] = useState<FitHistoryPoint[]>([]);
   // 拟合收敛动画播放
   const [animPlaying, setAnimPlaying] = useState(false);
@@ -538,8 +683,17 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
   const [protectWeight, setProtectWeight] = useState(0.4);
   const [dragStepId, setDragStepId] = useState<string | null>(null);
   const [dragOverStepIndex, setDragOverStepIndex] = useState<number | null>(null);
-  // 侧边栏 Tab 切换: "steps" = Transfer Steps + 数据 + 区间, "params" = BSIM3 参数
-  const [sidePanelTab, setSidePanelTab] = useState<"steps" | "params">("steps");
+  // 侧边栏 Tab 切换: "steps" = Transfer Steps, "params" = BSIM3 参数, "export" = SPICE 导出
+  const [sidePanelTab, setSidePanelTab] = useState<"steps" | "params" | "export">("steps");
+  const [exportFormat, setExportFormat] = useState<"subckt" | "bsim3">("subckt");
+  const [exportSubcktName, setExportSubcktName] = useState("MY_MOSFET");
+  const [exportOutputPath, setExportOutputPath] = useState("");
+  const [exportIncludeDiode, setExportIncludeDiode] = useState(true);
+  const [exportRgOhm, setExportRgOhm] = useState(1.6);
+  const [exporting, setExporting] = useState(false);
+  const [exportResult, setExportResult] = useState<{ path: string; nBytes: number } | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [importingParams, setImportingParams] = useState(false);
   // ParamSliders 回调包装 (避免 JSX-in-JSX prop 嵌入)
   const onBoundsChange = useCallback((name: string, next: { min?: string; max?: string }) => {
     setCustomBounds(prev => ({ ...prev, [name]: next }));
@@ -641,6 +795,8 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
 
   // 拟合取消: AbortController 让 fetch 中断
   const fitAbortRef = useRef<AbortController | null>(null);
+  const simAbortRef = useRef<AbortController | null>(null);
+  const simRunIdRef = useRef(0);
 
   const currentStepPatch = useCallback((overrides: Partial<TransferStep> = {}): TransferStep => ({
     ...steps[activeStep],
@@ -700,6 +856,47 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
     loadStepIntoEditor(idx === activeStep ? saved : steps[idx]);
     setActiveStep(idx);
   }, [activeStep, currentStepPatch, fitting, loadStepIntoEditor, steps]);
+
+  useEffect(() => {
+    if (
+      !externalSelectedStep ||
+      externalSelectedStep.id === "power_cell" ||
+      externalSelectedStep.id === "export_model" ||
+      fitting
+    ) return;
+    if (steps[activeStep]?.id === externalSelectedStep.id) {
+      updateActiveStep();
+      return;
+    }
+
+    const saved = currentStepPatch();
+    const existingIdx = steps.findIndex(step => step.id === externalSelectedStep.id);
+    if (existingIdx >= 0) {
+      setSteps(prev => prev.map((step, i) => i === activeStep ? saved : step));
+      loadStepIntoEditor(existingIdx === activeStep ? saved : steps[existingIdx]);
+      setActiveStep(existingIdx);
+      return;
+    }
+
+    const nextVds = parseBiasVoltage(externalSelectedStep.bias, steps[steps.length - 1]?.vds ?? 0.5);
+    const next = makeTransferStep(
+      steps.length + 1,
+      nextVds,
+      externalSelectedStep.id,
+      externalSelectedStep.label,
+    );
+    setSteps(prev => prev.map((step, i) => i === activeStep ? saved : step).concat(next));
+    loadStepIntoEditor(next);
+    setActiveStep(steps.length);
+  }, [
+    activeStep,
+    currentStepPatch,
+    externalSelectedStep,
+    fitting,
+    loadStepIntoEditor,
+    steps,
+    updateActiveStep,
+  ]);
 
   const onAddStep = useCallback(() => {
     if (fitting) return;
@@ -799,9 +996,22 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
   }, []); // 空依赖数组，监听器只注册一次
 
   const onCancelFit = useCallback(() => {
+    let cancelled = false;
     if (fitAbortRef.current) {
       fitAbortRef.current.abort();
       setLog("warn", "Fit cancelled by user");
+      cancelled = true;
+    }
+    if (simAbortRef.current) {
+      simAbortRef.current.abort();
+      simAbortRef.current = null;
+      simRunIdRef.current += 1;
+      setSimulating(false);
+      setLog("warn", "Simulation cancelled by user");
+      cancelled = true;
+    }
+    if (!cancelled) {
+      setLog("warn", "No fit or simulation is running");
     }
   }, [setLog]);
 
@@ -957,11 +1167,15 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
     const a = r.ivar[0], b = r.ivar[r.ivar.length - 1];
     const nextRaw = { ivar: r.ivar, dvar: r.dvar, meta: r.metadata };
     setRaw(nextRaw);
+    const metadataVds = Number((r.metadata as any)?.vds_v);
+    const nextVds = Number.isFinite(metadataVds) ? metadataVds : vds;
+
     const nextVmin = Math.round((a + (b - a) * 0.4) * 2) / 2;
     const nextVmax = Math.round((a + (b - a) * 0.6) * 2) / 2;
     const nextSim = new Array(r.ivar.length).fill(0);
     setVmin(nextVmin);
     setVmax(nextVmax);
+    setVds(nextVds);
     setSimCurve(nextSim);
     setFitRMS(null);
     setFitR2(null);
@@ -976,7 +1190,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
       simCurve: nextSim,
       vmin: nextVmin,
       vmax: nextVmax,
-      vds,
+      vds: nextVds,
       status: "loaded",
       rms: null,
       r2Log: null,
@@ -1045,11 +1259,118 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
   const powerParams = useMemo(() => ({
     active_area_mm2: Math.min(Math.max(Number(activeAreaMm2) || 10.0, 1e-6), 1e6),
     cell_pitch_um: Math.min(Math.max(Number(cellPitchUm) || 2.0, 0.01), 1000),
-  }), [activeAreaMm2, cellPitchUm]);
+    rg_ohm: Math.min(Math.max(Number(exportRgOhm) || 1.6, 0), 1e6),
+    include_diode: exportIncludeDiode,
+  }), [activeAreaMm2, cellPitchUm, exportRgOhm, exportIncludeDiode]);
+
+  const fittedStepSummaries = useMemo(() => (
+    steps
+      .filter(step => step.status === "fitted" || step.status === "loaded" || step.status === "simulated")
+      .map(step => ({
+        name: step.name,
+        vds: step.vds,
+        vmin: step.vmin,
+        vmax: step.vmax,
+        pts: step.raw?.ivar.length ?? 0,
+        r2Log: step.r2Log,
+        r2Linear: step.r2Linear,
+        rms: step.rms,
+      }))
+  ), [steps]);
+
+  const exportPreview = useMemo(() => {
+    const params = Object.entries(pvals)
+      .map(([name, value]) => `+${name}=${fmtParam(value)}`)
+      .join("\n");
+    const stepLines = fittedStepSummaries.length > 0
+      ? fittedStepSummaries.map(step => (
+        `* Step: ${step.name}, Vds=${fmtParam(step.vds)}V, range=${fmtParam(step.vmin)}-${fmtParam(step.vmax)}V, pts=${step.pts}` +
+        `${step.r2Log != null ? `, R2log=${step.r2Log.toFixed(4)}` : ""}` +
+        `${step.r2Linear != null ? `, R2lin=${step.r2Linear.toFixed(4)}` : ""}`
+      )).join("\n")
+      : "* Step: draft parameter export, no fitted curve summary";
+    if (exportFormat === "bsim3") {
+      return `* SpiceBuilder Workbench Export\n${stepLines}\n* Format: A (pure BSIM3 .model)\n* Parameter count: ${Object.keys(pvals).length}\n\n.MODEL ${exportSubcktName || "BSIM3_core"} NMOS LEVEL=49\n${params}\n.END`;
+    }
+    return `* SpiceBuilder Workbench Export\n${stepLines}\n* Format: B (subckt wrapper)\n* Parameter count: ${Object.keys(pvals).length}\n* Power: Rg=${fmtParam(exportRgOhm)} AA=${fmtParam(activeAreaMm2)}mm2 Pitch=${fmtParam(cellPitchUm)}um\n\n.SUBCKT ${exportSubcktName || "MY_MOSFET"} D G S\nM1 D_int G_int S_int S_int BSIM3_core L=1u W=<unit_width> M=<unit_multiplier>\nRg G G_int ${fmtParam(exportRgOhm)}\nRd_ext D D_int <from RD or override>\nRs_ext S_int S <from RS or override>\n${exportIncludeDiode ? "Dbody S D Dbody_diode\n.MODEL Dbody_diode D (...)" : "* Body diode disabled"}\n.ENDS\n\n.MODEL BSIM3_core NMOS LEVEL=49\n${params}\n.END`;
+  }, [activeAreaMm2, cellPitchUm, exportFormat, exportIncludeDiode, exportRgOhm, exportSubcktName, fittedStepSummaries, pvals]);
+  const exportPreviewLines = useMemo(() => exportPreview.split("\n"), [exportPreview]);
+
+  const pickExportPath = useCallback(async () => {
+    try {
+      const defaultName = `${exportSubcktName || "MY_MOSFET"}.lib`;
+      const path = await invoke<string>("save_file_dialog", { defaultName });
+      if (path) setExportOutputPath(path.endsWith(".lib") ? path : `${path}.lib`);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      setLog("error", `Save path dialog failed: ${message}`);
+    }
+  }, [exportSubcktName, setLog]);
+
+  const onExportModel = useCallback(async () => {
+    if (!exportOutputPath) {
+      setExportError("Please choose an output .lib path first.");
+      return;
+    }
+    setExporting(true);
+    setExportError(null);
+    setExportResult(null);
+    const exportRequest = {
+        outputPath: exportOutputPath,
+        format: exportFormat,
+        subcktName: exportSubcktName || "MY_MOSFET",
+        modelName: exportFormat === "bsim3" ? (exportSubcktName || "BSIM3_core") : "BSIM3_core",
+        params: pvals,
+        powerParams,
+        includeDiode: exportIncludeDiode,
+        rgOhm: exportRgOhm,
+    } as const;
+
+    try {
+      const result = await csvExportModel(exportRequest);
+      setExportResult({ path: result.file_path, nBytes: result.n_bytes });
+      setLog("success", `Exported SPICE model: ${result.file_path}`);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      if (isApiEndpointNotFound(e, "/api/csv/export_model")) {
+        const restartHint = "Export endpoint is missing in the running backend. Restarting Python backend and retrying once...";
+        setExportError(restartHint);
+        setLog("warn", restartHint);
+        try {
+          await stopBackend();
+          const restarted = await startBackend();
+          if (!restarted) {
+            throw new Error("Python backend restart returned false");
+          }
+          setLog("info", "Python backend restarted. Retrying SPICE export...");
+          const retryResult = await csvExportModel(exportRequest);
+          setExportResult({ path: retryResult.file_path, nBytes: retryResult.n_bytes });
+          setExportError(null);
+          setLog("success", `Exported SPICE model after backend restart: ${retryResult.file_path}`);
+          return;
+        } catch (retryError) {
+          const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+          const finalMessage = `Export SPICE failed after backend restart: ${retryMessage}. If this is still 404 Not Found, close the app completely and reopen it so port 8765 is not held by an old backend process.`;
+          setExportError(finalMessage);
+          setLog("error", finalMessage);
+          return;
+        }
+      }
+      setExportError(message);
+      setLog("error", `Export SPICE failed: ${message}`);
+    } finally {
+      setExporting(false);
+    }
+  }, [exportFormat, exportIncludeDiode, exportOutputPath, exportRgOhm, exportSubcktName, powerParams, pvals, setLog]);
 
   // ---- 实时 LTspice 仿真（防抖 300ms）----
   const doSim = useCallback(async (params: Record<string, number>) => {
     if (!csvPath) return;
+    simAbortRef.current?.abort();
+    const abort = new AbortController();
+    const runId = simRunIdRef.current + 1;
+    simRunIdRef.current = runId;
+    simAbortRef.current = abort;
     setSimulating(true);
     try {
       const r = await csvSimulate(csvPath, {
@@ -1057,7 +1378,9 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
         paramOverrides: params,
         vds,
         powerParams,
+        signal: abort.signal,
       });
+      if (abort.signal.aborted || runId !== simRunIdRef.current) return;
       setSimCurve(r.sim);
       setSteps(prev => prev.map((step, idx) => idx === activeStep ? {
         ...step,
@@ -1065,11 +1388,18 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
         status: step.status === "fitted" ? "fitted" : "simulated",
       } : step));
     } catch (e) {
-      console.error("simulate failed:", e);
+      if (e && typeof e === "object" && "name" in e && e.name === "AbortError") {
+        setLog("warn", "Simulation cancelled by user");
+      } else {
+        console.error("simulate failed:", e);
+      }
     } finally {
-      setSimulating(false);
+      if (runId === simRunIdRef.current) {
+        simAbortRef.current = null;
+        setSimulating(false);
+      }
     }
-  }, [activeStep, csvPath, vds, powerParams]);
+  }, [activeStep, csvPath, vds, powerParams, setLog]);
 
   // 参数变化 -> 防抖刷新 sim
   const [simulating, setSimulating] = useState(false);
@@ -1127,6 +1457,17 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
     });
   }, []);
 
+  const selectedFitStepIdSet = useMemo(() => {
+    if (!selectedFitStepIds) return null;
+    return selectedFitStepIds instanceof Set
+      ? selectedFitStepIds
+      : new Set(selectedFitStepIds);
+  }, [selectedFitStepIds]);
+
+  const isStepSelectedForFit = useCallback((step: TransferStep): boolean => {
+    return selectedFitStepIdSet ? selectedFitStepIdSet.has(step.id) : step.selectedForFit;
+  }, [selectedFitStepIdSet]);
+
   const applyActiveFitHistory = useCallback((history: FitHistoryPoint[]) => {
     setFitHistory(history);
     setSteps(prev => prev.map((step, idx) => (
@@ -1148,6 +1489,34 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
     if (timerRef.current !== null) clearTimeout(timerRef.current);
     void doSim(next);
   }, [pvals, doSim]);
+
+  const onImportSpiceParams = useCallback(async () => {
+    setImportingParams(true);
+    try {
+      const path = await invoke<string>("open_spice_model_file");
+      const text = await invoke<string>("read_text_file", { path });
+      const parsed = parseSpiceParams(text);
+      const importedNames = Object.keys(parsed.params);
+      if (importedNames.length === 0) {
+        setLog("warn", `No supported BSIM parameters found in ${path.split(/[/\\]/).pop() || path}`);
+        return;
+      }
+      const next = { ...pvals, ...parsed.params };
+      setPvals(next);
+      pendingRef.current = {};
+      if (timerRef.current !== null) clearTimeout(timerRef.current);
+      void doSim(next);
+      const skippedText = parsed.unknown.length > 0 ? `, skipped ${parsed.unknown.length} unknown tokens` : "";
+      const invalidText = parsed.invalid.length > 0 ? `, ignored ${parsed.invalid.length} invalid values` : "";
+      setLog("success", `Imported ${importedNames.length} BSIM params from ${path.split(/[/\\]/).pop() || path}${skippedText}${invalidText}`);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      if (/no file selected/i.test(message)) return;
+      setLog("error", `Import SPICE params failed: ${message}`);
+    } finally {
+      setImportingParams(false);
+    }
+  }, [doSim, pvals, setLog]);
 
   const parseBound = useCallback((rawValue: string | undefined, fallback: number): number => {
     if (rawValue === undefined || rawValue.trim() === "" || rawValue.trim() === "-") return fallback;
@@ -1290,7 +1659,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
         setFitting(false);
         return;
       }
-      if (!steps[activeStep]?.selectedForFit) {
+      if (!isStepSelectedForFit(steps[activeStep])) {
         setLog("warn", "当前 IdVg step 未勾选，不会参与拟合。请先在左侧 tree 勾选该 step。");
         setFitting(false);
         return;
@@ -1427,7 +1796,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
       setSimulating(false);
       setFitting(false);
     }
-  }, [activeStep, csvPath, raw, fitParamNames, fitParamBounds, protectedCurves, protectWeight, fitStopPayload, powerParams, pvals, selectedFitTargets, steps, vmin, vmax, vds, setLog, applyActiveFitHistory, lockParamsAfterFit]);
+  }, [activeStep, csvPath, raw, fitParamNames, fitParamBounds, protectedCurves, protectWeight, fitStopPayload, powerParams, pvals, selectedFitTargets, steps, vmin, vmax, vds, setLog, applyActiveFitHistory, lockParamsAfterFit, isStepSelectedForFit]);
 
   const onJointFit = useCallback(async () => {
     const saved = currentStepPatch();
@@ -1438,7 +1807,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
     }
     const loadedSteps = materialized
       .map((step, idx) => ({ step, idx }))
-      .filter(({ step }) => step.selectedForFit && step.csvPath && step.raw);
+      .filter(({ step }) => isStepSelectedForFit(step) && step.csvPath && step.raw);
 
     if (loadedSteps.length < 2) {
       setLog("warn", "IdVg joint fit needs at least 2 checked and loaded steps");
@@ -1702,9 +2071,9 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
     const saved = currentStepPatch();
     return steps.filter((step, idx) => {
       const s = idx === activeStep ? saved : step;
-      return Boolean(s.selectedForFit && s.csvPath && s.raw);
+      return Boolean(isStepSelectedForFit(s) && s.csvPath && s.raw);
     }).length;
-  }, [activeStep, currentStepPatch, steps]);
+  }, [activeStep, currentStepPatch, steps, isStepSelectedForFit]);
   const fitScopeSummary = useMemo(() => {
     const selected = FIT_TARGET_TEMPLATES.filter(item => selectedFitTargets.has(item.id));
     const count = selected.length;
@@ -1743,7 +2112,8 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
       return;
     }
     if (action === "export") {
-      setLog("info", "Export 入口已保留，后续会接入模型/报告导出。");
+      setSidePanelTab("export");
+      setLog("info", "Switched to Export Model panel.");
       return;
     }
     if (action === "reset-current") {
@@ -1775,8 +2145,82 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
   const canWorkbenchSimulate = Boolean(raw && !fitting && !simulating && selectedFitTargets.has("idvg"));
   const canWorkbenchFit = Boolean(
     selectedFitTargets.has("idvg") &&
-    ((raw && steps[activeStep]?.selectedForFit) || loadedStepCount >= 2)
+    ((raw && isStepSelectedForFit(steps[activeStep])) || loadedStepCount >= 2)
   );
+  const workbenchIsRunning = fitting || simulating;
+  const targetConfigStep = externalSelectedStep?.id
+    ? steps.find(step => step.id === externalSelectedStep.id) ?? steps[activeStep]
+    : steps[activeStep];
+  const targetConfigFileName = targetConfigStep?.csvPath
+    ? targetConfigStep.csvPath.split(/[/\\]/).pop()
+    : "";
+  const isTargetLoadSupported = !externalSelectedStep?.type || externalSelectedStep.type === "IdVg";
+  const canLoadTargetCsv = (
+    !loading &&
+    !workbenchIsRunning &&
+    externalSelectedStep?.id !== "power_cell" &&
+    externalSelectedStep?.id !== "export_model" &&
+    isTargetLoadSupported
+  );
+  const isExportStepSelected = externalSelectedStep?.id === "export_model";
+  const isExportPanelVisible = isExportStepSelected || sidePanelTab === "export";
+
+  useEffect(() => {
+    if (isExportStepSelected && sidePanelTab !== "export") {
+      setSidePanelTab("export");
+      return;
+    }
+    if (!isExportStepSelected && externalSelectedStep && sidePanelTab === "export") {
+      setSidePanelTab("steps");
+    }
+  }, [externalSelectedStep, isExportStepSelected, sidePanelTab]);
+
+  useEffect(() => {
+    dispatchWorkbenchState({
+      hasCsv: Boolean(csvPath && raw),
+      canFit: Boolean(canWorkbenchFit && !workbenchIsRunning && !loading),
+      canSimulate: Boolean(canWorkbenchSimulate && !workbenchIsRunning && !loading),
+      fitting,
+      simulating,
+      loading,
+      isRunning: workbenchIsRunning,
+      loadedStepCount,
+      activeStepName: steps[activeStep]?.name ?? `IdVg @ Vds=${vds}V`,
+    });
+  }, [
+    activeStep,
+    canWorkbenchFit,
+    canWorkbenchSimulate,
+    csvPath,
+    fitting,
+    loadedStepCount,
+    loading,
+    raw,
+    simulating,
+    steps,
+    vds,
+    workbenchIsRunning,
+  ]);
+
+  useEffect(() => {
+    if (!onStepRuntimeChange) return;
+    const activeSnapshot = currentStepPatch();
+    onStepRuntimeChange(steps.map((step, idx) => {
+      const liveStep = idx === activeStep ? activeSnapshot : step;
+      return {
+        id: liveStep.id,
+        status: workbenchIsRunning && idx === activeStep ? "running" : liveStep.status,
+        csvPath: liveStep.csvPath,
+        pts: liveStep.raw?.ivar.length ?? 0,
+        vds: liveStep.vds,
+        vmin: liveStep.vmin,
+        vmax: liveStep.vmax,
+        r2Log: liveStep.r2Log,
+        r2Linear: liveStep.r2Linear,
+        rms: liveStep.rms,
+      };
+    }));
+  }, [activeStep, currentStepPatch, onStepRuntimeChange, steps, workbenchIsRunning]);
 
   return (
     <div style={{
@@ -1900,11 +2344,68 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
           fontWeight: 600, fontSize: 13,
           display: "flex", alignItems: "center", gap: 8,
         }}>
-          Curves Plot · {steps[activeStep]?.name ?? `IdVg @ Vds=${vds}V`}
+          {isExportPanelVisible ? "SPICE Model Preview" : `Curves Plot · ${steps[activeStep]?.name ?? `IdVg @ Vds=${vds}V`}`}
           {dragging && <span style={{ fontSize: 10, color: "var(--primary)" }}>拖动 {dragging === "min" ? "min" : "max"} 线...</span>}
         </div>
         <div ref={chartPaneRef} style={{ flex: 1, minHeight: 400, display: "flex", flexDirection: "column", background: "#fff", overflow: "hidden", position: "relative" }}>
-          {!raw ? (
+          {isExportPanelVisible ? (
+            <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, gap: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(120px, 1fr))", gap: 8, flexShrink: 0 }}>
+                <div style={{ border: "1px solid var(--border)", padding: 8, borderRadius: "var(--radius-sm)" }}>
+                  <div style={{ fontSize: 10, color: WB.textXs }}>Format</div>
+                  <div style={{ fontSize: 13, fontWeight: 800 }}>{exportFormat === "subckt" ? "Subckt wrapper" : "Pure BSIM3"}</div>
+                </div>
+                <div style={{ border: "1px solid var(--border)", padding: 8, borderRadius: "var(--radius-sm)" }}>
+                  <div style={{ fontSize: 10, color: WB.textXs }}>Parameters</div>
+                  <div style={{ fontSize: 13, fontWeight: 800 }}>{Object.keys(pvals).length}</div>
+                </div>
+                <div style={{ border: "1px solid var(--border)", padding: 8, borderRadius: "var(--radius-sm)" }}>
+                  <div style={{ fontSize: 10, color: WB.textXs }}>Fitted Steps</div>
+                  <div style={{ fontSize: 13, fontWeight: 800 }}>{fittedStepSummaries.filter(s => s.r2Log != null || s.r2Linear != null).length}</div>
+                </div>
+                <div style={{ border: "1px solid var(--border)", padding: 8, borderRadius: "var(--radius-sm)" }}>
+                  <div style={{ fontSize: 10, color: WB.textXs }}>Power Cell</div>
+                  <div style={{ fontSize: 13, fontWeight: 800 }}>{fmtParam(activeAreaMm2)} mm²</div>
+                </div>
+              </div>
+              <div
+                style={{
+                  flex: 1,
+                  minHeight: 0,
+                  overflow: "auto",
+                  border: "1px solid var(--border)",
+                  borderRadius: "var(--radius-sm)",
+                  background: "#F8FAFC",
+                  color: WB.text,
+                  fontSize: 12,
+                  lineHeight: 1.55,
+                  fontFamily: "'JetBrains Mono', Consolas, 'Courier New', monospace",
+                }}
+              >
+                <div style={{ display: "grid", gridTemplateColumns: "48px minmax(0, 1fr)" }}>
+                  {exportPreviewLines.map((line, index) => (
+                    <div key={index} style={{ display: "contents" }}>
+                      <div
+                        style={{
+                          padding: "0 10px",
+                          textAlign: "right",
+                          color: WB.textXs,
+                          background: "#EEF2F7",
+                          borderRight: "1px solid var(--border)",
+                          userSelect: "none",
+                        }}
+                      >
+                        {index + 1}
+                      </div>
+                      <div style={{ padding: "0 12px", whiteSpace: "pre" }}>
+                        {line || " "}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          ) : !raw ? (
             <div style={{
               color: "var(--muted)", textAlign: "center",
               marginTop: 80, fontSize: 14,
@@ -2112,79 +2613,203 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
         flexDirection: "column",
         overflow: "hidden",
       }}>
-        <div style={{ display: "flex", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
-          {(["steps", "params"] as const).map(tab => (
-            <button
-              key={tab}
-              type="button"
-              onClick={() => setSidePanelTab(tab)}
-              style={{
-                flex: 1,
-                border: 0,
-                borderBottom: sidePanelTab === tab ? `2px solid ${WB.primary}` : "2px solid transparent",
-                background: sidePanelTab === tab ? WB.primaryLt : "transparent",
-                color: sidePanelTab === tab ? WB.primary : WB.textSm,
-                padding: "9px 8px",
-                fontSize: 13,
-                fontWeight: 700,
-                cursor: "pointer",
-              }}
-            >
-              {tab === "steps" ? "Target Config" : "BSIM Params"}
-            </button>
-          ))}
-        </div>
-        {sidePanelTab === "steps" ? (
-          <div style={{ flex: 1, overflow: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 12 }}>
-            <section>
-              <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Current Target</div>
-              <div style={{ fontSize: 12, color: WB.textSm, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {fileName || "No CSV loaded"} · {fitScopeSummary.mode}
-              </div>
-            </section>
-            <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              <label style={{ fontSize: 12, color: WB.textSm }}>Vds (V)<input type="number" value={vds} step={0.1} onChange={e => setVds(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-              <label style={{ fontSize: 12, color: WB.textSm }}>Vmin<input type="number" value={vmin} step={0.05} onChange={e => setVmin(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-              <label style={{ fontSize: 12, color: WB.textSm }}>Vmax<input type="number" value={vmax} step={0.05} onChange={e => setVmax(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-              <label style={{ fontSize: 12, color: WB.textSm }}>Points<input readOnly value={inRange} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-            </section>
-
-            <section>
-              <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Stop Criteria</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                <label style={{ fontSize: 12, color: WB.textSm }}>Preset<select value={stopPreset} onChange={e => {
-                  const next = e.target.value as StopPreset;
-                  setStopPreset(next);
-                  if (next !== "custom") setFitStop(STOP_PRESETS[next]);
-                }} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}>
-                  <option value="fast">Fast</option><option value="balanced">Balanced</option><option value="precise">Precise</option><option value="custom">Custom</option>
-                </select></label>
-                <label style={{ fontSize: 12, color: WB.textSm }}>Max nfev<input type="number" value={fitStop.max_nfev} onChange={e => updateStopValue("max_nfev", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-                <label style={{ fontSize: 12, color: WB.textSm }}>R² log<input type="number" value={fitStop.r2_log} step={0.001} onChange={e => updateStopValue("r2_log", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-                <label style={{ fontSize: 12, color: WB.textSm }}>R² linear<input type="number" value={fitStop.r2_linear} step={0.001} onChange={e => updateStopValue("r2_linear", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-              </div>
-            </section>
-
-            <section>
-              <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Power Cell</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                <label style={{ fontSize: 12, color: WB.textSm }}>Area mm²<input type="number" value={activeAreaMm2} step={0.1} onChange={e => setActiveAreaMm2(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-                <label style={{ fontSize: 12, color: WB.textSm }}>Pitch µm<input type="number" value={cellPitchUm} step={0.1} onChange={e => setCellPitchUm(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-              </div>
-              <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, fontSize: 13, color: WB.textSm }}>
-                <input type="checkbox" checked={protectPrevious} onChange={e => setProtectPrevious(e.target.checked)} />
-                Protect previous fitted curves
-              </label>
-              <label style={{ fontSize: 12, color: WB.textSm, display: "block", marginTop: 8 }}>Protect weight<input type="number" value={protectWeight} min={0} max={1} step={0.05} onChange={e => setProtectWeight(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-            </section>
+        {isExportPanelVisible ? (
+          <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 800 }}>Export Model</div>
+            <div style={{ fontSize: 11, color: WB.textXs, marginTop: 2 }}>Final step: write current BSIM parameters to SPICE .lib</div>
           </div>
         ) : (
+          <div style={{ display: "flex", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+            {(["steps", "params"] as const).map(tab => (
+              <button
+                key={tab}
+                type="button"
+                onClick={() => setSidePanelTab(tab)}
+                style={{
+                  flex: 1,
+                  border: 0,
+                  borderBottom: sidePanelTab === tab ? `2px solid ${WB.primary}` : "2px solid transparent",
+                  background: sidePanelTab === tab ? WB.primaryLt : "transparent",
+                  color: sidePanelTab === tab ? WB.primary : WB.textSm,
+                  padding: "9px 8px",
+                  fontSize: 13,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                {tab === "steps" ? "Target Config" : "BSIM Params"}
+              </button>
+            ))}
+          </div>
+        )}
+        {!isExportPanelVisible && sidePanelTab === "steps" ? (
+          <div style={{ flex: 1, overflow: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 12 }}>
+            {/* 根据选中内容显示不同的配置 */}
+            {externalSelectedStep?.id === "power_cell" ? (
+              // 显示 Power Cell 配置 - 只有 Area 和 Pitch
+              <>
+                <section>
+                  <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Power Cell</div>
+                  <div style={{ fontSize: 11, color: WB.textXs, marginBottom: 10 }}>
+                    器件级参数，应用于所有拟合步骤
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Area mm²<input type="number" value={activeAreaMm2} step={0.1} onChange={e => setActiveAreaMm2(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Pitch µm<input type="number" value={cellPitchUm} step={0.1} onChange={e => setCellPitchUm(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  </div>
+                </section>
+              </>
+            ) : externalSelectedStep ? (
+              // 显示选中 step 的配置
+              <>
+                <section>
+                  <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Target: {externalSelectedStep.label}</div>
+                  <div style={{ fontSize: 11, color: WB.textXs }}>
+                    Type: {externalSelectedStep.type || "—"} · CSV: {externalSelectedStep.csvFile || "—"}
+                  </div>
+                </section>
+                <section>
+                  <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Data Source</div>
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    onClick={onLoad}
+                    disabled={!canLoadTargetCsv}
+                    style={{ width: "100%", justifyContent: "center" }}
+                    title={isTargetLoadSupported ? "为当前 step 加载 CSV" : "当前 step 类型暂未接入 CSV 加载"}
+                  >
+                    <Upload size={13} />{loading ? "Loading..." : "Load CSV"}
+                  </Button>
+                  <div
+                    style={{
+                      marginTop: 7,
+                      minHeight: 18,
+                      fontSize: 11,
+                      color: targetConfigFileName ? WB.textMd : WB.textXs,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                    title={targetConfigStep?.csvPath || "No CSV loaded"}
+                  >
+                    {targetConfigFileName || "No CSV loaded for this step"}
+                  </div>
+                </section>
+                <section>
+                  <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Circuit Condition</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>
+                      {externalSelectedStep.type === "IdVg" ? "Vds (V)" : "Vgs (V)"}
+                      <input
+                        type="text"
+                        value={externalSelectedStep.bias || "?"}
+                        placeholder="?"
+                        style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}
+                      />
+                    </label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Range<input type="text" value={externalSelectedStep.range || "?"} readOnly style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px", backgroundColor: WB.pageBg }} /></label>
+                  </div>
+                </section>
+                <section>
+                  <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Fit Range</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Vmin<input type="number" value={vmin} step={0.05} onChange={e => setVmin(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Vmax<input type="number" value={vmax} step={0.05} onChange={e => setVmax(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Points<input readOnly value={inRange} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px", backgroundColor: WB.pageBg }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Weight<input type="number" value={externalSelectedStep.weight ?? 1.0} min={0} max={2} step={0.1} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  </div>
+                </section>
+                <section>
+                  <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Stop Criteria</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Preset<select value={stopPreset} onChange={e => {
+                      const next = e.target.value as StopPreset;
+                      setStopPreset(next);
+                      if (next !== "custom") setFitStop(STOP_PRESETS[next]);
+                    }} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}>
+                      <option value="fast">Fast</option><option value="balanced">Balanced</option><option value="precise">Precise</option><option value="custom">Custom</option>
+                    </select></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Max nfev<input type="number" value={fitStop.max_nfev} onChange={e => updateStopValue("max_nfev", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>R² log<input type="number" value={fitStop.r2_log} step={0.001} onChange={e => updateStopValue("r2_log", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>R² linear<input type="number" value={fitStop.r2_linear} step={0.001} onChange={e => updateStopValue("r2_linear", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  </div>
+                </section>
+              </>
+            ) : (
+              // 旧的默认显示（无外部选中时）
+              <>
+                <section>
+                  <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Current Target</div>
+                  <div style={{ fontSize: 12, color: WB.textSm, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {fileName || "No CSV loaded"} · {fitScopeSummary.mode}
+                  </div>
+                </section>
+                <section>
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    onClick={onLoad}
+                    disabled={loading || workbenchIsRunning}
+                    style={{ width: "100%", justifyContent: "center" }}
+                    title="加载当前 step 的 CSV"
+                  >
+                    <Upload size={13} />{loading ? "Loading..." : "Load CSV"}
+                  </Button>
+                </section>
+                <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <label style={{ fontSize: 12, color: WB.textSm }}>Vds (V)<input type="number" value={vds} step={0.1} onChange={e => setVds(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  <label style={{ fontSize: 12, color: WB.textSm }}>Vmin<input type="number" value={vmin} step={0.05} onChange={e => setVmin(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  <label style={{ fontSize: 12, color: WB.textSm }}>Vmax<input type="number" value={vmax} step={0.05} onChange={e => setVmax(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  <label style={{ fontSize: 12, color: WB.textSm }}>Points<input readOnly value={inRange} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                </section>
+
+                <section>
+                  <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Stop Criteria</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Preset<select value={stopPreset} onChange={e => {
+                      const next = e.target.value as StopPreset;
+                      setStopPreset(next);
+                      if (next !== "custom") setFitStop(STOP_PRESETS[next]);
+                    }} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}>
+                      <option value="fast">Fast</option><option value="balanced">Balanced</option><option value="precise">Precise</option><option value="custom">Custom</option>
+                    </select></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Max nfev<input type="number" value={fitStop.max_nfev} onChange={e => updateStopValue("max_nfev", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>R² log<input type="number" value={fitStop.r2_log} step={0.001} onChange={e => updateStopValue("r2_log", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>R² linear<input type="number" value={fitStop.r2_linear} step={0.001} onChange={e => updateStopValue("r2_linear", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  </div>
+                </section>
+
+                <section>
+                  <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Power Cell</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Area mm²<input type="number" value={activeAreaMm2} step={0.1} onChange={e => setActiveAreaMm2(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Pitch µm<input type="number" value={cellPitchUm} step={0.1} onChange={e => setCellPitchUm(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  </div>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, fontSize: 13, color: WB.textSm }}>
+                    <input type="checkbox" checked={protectPrevious} onChange={e => setProtectPrevious(e.target.checked)} />
+                    Protect previous fitted curves
+                  </label>
+                  <label style={{ fontSize: 12, color: WB.textSm, display: "block", marginTop: 8 }}>Protect weight<input type="number" value={protectWeight} min={0} max={1} step={0.05} onChange={e => setProtectWeight(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                </section>
+              </>
+            )}
+          </div>
+        ) : !isExportPanelVisible && sidePanelTab === "params" ? (
           <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
             <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)", display: "flex", gap: 8, alignItems: "center" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 13, fontWeight: 800 }}>BSIM Parameters</div>
                 <div style={{ fontSize: 12, color: WB.textXs }}>{fitParamNames.length} selected · {lockedParams.size} locked</div>
               </div>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={onImportSpiceParams}
+                disabled={importingParams}
+                title="Import parameters from a SPICE .lib/.model file"
+              >
+                <Upload size={13} />{importingParams ? "Importing..." : "Import"}
+              </Button>
               <Button size="sm" variant="outline" onClick={() => setLockedParams(new Set())}>Unlock</Button>
             </div>
             <div style={{ flex: 1, minHeight: 0, overflow: "hidden", padding: 10, display: "flex", flexDirection: "column" }}>
@@ -2203,6 +2828,128 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
                 onResetCatBounds={onResetCatBounds}
               />
             </div>
+          </div>
+        ) : (
+          <div style={{ flex: 1, overflow: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 12 }}>
+            <section>
+              <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Export SPICE Model</div>
+              <div style={{ fontSize: 11, color: WB.textXs }}>
+                Export the current BSIM parameter set shown in BSIM Params.
+              </div>
+            </section>
+
+            <section>
+              <div style={{ fontSize: 12, color: WB.textSm, marginBottom: 6 }}>Format</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                <Button
+                  size="sm"
+                  variant={exportFormat === "subckt" ? "primary" : "outline"}
+                  onClick={() => setExportFormat("subckt")}
+                >
+                  Subckt
+                </Button>
+                <Button
+                  size="sm"
+                  variant={exportFormat === "bsim3" ? "primary" : "outline"}
+                  onClick={() => setExportFormat("bsim3")}
+                >
+                  BSIM3
+                </Button>
+              </div>
+            </section>
+
+            <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <label style={{ fontSize: 12, color: WB.textSm }}>
+                {exportFormat === "subckt" ? "Subckt Name" : "Model Name"}
+                <input
+                  value={exportSubcktName}
+                  onChange={e => setExportSubcktName(e.target.value)}
+                  style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}
+                />
+              </label>
+              <label style={{ fontSize: 12, color: WB.textSm }}>
+                Rg (Ω)
+                <input
+                  type="number"
+                  value={exportRgOhm}
+                  min={0}
+                  step={0.1}
+                  onChange={e => setExportRgOhm(Number(e.target.value))}
+                  style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}
+                />
+              </label>
+              <label style={{ fontSize: 12, color: WB.textSm }}>
+                Area mm²
+                <input
+                  type="number"
+                  value={activeAreaMm2}
+                  step={0.1}
+                  onChange={e => setActiveAreaMm2(Number(e.target.value))}
+                  style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}
+                />
+              </label>
+              <label style={{ fontSize: 12, color: WB.textSm }}>
+                Pitch µm
+                <input
+                  type="number"
+                  value={cellPitchUm}
+                  step={0.1}
+                  onChange={e => setCellPitchUm(Number(e.target.value))}
+                  style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}
+                />
+              </label>
+            </section>
+
+            <section>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: WB.textSm }}>
+                <input
+                  type="checkbox"
+                  checked={exportIncludeDiode}
+                  onChange={e => setExportIncludeDiode(e.target.checked)}
+                />
+                Include body diode
+              </label>
+            </section>
+
+            <section>
+              <div style={{ fontSize: 12, color: WB.textSm, marginBottom: 4 }}>Output Path</div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <input
+                  value={exportOutputPath}
+                  onChange={e => setExportOutputPath(e.target.value)}
+                  placeholder="C:/models/MY_MOSFET.lib"
+                  style={{ flex: 1, minWidth: 0, fontSize: 12, padding: "4px 6px" }}
+                />
+                <Button size="sm" variant="outline" onClick={pickExportPath}>Browse</Button>
+              </div>
+            </section>
+
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={onExportModel}
+              disabled={exporting || !exportOutputPath}
+              style={{ width: "100%" }}
+            >
+              <Download size={13} />{exporting ? "Exporting..." : "Export .lib"}
+            </Button>
+
+            {exportResult && (
+              <div style={{ border: `1px solid ${WB.border}`, background: "#ECFDF5", padding: 9, borderRadius: "var(--radius-sm)", fontSize: 11 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 800, color: "#047857" }}>
+                  <CheckCircle2 size={13} />Exported
+                </div>
+                <div title={exportResult.path} style={{ marginTop: 4, color: WB.textMd, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {exportResult.path}
+                </div>
+                <div style={{ color: WB.textXs }}>{exportResult.nBytes.toLocaleString()} bytes</div>
+              </div>
+            )}
+            {exportError && (
+              <div style={{ border: "1px solid #FCA5A5", background: "#FEF2F2", padding: 9, borderRadius: "var(--radius-sm)", color: "#991B1B", fontSize: 11 }}>
+                {exportError}
+              </div>
+            )}
           </div>
         )}
       </div>

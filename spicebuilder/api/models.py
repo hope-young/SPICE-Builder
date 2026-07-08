@@ -80,6 +80,27 @@ class ExportRequest(BaseModel):
         return v
 
 
+class CsvExportModelRequest(BaseModel):
+    """Stateless export: current Workbench params -> SPICE .lib."""
+    output_path: str = Field(..., description="Absolute output file path (must end with .lib)")
+    format: Literal["subckt", "bsim3", "B", "A"] = Field("subckt")
+    subckt_name: str = Field("MY_MOSFET")
+    model_name: str = Field("BSIM3_core")
+    params: Dict[str, float] = Field(default_factory=dict)
+    power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
+    include_diode: bool = Field(True)
+    rg_ohm: float = Field(1.6)
+
+    @field_validator('output_path')
+    @classmethod
+    def _csv_output_path_must_be_lib(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError('output_path is required')
+        if not v.lower().endswith('.lib'):
+            raise ValueError(f'output_path must end with .lib, got: {v}')
+        return v
+
+
 class HealthResponse(BaseModel):
     """Response payload for GET /health."""
     status: str = Field(..., description="'ok' when the server is alive")

@@ -277,6 +277,52 @@ export type CsvFitStopConfig = {
   max_nfev: number;
 };
 
+export type CsvExportModelResponse = {
+  success: boolean;
+  file_path: string;
+  n_bytes: number;
+};
+
+export class ApiRequestError extends Error {
+  status: number;
+  endpoint: string;
+  backendError?: string;
+  body?: unknown;
+
+  constructor(message: string, opts: { status: number; endpoint: string; backendError?: string; body?: unknown }) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = opts.status;
+    this.endpoint = opts.endpoint;
+    this.backendError = opts.backendError;
+    this.body = opts.body;
+    Object.setPrototypeOf(this, ApiRequestError.prototype);
+  }
+}
+
+function stringifyBackendBody(body: unknown): string {
+  if (body == null) return "";
+  if (typeof body === "string") return body;
+  if (typeof body === "object" && "detail" in body) {
+    const detail = (body as { detail?: unknown }).detail;
+    return typeof detail === "string" ? detail : JSON.stringify(detail);
+  }
+  try {
+    return JSON.stringify(body);
+  } catch {
+    return String(body);
+  }
+}
+
+export function isApiEndpointNotFound(error: unknown, endpoint: string): boolean {
+  if (error instanceof ApiRequestError) {
+    const backendText = `${error.backendError ?? ""} ${stringifyBackendBody(error.body)}`;
+    return error.status === 404 && error.endpoint === endpoint && /not found/i.test(backendText);
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes(endpoint) && /\b404\b/.test(message) && /not found/i.test(message);
+}
+
 function isTauri(): boolean {
   return typeof window !== "undefined" && !!(window as any).__TAURI_INTERNALS__;
 }
@@ -316,6 +362,56 @@ export async function csvLoad(
   return resp.body;
 }
 
+/** Export current Workbench BSIM params as a SPICE .lib without project state */
+export async function csvExportModel(opts: {
+  outputPath: string;
+  format: "subckt" | "bsim3";
+  subcktName: string;
+  modelName?: string;
+  params: Record<string, number>;
+  powerParams?: PowerMOSSubcktParams;
+  includeDiode?: boolean;
+  rgOhm?: number;
+}): Promise<CsvExportModelResponse> {
+  const endpoint = "/api/csv/export_model";
+  const body = {
+    output_path: opts.outputPath,
+    format: opts.format,
+    subckt_name: opts.subcktName,
+    model_name: opts.modelName ?? "BSIM3_core",
+    params: opts.params,
+    power_params: opts.powerParams,
+    include_diode: opts.includeDiode ?? true,
+    rg_ohm: opts.rgOhm ?? 1.6,
+  };
+  if (!isTauri()) {
+    try {
+      return await webFetch(endpoint, body);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      const status = Number(message.match(/\bfailed:\s+(\d+)/)?.[1] ?? 0);
+      throw new ApiRequestError(message, { status, endpoint, backendError: message });
+    }
+  }
+  const resp = await cmd<{
+    status: number; ok: boolean; body: CsvExportModelResponse; error?: string;
+  }>("call_api", {
+    method: "POST",
+    endpoint,
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const backendText = resp.error || stringifyBackendBody(resp.body);
+    throw new ApiRequestError(`csvExportModel failed: ${resp.status} ${backendText}`, {
+      status: resp.status,
+      endpoint,
+      backendError: resp.error,
+      body: resp.body,
+    });
+  }
+  return resp.body;
+}
+
 /** 给定 CSV + 参数, 跑 LTspice 返回 sim+meas */
 export async function csvSimulate(
   csvPath: string,
@@ -326,6 +422,7 @@ export async function csvSimulate(
     vgs_v?: number;
     vds_max?: number;
     powerParams?: PowerMOSSubcktParams;
+    signal?: AbortSignal;
   }
 ): Promise<{ curve_type: string; ivar: number[]; sim: number[]; meas: number[]; metadata: Record<string, unknown> }> {
   const body = {
@@ -338,7 +435,7 @@ export async function csvSimulate(
     power_params: opts.powerParams,
   };
   if (!isTauri()) {
-    return webFetch("/api/csv/simulate", body);
+    return webFetch("/api/csv/simulate", body, opts.signal);
   }
   const resp = await cmd<{
     status: number; ok: boolean; body: {

@@ -161,6 +161,19 @@ class BSIM3Model:
         self._values[name] = float(value)
         self._fitted.add(name)
 
+    def set_unchecked(self, param: str, value: float) -> None:
+        """Set a parameter without enforcing optimizer bounds.
+
+        This is intended for serialization/export paths where the user wants
+        to write the current model state exactly as-is.  Fitting and simulation
+        should keep using set() so bounds remain active there.
+        """
+        name = self._strip_path(param)
+        if name not in self._values:
+            raise KeyError(f"未知参数: {param}")
+        self._values[name] = float(value)
+        self._fitted.add(name)
+
     def set_initial(self, param: str, value: float) -> None:
         """设置初始值（不会被 set() 覆盖）"""
         name = self._strip_path(param)
