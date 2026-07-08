@@ -42,8 +42,8 @@ export function DataBrowser() {
       const ps = await api.listProjects();
       setProjects(ps as ProjectItem[]);
       setLog("info", `Found ${ps.length} project(s)`);
-    } catch (e: any) {
-      setLog("error", `listProjects failed: ${e.message}`);
+    } catch (e: unknown) {
+      setLog("error", `listProjects failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
@@ -62,9 +62,9 @@ export function DataBrowser() {
     try {
       const r = await api.getCurve(projectId, curveType);
       setCurvePreview({ ivar: r.ivar, dvar: r.dvar, meta: r.metadata });
-    } catch (e: any) {
+    } catch (e: unknown) {
       setCurvePreview(null);
-      setLog("error", `getCurve(${curveType}) failed: ${e.message}`);
+      setLog("error", `getCurve(${curveType}) failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLoadingCurve(false);
     }
@@ -78,8 +78,8 @@ export function DataBrowser() {
         await loadProject(path);
         await refreshProjects();
       }
-    } catch (e: any) {
-      setLog("error", `Load Excel failed: ${e.message}`);
+    } catch (e: unknown) {
+      setLog("error", `Load Excel failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLoadingFile(false);
     }
@@ -254,7 +254,7 @@ function DatasetDetail({ dataset, curve, loading, curveInfo }: {
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div style={{ padding: "8px 10px", background: "#ffffff", borderRadius: 5, border: "1px solid #e5e5e5" }}>
+    <div style={{ padding: "8px 10px", background: "#ffffff", borderRadius: "var(--radius-md)", border: "1px solid #e5e5e5" }}>
       <div style={{ fontSize: 10, color: "#6b7280", marginBottom: 2 }}>{label}</div>
       <div style={{ fontSize: 14, fontWeight: 600, color: "#2c2c2c", fontFamily: "'JetBrains Mono', Consolas, monospace" }}>{value}</div>
     </div>

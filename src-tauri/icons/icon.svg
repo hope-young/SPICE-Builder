@@ -1,0 +1,58 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- 白色圆角背景 -->
+  <rect width="512" height="512" rx="115" fill="#FFFFFF"/>
+
+  <!-- MOSFET 符号 + 曲线组合 (主色调 #0D7F8F) -->
+  <g transform="translate(256, 256)">
+    <!-- Gate 栅极线 (左侧) -->
+    <line x1="-140" y1="0" x2="-80" y2="0"
+          stroke="#0D7F8F" stroke-width="12" stroke-linecap="round"/>
+
+    <!-- 栅极绝缘层 (短竖线) -->
+    <line x1="-80" y1="-60" x2="-80" y2="60"
+          stroke="#0D7F8F" stroke-width="10" stroke-linecap="round"/>
+
+    <!-- 沟道区域 (三段短线，表示增强型) -->
+    <line x1="-50" y1="-60" x2="-50" y2="-20"
+          stroke="#0D7F8F" stroke-width="10" stroke-linecap="round"/>
+    <line x1="-50" y1="-10" x2="-50" y2="10"
+          stroke="#0D7F8F" stroke-width="10" stroke-linecap="round"/>
+    <line x1="-50" y1="20" x2="-50" y2="60"
+          stroke="#0D7F8F" stroke-width="10" stroke-linecap="round"/>
+
+    <!-- Drain 漏极 (上方，带曲线暗示) -->
+    <path d="M -50 -60 Q -20 -70, 10 -75 L 80 -85"
+          stroke="#0D7F8F" stroke-width="12" fill="none" stroke-linecap="round"/>
+    <line x1="80" y1="-85" x2="140" y2="-85"
+          stroke="#0D7F8F" stroke-width="12" stroke-linecap="round"/>
+
+    <!-- Source 源极 (下方) -->
+    <line x1="-50" y1="60" x2="80" y2="60"
+          stroke="#0D7F8F" stroke-width="12" stroke-linecap="round"/>
+    <line x1="80" y1="60" x2="140" y2="60"
+          stroke="#0D7F8F" stroke-width="12" stroke-linecap="round"/>
+
+    <!-- 衬底箭头 (指向沟道，表示 N-Channel) -->
+    <line x1="0" y1="90" x2="0" y2="30"
+          stroke="#0D7F8F" stroke-width="10" stroke-linecap="round"/>
+    <path d="M 0 30 L -10 45 L 10 45 Z"
+          fill="#0D7F8F"/>
+
+    <!-- Id-Vg 曲线元素 (右上角，S型曲线) -->
+    <path d="M 50 -100 Q 70 -90, 80 -70 T 100 -30 T 115 10"
+          stroke="#0D7F8F" stroke-width="8" fill="none"
+          stroke-linecap="round" opacity="0.7"/>
+
+    <!-- 端子标签 -->
+    <text x="-140" y="-15" font-family="'Inter', sans-serif"
+          font-size="32" font-weight="700" fill="#0D7F8F">G</text>
+    <text x="145" y="-75" font-family="'Inter', sans-serif"
+          font-size="32" font-weight="700" fill="#0D7F8F">D</text>
+    <text x="145" y="75" font-family="'Inter', sans-serif"
+          font-size="32" font-weight="700" fill="#0D7F8F">S</text>
+  </g>
+
+  <!-- 外边框 (可选，增加层次感) -->
+  <rect width="512" height="512" rx="115" fill="none"
+        stroke="#0D7F8F" stroke-width="8" opacity="0.2"/>
+</svg>

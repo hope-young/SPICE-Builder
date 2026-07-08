@@ -1,0 +1,995 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SpiceBuilder Multi-Plot Fit Mockup</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --surface: #ffffff;
+      --surface-2: #f0f4f8;
+      --text: #18202a;
+      --muted: #687383;
+      --border: #d7dde5;
+      --primary: #0d7f8f;
+      --primary-soft: #e7f5f6;
+      --success: #188558;
+      --danger: #bd3b3b;
+      --warning: #b7791f;
+      --blue: #246bce;
+      --violet: #7b57c2;
+      --rose: #c94f71;
+      --amber: #c47a16;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      letter-spacing: 0;
+    }
+
+    .app {
+      height: 100vh;
+      display: grid;
+      grid-template-columns: 272px 318px minmax(640px, 1fr);
+      grid-template-rows: 72px 1fr;
+    }
+
+    .topbar {
+      grid-column: 1 / 4;
+      display: grid;
+      grid-template-rows: 28px 44px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+
+    .menu-bar {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      padding: 0 8px;
+      border-bottom: 1px solid #edf0f4;
+      background: #fbfcfd;
+    }
+    .menu-item {
+      position: relative;
+      height: 24px;
+      padding: 0 10px;
+      border: 0;
+      border-radius: 5px;
+      background: transparent;
+      color: var(--text);
+      font-size: 12px;
+      cursor: default;
+    }
+    .menu-item:hover { background: var(--surface-2); }
+    .menu-item .drop {
+      display: none;
+      position: absolute;
+      left: 0;
+      top: 24px;
+      min-width: 172px;
+      z-index: 30;
+      padding: 5px;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: #fff;
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16);
+    }
+    .menu-item:hover .drop { display: grid; }
+    .drop span {
+      padding: 6px 8px;
+      border-radius: 5px;
+      color: var(--text);
+      white-space: nowrap;
+      font-size: 12px;
+    }
+    .drop span:hover { background: var(--primary-soft); color: var(--primary); }
+    .mainbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 14px;
+    }
+
+    .brand { font-weight: 760; font-size: 14px; }
+    .crumb { color: var(--muted); font-size: 12px; flex: 1; }
+    .seg {
+      display: inline-flex;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      background: var(--surface);
+      height: 28px;
+    }
+    .seg button {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      padding: 0 10px;
+      font-size: 12px;
+      border-right: 1px solid var(--border);
+    }
+    .seg button:last-child { border-right: 0; }
+    .seg button.active {
+      background: var(--primary-soft);
+      color: var(--primary);
+      font-weight: 700;
+    }
+    .toolbar-button {
+      height: 28px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 6px;
+      padding: 0 10px;
+      color: var(--text);
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .toolbar-button.primary {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: white;
+      font-weight: 700;
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--border);
+      background: var(--surface);
+      min-height: 0;
+      overflow: auto;
+      padding: 12px;
+    }
+
+    .section-title {
+      font-size: 11px;
+      font-weight: 780;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin: 14px 4px 8px;
+    }
+
+    .tree {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .tree-group {
+      border: 0;
+      border-radius: 0;
+      overflow: visible;
+      background: transparent;
+    }
+    .tree-row {
+      display: grid;
+      grid-template-columns: 18px 16px 18px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 6px;
+      min-height: 28px;
+      padding: 4px 6px;
+      font-size: 12px;
+      color: var(--text);
+      border-radius: 6px;
+    }
+    .tree-row.group-row {
+      background: transparent;
+      border-bottom: 0;
+    }
+    .tree-row.step-row {
+      grid-template-columns: 18px 16px 18px minmax(0, 1fr) auto;
+      min-height: 25px;
+      padding-left: 18px;
+    }
+    .tree-row.active { background: var(--primary-soft); color: var(--primary); font-weight: 720; }
+    .tree-row:hover { background: #f2f5f8; }
+    .tree-row.dim { color: var(--muted); }
+    .tree-row .indent { width: 14px; }
+    .tree-label {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+    .tree-name {
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 720;
+      line-height: 1.2;
+    }
+    .tree-sub {
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--muted);
+      font-size: 9px;
+      font-weight: 500;
+      line-height: 1.2;
+    }
+    .step-row .tree-name {
+      font-weight: 620;
+      font-size: 11px;
+    }
+    .tree-check {
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      accent-color: var(--primary);
+    }
+    .status {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 2px solid var(--border);
+      display: inline-grid;
+      place-items: center;
+    }
+    .status.done { border-color: var(--success); background: #e9f8f1; }
+    .status.done::after {
+      content: "";
+      width: 5px;
+      height: 8px;
+      border-right: 2px solid var(--success);
+      border-bottom: 2px solid var(--success);
+      transform: rotate(40deg);
+      margin-top: -1px;
+    }
+    .status.todo { border-color: var(--danger); background: #fff0f0; }
+    .status.todo::after {
+      content: "";
+      width: 7px;
+      height: 2px;
+      background: var(--danger);
+    }
+    .tag {
+      font-size: 10px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 1px 5px;
+      white-space: nowrap;
+      background: #fff;
+    }
+    .tag.live { color: var(--success); border-color: transparent; background: transparent; }
+    .tag.next { color: var(--muted); border-color: transparent; background: transparent; }
+    .tag.idle { color: var(--muted); }
+    .tree-actions {
+      display: flex;
+      gap: 6px;
+      padding: 4px 6px 6px 58px;
+      border-top: 0;
+      background: transparent;
+    }
+    .tree-action {
+      height: 22px;
+      border: 1px solid var(--border);
+      background: #fff;
+      border-radius: 5px;
+      font-size: 10px;
+      color: var(--text);
+      padding: 0 7px;
+    }
+
+    .mini-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin: 12px 4px;
+    }
+
+    .control {
+      border-right: 1px solid var(--border);
+      background: #fbfcfd;
+      min-height: 0;
+      overflow: auto;
+      padding: 14px;
+    }
+
+    .panel {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 8px;
+      margin-bottom: 12px;
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 760;
+    }
+    .panel-body { padding: 10px; }
+    .scope-note {
+      padding: 8px;
+      margin-bottom: 10px;
+      border: 1px solid #cde7ea;
+      border-radius: 6px;
+      background: var(--primary-soft);
+      color: var(--primary);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    .scope-note strong {
+      display: block;
+      font-size: 12px;
+      color: var(--text);
+      margin-bottom: 2px;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 8px;
+    }
+    .chip {
+      border: 1px solid var(--border);
+      background: #fff;
+      color: var(--muted);
+      border-radius: 5px;
+      padding: 2px 6px;
+      font-size: 10px;
+    }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .summary-list {
+      display: grid;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .summary-line {
+      display: grid;
+      grid-template-columns: 82px 1fr;
+      gap: 8px;
+    }
+    .summary-line span:first-child {
+      color: var(--muted);
+    }
+    label {
+      font-size: 10px;
+      color: var(--muted);
+      display: block;
+    }
+    input, select {
+      width: 100%;
+      margin-top: 4px;
+      height: 28px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      background: #fff;
+      color: var(--text);
+      font-size: 12px;
+      padding: 0 8px;
+    }
+
+    .param-row {
+      display: grid;
+      grid-template-columns: 18px 18px 58px 1fr 58px;
+      align-items: center;
+      gap: 7px;
+      min-height: 26px;
+      font-size: 11px;
+      border-bottom: 1px solid #edf0f4;
+    }
+    .param-row:last-child { border-bottom: 0; }
+    .lock {
+      width: 16px;
+      height: 16px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      position: relative;
+      background: #fff;
+    }
+    .lock::before {
+      content: "";
+      position: absolute;
+      left: 4px;
+      top: -4px;
+      width: 6px;
+      height: 7px;
+      border: 1.5px solid currentColor;
+      border-bottom: 0;
+      border-radius: 6px 6px 0 0;
+      color: var(--muted);
+    }
+    .lock.closed { background: #fff8e8; border-color: #e1b86a; color: var(--warning); }
+    .lock.open::before { transform: translateX(4px) rotate(28deg); transform-origin: left bottom; }
+    .param-name {
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-weight: 700;
+    }
+    .tiny-bar {
+      height: 5px;
+      background: #dce5ee;
+      border-radius: 999px;
+      position: relative;
+      overflow: hidden;
+    }
+    .tiny-bar::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: var(--w, 52%);
+      background: var(--primary);
+    }
+    .value { text-align: right; color: var(--muted); font-family: Consolas, monospace; }
+
+    .workspace {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: 40px 1fr 168px;
+      background: var(--bg);
+    }
+    .canvas-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .canvas-title {
+      flex: 1;
+      font-size: 13px;
+      font-weight: 760;
+    }
+    .plot-grid {
+      min-height: 0;
+      overflow: auto;
+      padding: 12px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(360px, 1fr));
+      gap: 12px;
+      align-content: start;
+    }
+    .plot-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      min-height: 268px;
+      display: grid;
+      grid-template-rows: 34px 1fr 46px;
+    }
+    .plot-head {
+      padding: 0 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 760;
+    }
+    .plot-head .meta { color: var(--muted); font-weight: 500; flex: 1; }
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--blue);
+    }
+    .dot.violet { background: var(--violet); }
+    .dot.rose { background: var(--rose); }
+    .dot.amber { background: var(--amber); }
+    .plot {
+      padding: 8px 10px 0;
+      min-height: 0;
+    }
+    svg { width: 100%; height: 100%; display: block; }
+    .axis { stroke: #b9c2cd; stroke-width: 1; }
+    .grid { stroke: #e7ebf0; stroke-width: 1; }
+    .meas { fill: var(--blue); opacity: .78; }
+    .meas.violet { fill: var(--violet); }
+    .meas.rose { fill: var(--rose); }
+    .meas.amber { fill: var(--amber); }
+    .fit { fill: #111827; opacity: .82; }
+    .line { fill: none; stroke-width: 2; stroke-linecap: round; }
+    .line.blue { stroke: var(--blue); }
+    .line.violet { stroke: var(--violet); }
+    .line.rose { stroke: var(--rose); }
+    .line.amber { stroke: var(--amber); }
+    .plot-foot {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1px;
+      border-top: 1px solid var(--border);
+      background: var(--border);
+    }
+    .metric {
+      background: #fff;
+      padding: 5px 8px;
+      font-size: 10px;
+      color: var(--muted);
+    }
+    .metric strong { color: var(--text); font-size: 12px; display: block; }
+
+    .bottom {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr;
+      gap: 12px;
+      padding: 0 12px 12px;
+      min-height: 0;
+    }
+    .convergence, .queue {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      min-height: 0;
+    }
+    .bottom-head {
+      height: 32px;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 760;
+    }
+    .queue-row {
+      display: grid;
+      grid-template-columns: 18px 1fr 62px 72px;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-bottom: 1px solid #edf0f4;
+      font-size: 11px;
+    }
+    .queue-row:last-child { border-bottom: 0; }
+    .progress {
+      height: 6px;
+      background: #e4e9ef;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress span {
+      display: block;
+      height: 100%;
+      width: var(--p);
+      background: var(--primary);
+    }
+
+    @media (max-width: 1180px) {
+      .app { grid-template-columns: 246px 294px minmax(520px, 1fr); }
+      .plot-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <nav class="menu-bar" aria-label="application menu">
+        <button class="menu-item">文件
+          <span class="drop">
+            <span>新建拟合项目</span>
+            <span>打开项目</span>
+            <span>导入 CSV / Excel</span>
+            <span>保存当前模型</span>
+            <span>导出 SPICE .lib</span>
+          </span>
+        </button>
+        <button class="menu-item">编辑
+          <span class="drop">
+            <span>撤销参数修改</span>
+            <span>重做参数修改</span>
+            <span>复制当前 Step</span>
+            <span>删除选中项</span>
+            <span>参数锁批量设置</span>
+          </span>
+        </button>
+        <button class="menu-item">视图
+          <span class="drop">
+            <span>Grid 多图布局</span>
+            <span>Vertical 纵向布局</span>
+            <span>Horizontal 横向布局</span>
+            <span>显示 Convergence</span>
+            <span>显示 Fit Queue</span>
+          </span>
+        </button>
+        <button class="menu-item">拟合
+          <span class="drop">
+            <span>仿真当前 Step</span>
+            <span>拟合当前 Scope</span>
+            <span>拟合全部队列</span>
+            <span>停止拟合</span>
+            <span>重置停止条件</span>
+          </span>
+        </button>
+        <button class="menu-item">帮助
+          <span class="drop">
+            <span>参数说明</span>
+            <span>拟合流程指南</span>
+            <span>查看日志</span>
+            <span>关于 SpiceBuilder</span>
+          </span>
+        </button>
+      </nav>
+      <div class="mainbar">
+        <div class="brand">SpiceBuilder</div>
+        <div class="crumb" id="breadcrumb">Project / SDH10N2P1 / Transfer IdVg group</div>
+        <div class="seg" aria-label="layout mode">
+          <button>Vertical</button>
+          <button>Horizontal</button>
+          <button class="active">Grid</button>
+        </div>
+        <button class="toolbar-button">Import</button>
+        <button class="toolbar-button primary">Fit Queue</button>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <div class="section-title">Fit Project Tree</div>
+      <div class="tree">
+        <div class="tree-group">
+          <div class="tree-row group-row active" data-fit-root="1" data-title="Transfer IdVg" data-scope-title="IdVg / Transfer" data-scope="组级联合拟合：所有勾选的 IdVg step 同时进入 residual，共享同一组 BSIM 参数。" data-detail="Characteristic=Transfer IdVg; Steps=2/2 loaded; Bias=Vds 0.5 V + 5 V">
+            <span>▾</span><input class="tree-check" type="checkbox" checked><span class="status done"></span>
+            <span class="tree-label"><span class="tree-name">IdVg / Transfer</span><span class="tree-sub">2 steps · ready</span></span>
+            <span class="tag live">2/2</span>
+          </div>
+          <div class="tree-row step-row" data-title="IdVg @ Vds 0.5 V" data-scope-title="IdVg Step · Vds 0.5 V" data-scope="单 Step 查看/拟合：Vds=0.5 V 的转移曲线。" data-detail="Characteristic=Transfer IdVg; Bias=Vds 0.5 V; Range=4.11~7.93 V; Weight=1.0">
+            <span class="indent"></span><input class="tree-check" type="checkbox" checked><span class="status done"></span>
+            <span class="tree-label"><span class="tree-name">Vds = 0.5 V</span><span class="tree-sub">R2log 0.9964</span></span>
+            <span class="tag">fit</span>
+          </div>
+          <div class="tree-row step-row" data-title="IdVg @ Vds 5 V" data-scope-title="IdVg Step · Vds 5 V" data-scope="单 Step 查看/拟合：Vds=5 V 的转移曲线。" data-detail="Characteristic=Transfer IdVg; Bias=Vds 5 V; Range=4.13~5.48 V; Weight=1.0">
+            <span class="indent"></span><input class="tree-check" type="checkbox" checked><span class="status done"></span>
+            <span class="tree-label"><span class="tree-name">Vds = 5 V</span><span class="tree-sub">R2log 0.9931</span></span>
+            <span class="tag">fit</span>
+          </div>
+          <div class="tree-actions">
+            <button class="tree-action">+ Vds</button>
+            <button class="tree-action">Load</button>
+          </div>
+        </div>
+
+        <div class="tree-group">
+          <div class="tree-row group-row" data-fit-root="1" data-title="Output IdVd" data-scope-title="IdVd / Output" data-scope="输出特性拟合：多个 Vgs 的 IdVd 曲线共同约束输出电阻、沟长调制、漂移区电阻等参数。" data-detail="Characteristic=Output IdVd; Steps=0/3 loaded; Bias=Vgs 5/6/10 V">
+            <span>▾</span><input class="tree-check" type="checkbox" checked><span class="status todo"></span>
+            <span class="tree-label"><span class="tree-name">IdVd / Output</span><span class="tree-sub">3 template steps</span></span>
+            <span class="tag next">0/3</span>
+          </div>
+          <div class="tree-row step-row dim" data-title="IdVd @ Vgs 5 V" data-scope-title="IdVd Step · Vgs 5 V" data-scope="输出曲线模板：用户可修改 Vgs，并导入对应 CSV。" data-detail="Characteristic=Output IdVd; Bias=Vgs 5 V; Range=0~20 V; Weight=1.0">
+            <span class="indent"></span><input class="tree-check" type="checkbox" checked><span class="status todo"></span>
+            <span class="tree-label"><span class="tree-name">Vgs = 5 V</span><span class="tree-sub">not loaded</span></span>
+            <span class="tag idle">idle</span>
+          </div>
+          <div class="tree-row step-row dim" data-title="IdVd @ Vgs 6 V" data-scope-title="IdVd Step · Vgs 6 V" data-scope="输出曲线模板：用户可修改 Vgs，并导入对应 CSV。" data-detail="Characteristic=Output IdVd; Bias=Vgs 6 V; Range=0~20 V; Weight=1.0">
+            <span class="indent"></span><input class="tree-check" type="checkbox" checked><span class="status todo"></span>
+            <span class="tree-label"><span class="tree-name">Vgs = 6 V</span><span class="tree-sub">not loaded</span></span>
+            <span class="tag idle">idle</span>
+          </div>
+          <div class="tree-row step-row dim" data-title="IdVd @ Vgs 10 V" data-scope-title="IdVd Step · Vgs 10 V" data-scope="输出曲线模板：用户可修改 Vgs，并导入对应 CSV。" data-detail="Characteristic=Output IdVd; Bias=Vgs 10 V; Range=0~20 V; Weight=1.0">
+            <span class="indent"></span><input class="tree-check" type="checkbox" checked><span class="status todo"></span>
+            <span class="tree-label"><span class="tree-name">Vgs = 10 V</span><span class="tree-sub">not loaded</span></span>
+            <span class="tag idle">idle</span>
+          </div>
+          <div class="tree-actions">
+            <button class="tree-action">+ Vgs</button>
+            <button class="tree-action">Load</button>
+          </div>
+        </div>
+
+        <div class="tree-group">
+          <div class="tree-row group-row" data-fit-root="1" data-title="BV / Leakage" data-scope-title="BV / Leakage" data-scope="击穿与漏电特性：BVDSS、IDSS、IGSS 正负偏置作为独立约束。" data-detail="Characteristic=BV / Leakage; Curves=BVDSS/IDSS/IGSS+/IGSS-">
+            <span>▸</span><input class="tree-check" type="checkbox" checked><span class="status todo"></span>
+            <span class="tree-label"><span class="tree-name">BV / Leakage</span><span class="tree-sub">BVDSS · IDSS · IGSS</span></span>
+            <span class="tag next">0/4</span>
+          </div>
+        </div>
+
+        <div class="tree-group">
+          <div class="tree-row group-row" data-fit-root="1" data-title="Body Diode" data-scope-title="Body Diode" data-scope="体二极管特性：Is-Vsd 和后续 Qrr，用于约束二极管与反向恢复相关参数。" data-detail="Characteristic=Body Diode; Curves=Is-Vsd/Qrr">
+            <span>▸</span><input class="tree-check" type="checkbox" checked><span class="status todo"></span>
+            <span class="tree-label"><span class="tree-name">Body Diode</span><span class="tree-sub">Is-Vsd · Qrr</span></span>
+            <span class="tag next">0/2</span>
+          </div>
+        </div>
+
+        <div class="tree-group">
+          <div class="tree-row group-row" data-fit-root="1" data-title="CV / Capacitance" data-scope-title="CV / Capacitance" data-scope="电容特性：Ciss、Coss、Crss 作为准静态电容曲线拟合目标。" data-detail="Characteristic=CV / Capacitance; Curves=Ciss/Coss/Crss">
+            <span>▸</span><input class="tree-check" type="checkbox" checked><span class="status todo"></span>
+            <span class="tree-label"><span class="tree-name">CV / Capacitance</span><span class="tree-sub">Ciss · Coss · Crss</span></span>
+            <span class="tag next">0/3</span>
+          </div>
+        </div>
+
+        <div class="tree-group">
+          <div class="tree-row group-row" data-fit-root="1" data-title="Qg / Gate Charge" data-scope-title="Qg / Gate Charge" data-scope="栅电荷特性：Qg、Qgs、Qgd，用于约束动态前的电荷平台。" data-detail="Characteristic=Qg / Gate Charge; Curves=Qg/Qgs/Qgd">
+            <span>▸</span><input class="tree-check" type="checkbox" checked><span class="status todo"></span>
+            <span class="tree-label"><span class="tree-name">Qg / Gate Charge</span><span class="tree-sub">Qg · Qgs · Qgd</span></span>
+            <span class="tag next">0/3</span>
+          </div>
+        </div>
+
+        <div class="tree-group">
+          <div class="tree-row group-row" data-fit-root="1" data-title="DPT / Switching" data-scope-title="DPT / Switching Validation" data-scope="双脉冲动态验证：Turn-on / Turn-off，建议作为验证或后期动态校准入口。" data-detail="Characteristic=DPT / Switching; Curves=Turn-on/Turn-off">
+            <span>▸</span><input class="tree-check" type="checkbox" checked><span class="status todo"></span>
+            <span class="tree-label"><span class="tree-name">DPT / Switching</span><span class="tree-sub">Turn-on · Turn-off</span></span>
+            <span class="tag next">valid</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="mini-actions">
+        <button class="toolbar-button">Add Step</button>
+        <button class="toolbar-button">Edit Bias</button>
+      </div>
+
+      <div class="section-title">Selected Tree Item</div>
+      <div class="panel">
+        <div class="panel-body">
+          <div class="scope-note">
+            <strong id="selectedTitle">Transfer IdVg group</strong>
+            <span id="selectedDetail">Characteristic=Transfer IdVg; Steps=2; Bias=Vds 0.5 V + 5 V</span>
+          </div>
+          <div class="summary-list">
+            <div class="summary-line"><span>Type</span><strong id="selectedType">Transfer IdVg</strong></div>
+            <div class="summary-line"><span>Bias</span><strong id="selectedBias">Vds 0.5 V + 5 V</strong></div>
+            <div class="summary-line"><span>Scope</span><strong id="selectedRange">2 selected steps</strong></div>
+          </div>
+          <button class="toolbar-button" style="width: 100%; justify-content: center; margin-top: 10px;">Edit Selected</button>
+        </div>
+      </div>
+
+      <div class="section-title">Global Device</div>
+      <div class="panel">
+        <div class="panel-body">
+          <div class="summary-list">
+            <div class="summary-line"><span>AA</span><strong>10.0 mm2</strong></div>
+            <div class="summary-line"><span>CellPitch</span><strong>2.0 um</strong></div>
+            <div class="summary-line"><span>Model</span><strong>BSIM3 subckt</strong></div>
+          </div>
+          <button class="toolbar-button" style="width: 100%; justify-content: center; margin-top: 10px;">Device Settings</button>
+        </div>
+      </div>
+    </aside>
+
+    <section class="control">
+      <div class="panel">
+        <div class="panel-head">Fit Scope</div>
+        <div class="panel-body">
+          <div class="scope-note">
+            <strong id="scopeTitle">Auto Joint Fit · 4 characteristics selected</strong>
+            <span id="scopeText">默认全部联合仿真/拟合：所有勾选的特性同时进入 residual。取消勾选后自动缩小拟合集合。</span>
+            <span class="chips" id="scopeChips">
+              <span class="chip">Transfer IdVg</span>
+              <span class="chip">Output IdVd</span>
+              <span class="chip">Capacitance CV</span>
+              <span class="chip">Body Diode</span>
+              <span class="chip">shared params</span>
+            </span>
+          </div>
+          <div class="seg" style="width: 100%; height: 30px;">
+            <button id="scopeNone" style="flex: 1;">None</button>
+            <button id="scopeSingle" style="flex: 1;">Single Fit</button>
+            <button id="scopeJoint" class="active" style="flex: 1;">Joint Fit</button>
+          </div>
+          <div style="height: 10px;"></div>
+          <div class="field-grid">
+            <label>R2 log<input value="0.990" /></label>
+            <label>R2 linear<input value="0.990" /></label>
+            <label>ftol<input value="1e-6" /></label>
+            <label>max evals<input value="120" /></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">BSIM Parameters</div>
+        <div class="panel-body">
+          <div class="param-row"><input type="checkbox" checked><span class="lock closed"></span><span class="param-name">VTH0</span><div class="tiny-bar" style="--w: 64%;"></div><span class="value">3.872</span></div>
+          <div class="param-row"><input type="checkbox"><span class="lock closed"></span><span class="param-name">U0</span><div class="tiny-bar" style="--w: 48%;"></div><span class="value">421.3</span></div>
+          <div class="param-row"><input type="checkbox"><span class="lock closed"></span><span class="param-name">TOX</span><div class="tiny-bar" style="--w: 35%;"></div><span class="value">1.8e-8</span></div>
+          <div class="param-row"><input type="checkbox" checked><span class="lock open"></span><span class="param-name">UA</span><div class="tiny-bar" style="--w: 78%;"></div><span class="value">2.1e-9</span></div>
+          <div class="param-row"><input type="checkbox" checked><span class="lock open"></span><span class="param-name">UB</span><div class="tiny-bar" style="--w: 52%;"></div><span class="value">6.4e-19</span></div>
+          <div class="param-row"><input type="checkbox" checked><span class="lock open"></span><span class="param-name">VSAT</span><div class="tiny-bar" style="--w: 67%;"></div><span class="value">1.13e5</span></div>
+          <div class="param-row"><input type="checkbox" checked><span class="lock open"></span><span class="param-name">A0</span><div class="tiny-bar" style="--w: 58%;"></div><span class="value">1.82</span></div>
+          <div class="param-row"><input type="checkbox"><span class="lock open"></span><span class="param-name">AGS</span><div class="tiny-bar" style="--w: 42%;"></div><span class="value">0.21</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">Parameter Policy</div>
+        <div class="panel-body" style="font-size: 11px; color: var(--muted); line-height: 1.55;">
+          Fitted parameters auto lock after success. New electrical characteristics can unlock only the parameters assigned to that stage.
+        </div>
+      </div>
+    </section>
+
+    <main class="workspace">
+      <div class="canvas-toolbar">
+        <div class="canvas-title">Plot Board · 4 comparison views</div>
+        <div class="seg">
+          <button class="active">Linear</button>
+          <button>Log</button>
+        </div>
+        <button class="toolbar-button">Sync X</button>
+        <button class="toolbar-button">Sync Y</button>
+        <button class="toolbar-button">Export PNG</button>
+      </div>
+
+      <div class="plot-grid">
+        <article class="plot-card">
+          <div class="plot-head"><span class="dot"></span><span>IdVg · Vds 0.5 V</span><span class="meta">Transfer Step 1</span><span class="tag">fitted</span></div>
+          <div class="plot">
+            <svg viewBox="0 0 420 184" preserveAspectRatio="none">
+              <line class="grid" x1="48" y1="26" x2="400" y2="26"/><line class="grid" x1="48" y1="72" x2="400" y2="72"/><line class="grid" x1="48" y1="118" x2="400" y2="118"/><line class="axis" x1="48" y1="158" x2="400" y2="158"/><line class="axis" x1="48" y1="18" x2="48" y2="158"/>
+              <path class="line blue" d="M58 151 C110 149,138 143,166 128 C212 103,238 67,278 42 C322 19,362 24,396 31"/>
+              <circle class="fit" cx="58" cy="150" r="2.2"/><circle class="fit" cx="93" cy="148" r="2.2"/><circle class="fit" cx="128" cy="141" r="2.2"/><circle class="fit" cx="164" cy="127" r="2.2"/><circle class="fit" cx="201" cy="104" r="2.2"/><circle class="fit" cx="238" cy="69" r="2.2"/><circle class="fit" cx="277" cy="43" r="2.2"/><circle class="fit" cx="318" cy="21" r="2.2"/><circle class="fit" cx="360" cy="25" r="2.2"/><circle class="fit" cx="396" cy="31" r="2.2"/>
+              <circle class="meas" cx="58" cy="152" r="2.4"/><circle class="meas" cx="93" cy="147" r="2.4"/><circle class="meas" cx="128" cy="139" r="2.4"/><circle class="meas" cx="164" cy="130" r="2.4"/><circle class="meas" cx="201" cy="101" r="2.4"/><circle class="meas" cx="238" cy="71" r="2.4"/><circle class="meas" cx="277" cy="41" r="2.4"/><circle class="meas" cx="318" cy="23" r="2.4"/><circle class="meas" cx="360" cy="24" r="2.4"/><circle class="meas" cx="396" cy="33" r="2.4"/>
+            </svg>
+          </div>
+          <div class="plot-foot"><div class="metric">R2 log<strong>0.9964</strong></div><div class="metric">R2 lin<strong>0.9948</strong></div><div class="metric">RMS<strong>0.018</strong></div><div class="metric">Locked<strong>8</strong></div></div>
+        </article>
+
+        <article class="plot-card">
+          <div class="plot-head"><span class="dot violet"></span><span>IdVg · Vds 5 V</span><span class="meta">Transfer Step 2</span><span class="tag">active</span></div>
+          <div class="plot">
+            <svg viewBox="0 0 420 184" preserveAspectRatio="none">
+              <line class="grid" x1="48" y1="26" x2="400" y2="26"/><line class="grid" x1="48" y1="72" x2="400" y2="72"/><line class="grid" x1="48" y1="118" x2="400" y2="118"/><line class="axis" x1="48" y1="158" x2="400" y2="158"/><line class="axis" x1="48" y1="18" x2="48" y2="158"/>
+              <path class="line violet" d="M58 154 C105 151,142 137,174 109 C204 82,238 49,280 30 C322 12,362 18,396 23"/>
+              <circle class="fit" cx="58" cy="154" r="2.2"/><circle class="fit" cx="96" cy="150" r="2.2"/><circle class="fit" cx="134" cy="140" r="2.2"/><circle class="fit" cx="174" cy="108" r="2.2"/><circle class="fit" cx="214" cy="71" r="2.2"/><circle class="fit" cx="254" cy="42" r="2.2"/><circle class="fit" cx="294" cy="25" r="2.2"/><circle class="fit" cx="336" cy="17" r="2.2"/><circle class="fit" cx="372" cy="19" r="2.2"/><circle class="fit" cx="396" cy="23" r="2.2"/>
+              <circle class="meas violet" cx="58" cy="153" r="2.4"/><circle class="meas violet" cx="96" cy="151" r="2.4"/><circle class="meas violet" cx="134" cy="137" r="2.4"/><circle class="meas violet" cx="174" cy="111" r="2.4"/><circle class="meas violet" cx="214" cy="72" r="2.4"/><circle class="meas violet" cx="254" cy="43" r="2.4"/><circle class="meas violet" cx="294" cy="26" r="2.4"/><circle class="meas violet" cx="336" cy="16" r="2.4"/><circle class="meas violet" cx="372" cy="20" r="2.4"/><circle class="meas violet" cx="396" cy="24" r="2.4"/>
+            </svg>
+          </div>
+          <div class="plot-foot"><div class="metric">R2 log<strong>0.9931</strong></div><div class="metric">R2 lin<strong>0.9917</strong></div><div class="metric">RMS<strong>0.026</strong></div><div class="metric">Mode<strong>joint</strong></div></div>
+        </article>
+
+        <article class="plot-card">
+          <div class="plot-head"><span class="dot rose"></span><span>IdVd · Vgs 6 V</span><span class="meta">Output Step</span><span class="tag">queued</span></div>
+          <div class="plot">
+            <svg viewBox="0 0 420 184" preserveAspectRatio="none">
+              <line class="grid" x1="48" y1="32" x2="400" y2="32"/><line class="grid" x1="48" y1="80" x2="400" y2="80"/><line class="grid" x1="48" y1="128" x2="400" y2="128"/><line class="axis" x1="48" y1="158" x2="400" y2="158"/><line class="axis" x1="48" y1="18" x2="48" y2="158"/>
+              <path class="line rose" d="M58 157 C92 116,126 82,168 59 C214 34,282 25,396 22"/>
+              <circle class="meas rose" cx="58" cy="156" r="2.4"/><circle class="meas rose" cx="96" cy="111" r="2.4"/><circle class="meas rose" cx="138" cy="73" r="2.4"/><circle class="meas rose" cx="186" cy="48" r="2.4"/><circle class="meas rose" cx="242" cy="31" r="2.4"/><circle class="meas rose" cx="300" cy="26" r="2.4"/><circle class="meas rose" cx="360" cy="24" r="2.4"/><circle class="meas rose" cx="396" cy="21" r="2.4"/>
+            </svg>
+          </div>
+          <div class="plot-foot"><div class="metric">R2 log<strong>pending</strong></div><div class="metric">Rds(on)<strong>calc</strong></div><div class="metric">Params<strong>PCLM</strong></div><div class="metric">State<strong>idle</strong></div></div>
+        </article>
+
+        <article class="plot-card">
+          <div class="plot-head"><span class="dot amber"></span><span>Coss · Vds sweep</span><span class="meta">Capacitance</span><span class="tag">draft</span></div>
+          <div class="plot">
+            <svg viewBox="0 0 420 184" preserveAspectRatio="none">
+              <line class="grid" x1="48" y1="32" x2="400" y2="32"/><line class="grid" x1="48" y1="80" x2="400" y2="80"/><line class="grid" x1="48" y1="128" x2="400" y2="128"/><line class="axis" x1="48" y1="158" x2="400" y2="158"/><line class="axis" x1="48" y1="18" x2="48" y2="158"/>
+              <path class="line amber" d="M58 26 C94 34,116 50,148 88 C190 135,250 148,396 154"/>
+              <circle class="meas amber" cx="58" cy="28" r="2.4"/><circle class="meas amber" cx="100" cy="39" r="2.4"/><circle class="meas amber" cx="140" cy="80" r="2.4"/><circle class="meas amber" cx="180" cy="123" r="2.4"/><circle class="meas amber" cx="230" cy="143" r="2.4"/><circle class="meas amber" cx="290" cy="149" r="2.4"/><circle class="meas amber" cx="348" cy="153" r="2.4"/><circle class="meas amber" cx="396" cy="155" r="2.4"/>
+            </svg>
+          </div>
+          <div class="plot-foot"><div class="metric">C type<strong>Coss</strong></div><div class="metric">Domain<strong>log-x</strong></div><div class="metric">Params<strong>MJ/PB</strong></div><div class="metric">State<strong>draft</strong></div></div>
+        </article>
+      </div>
+
+      <div class="bottom">
+        <section class="convergence">
+          <div class="bottom-head">Convergence · active plot</div>
+          <svg viewBox="0 0 640 126" preserveAspectRatio="none">
+            <line class="grid" x1="38" y1="28" x2="620" y2="28"/><line class="grid" x1="38" y1="64" x2="620" y2="64"/><line class="grid" x1="38" y1="100" x2="620" y2="100"/><line class="axis" x1="38" y1="104" x2="620" y2="104"/><line class="axis" x1="38" y1="20" x2="38" y2="104"/>
+            <path class="line blue" d="M42 96 C100 88,130 76,174 56 C230 30,312 24,438 22 C520 21,578 20,616 20"/>
+            <path class="line violet" d="M42 103 C110 100,166 88,220 68 C282 44,344 34,420 28 C496 23,560 23,616 22"/>
+            <path class="line amber" d="M42 34 C130 58,220 74,306 84 C390 92,510 98,616 101"/>
+          </svg>
+        </section>
+
+        <section class="queue">
+          <div class="bottom-head">Fit Queue</div>
+          <div class="queue-row"><span class="status done"></span><span>Transfer IdVg joint</span><div class="progress" style="--p:100%;"><span></span></div><span class="tag">done</span></div>
+          <div class="queue-row"><span class="status todo"></span><span>Output IdVd Vgs series</span><div class="progress" style="--p:42%;"><span></span></div><span class="tag">next</span></div>
+          <div class="queue-row"><span class="status todo"></span><span>Capacitance CV</span><div class="progress" style="--p:0%;"><span></span></div><span class="tag">idle</span></div>
+          <div class="queue-row"><span class="status todo"></span><span>Body diode</span><div class="progress" style="--p:0%;"><span></span></div><span class="tag">idle</span></div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <script>
+    const rows = Array.from(document.querySelectorAll(".tree-row[data-title]"));
+    const scopeTitle = document.getElementById("scopeTitle");
+    const scopeText = document.getElementById("scopeText");
+    const selectedTitle = document.getElementById("selectedTitle");
+    const selectedDetail = document.getElementById("selectedDetail");
+    const breadcrumb = document.getElementById("breadcrumb");
+    const selectedType = document.getElementById("selectedType");
+    const selectedBias = document.getElementById("selectedBias");
+    const selectedRange = document.getElementById("selectedRange");
+    const scopeButtons = {
+      "None": document.getElementById("scopeNone"),
+      "Single Fit": document.getElementById("scopeSingle"),
+      "Joint Fit": document.getElementById("scopeJoint"),
+    };
+    const scopeChips = document.getElementById("scopeChips");
+    const rootRows = rows.filter(row => row.dataset.fitRoot === "1");
+
+    function parseDetail(detail) {
+      return Object.fromEntries(
+        detail.split(";").map(part => {
+          const [key, ...rest] = part.trim().split("=");
+          return [key, rest.join("=")];
+        })
+      );
+    }
+
+    function setScopeMode(mode) {
+      Object.entries(scopeButtons).forEach(([label, button]) => {
+        button?.classList.toggle("active", label === mode);
+      });
+    }
+
+    function selectedFitRoots() {
+      return rootRows.filter(row => row.querySelector(".tree-check")?.checked);
+    }
+
+    function updateFitScopeFromChecks() {
+      const selected = selectedFitRoots();
+      const count = selected.length;
+      const labels = selected.map(row => row.dataset.title || "Fit item");
+      let mode = "None";
+      if (count === 1) mode = "Single Fit";
+      if (count >= 2) mode = "Joint Fit";
+      setScopeMode(mode);
+
+      if (count === 0) {
+        scopeTitle.textContent = "No Fit Target";
+        scopeText.textContent = "当前没有勾选任何特性。勾选左侧 tree 中的特性后，系统会自动生成拟合集合。";
+        scopeChips.innerHTML = '<span class="chip">no target</span>';
+        return;
+      }
+
+      if (count === 1) {
+        scopeTitle.textContent = `Auto Single Fit · ${labels[0]}`;
+        scopeText.textContent = `只勾选了 1 个特性，因此按单特性拟合执行。该特性内部仍可包含多个 step。`;
+      } else {
+        scopeTitle.textContent = `Auto Joint Fit · ${count} characteristics selected`;
+        scopeText.textContent = `默认全部联合仿真/拟合：${count} 个勾选特性同时进入 residual，共享同一组模型参数。`;
+      }
+
+      const chips = labels.concat(count >= 2 ? ["shared params", "joint residual"] : ["local residual"]);
+      scopeChips.innerHTML = chips.map(text => `<span class="chip">${text}</span>`).join("");
+    }
+
+    rows.forEach(row => {
+      row.addEventListener("click", () => {
+        rows.forEach(item => item.classList.remove("active"));
+        row.classList.add("active");
+        const title = row.dataset.title || "";
+        const scope = row.dataset.scope || "";
+        const scopeTitleText = row.dataset.scopeTitle || title;
+        const detailText = row.dataset.detail || "";
+        const detail = parseDetail(detailText);
+
+        selectedTitle.textContent = scopeTitleText;
+        selectedDetail.textContent = detailText;
+        breadcrumb.textContent = `Project / SDH10N2P1 / ${scopeTitleText}`;
+        selectedType.textContent = detail.Characteristic || scopeTitleText;
+        selectedBias.textContent = detail.Bias || detail.Curves || "";
+        selectedRange.textContent = detail.Range || detail.Steps || detail.Curves || "";
+        updateFitScopeFromChecks();
+      });
+    });
+
+    document.querySelectorAll(".tree-check").forEach(check => {
+      check.addEventListener("click", event => event.stopPropagation());
+      check.addEventListener("change", updateFitScopeFromChecks);
+    });
+
+    updateFitScopeFromChecks();
+  </script>
+</body>
+</html>

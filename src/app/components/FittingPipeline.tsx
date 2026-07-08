@@ -65,8 +65,8 @@ export function FittingPipeline() {
     try {
       // runFit now polls task.progress on its own; it resolves when done.
       await runFit(useLtspice, maxLoops);
-    } catch (e: any) {
-      setLog("error", e.message);
+    } catch (e: unknown) {
+      setLog("error", e instanceof Error ? e.message : String(e));
     } finally {
       setRunning(false);
     }
@@ -76,8 +76,8 @@ export function FittingPipeline() {
     setRunning(false);
     try {
       await cancelFit();
-    } catch (e: any) {
-      setLog("error", `Stop failed: ${e.message}`);
+    } catch (e: unknown) {
+      setLog("error", `Stop failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
   // The backend task now reports the active stage name directly
@@ -129,7 +129,7 @@ export function FittingPipeline() {
           </label>
           <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.text }}>
             <span>Loops:</span>
-            <select value={maxLoops} disabled={running} onChange={(e) => setMaxLoops(parseInt(e.target.value, 10))} style={{ padding: "2px 4px", borderRadius: 4, border: "1px solid " + C.border }}>
+            <select value={maxLoops} disabled={running} onChange={(e) => setMaxLoops(parseInt(e.target.value, 10))} style={{ padding: "2px 4px", borderRadius: "var(--radius-sm)", border: "1px solid " + C.border }}>
               <option value={1}>1</option>
               <option value={3}>3 (default)</option>
               <option value={5}>5</option>
@@ -190,7 +190,7 @@ export function FittingPipeline() {
               {fitProgressStatus.toUpperCase() || "RUNNING"}
               {activeStageId ? ` · ${activeStageId}` : ""}
             </div>
-            <div style={{ flex: 1, height: 8, background: "#eee", borderRadius: 4, overflow: "hidden" }}>
+            <div style={{ flex: 1, height: 8, background: "#eee", borderRadius: "var(--radius-sm)", overflow: "hidden" }}>
               <div style={{
                 width: `${Math.round(fitProgress * 100)}%`,
                 height: "100%",
@@ -247,7 +247,7 @@ export function FittingPipeline() {
           ref={logRef}
           style={{
             background: "#1a1a1a", color: "#e0e0e0",
-            padding: "12px 16px", borderRadius: 6,
+            padding: "12px 16px", borderRadius: "var(--radius-md)",
             fontFamily: "ui-monospace, Menlo, monospace", fontSize: 11,
             height: 240, overflowY: "auto",
             lineHeight: 1.5,
@@ -294,7 +294,7 @@ function StageCard({ id, name, params, status, rms }: {
   return (
     <div style={{
       background: C.surface, border: `1px solid ${C.border}`,
-      borderRadius: 8, padding: "12px 14px",
+      borderRadius: "var(--radius-lg)", padding: "12px 14px",
     }}>
       <div style={{ display: "flex", alignItems: "center", marginBottom: 6 }}>
         {iconMap[status]}
@@ -309,7 +309,7 @@ function StageCard({ id, name, params, status, rms }: {
         {params.map((p) => (
           <span key={p} style={{
             background: C.accent, color: C.primary,
-            padding: "1px 6px", borderRadius: 3,
+            padding: "1px 6px", borderRadius: "var(--radius-sm)",
             fontSize: 10, fontFamily: "ui-monospace, monospace",
           }}>
             {p}

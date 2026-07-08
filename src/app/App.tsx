@@ -2,92 +2,16 @@
 // 顶部：项目名 + 菜单栏（文件/编辑/视图/拟合/工具/帮助，"工具" 集合原 Settings 入口）
 // 主体：常驻三张页面（Workbench / Explore / Settings），Workbench 接管 TransFit 功能
 import { useState, useEffect, useRef } from "react";
+import type { ReactNode } from "react";
 import { SettingsScreen } from "./components/SettingsScreen";
 import { ParamExplorer } from "./components/ParamExplorer";
 import { LogPanel } from "./components/LogPanel";
 import { Workbench } from "./components/Workbench";
 import { AppProvider, useApp } from "../lib/store";
 import type { NavSection } from "../lib/types";
-import { Zap, FolderOpen } from "lucide-react";
+import { dispatchWorkbenchAction, type WorkbenchAction } from "../lib/events";
 
 const MENUBAR_HEIGHT = 26;
-
-function TopBar() {
-  const { projectId, dataset, backendRunning } = useApp();
-  const partNumber =
-    dataset?.device_info?.part_number ??
-    (projectId ? `Project ${projectId.slice(0, 8)}` : "No project loaded");
-
-  return (
-    <div
-      style={{
-        height: 36,
-        flexShrink: 0,
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "0 12px",
-        borderBottom: "1px solid var(--border)",
-        background: "var(--surface)",
-        userSelect: "none",
-      }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 190 }}>
-        <div
-          style={{
-            width: 22,
-            height: 22,
-            borderRadius: 5,
-            background: "var(--primary)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: "#fff",
-            fontWeight: 800,
-            fontSize: 12,
-          }}
-        >
-          <Zap size={13} color="#fff" />
-        </div>
-        <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text)" }}>
-          SpiceBuilder
-        </div>
-      </div>
-
-      <div style={{ flex: 1 }} />
-
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          minWidth: 0,
-          color: "var(--muted)",
-          fontSize: 11,
-        }}
-      >
-        <FolderOpen size={13} />
-        <span style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {partNumber}
-        </span>
-      </div>
-      <div
-        style={{
-          display: "flex", alignItems: "center", gap: 6, fontSize: 11,
-          color: backendRunning ? "var(--success)" : "var(--error)",
-        }}
-      >
-        <span
-          style={{
-            width: 6, height: 6, borderRadius: "50%",
-            background: backendRunning ? "var(--success)" : "var(--error)",
-          }}
-        />
-        {backendRunning ? "Python backend running" : "Python backend offline"}
-      </div>
-    </div>
-  );
-}
 
 interface MenuDef {
   label: string;
@@ -195,6 +119,7 @@ function MenuBar({
   );
 }
 
+
 function MenuDropdown({
   label, items, isOpen, highlight, onToggle, onPick,
 }: {
@@ -233,7 +158,7 @@ function MenuDropdown({
             zIndex: 2000,
             background: "var(--surface)",
             border: "1px solid var(--border)",
-            borderRadius: 4,
+            borderRadius: "var(--radius-sm)",
             boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
             minWidth: 220,
             padding: "3px 0",
@@ -309,6 +234,12 @@ function AppInner() {
     navTo?: NavSection,
   ) => {
     if (navTo) return setActiveNav(navTo);
+    if (activeNav === "workbench") {
+      if (_item.includes("导入 CSV")) dispatchWorkbenchAction("import");
+      if (_item.includes("仿真当前项")) dispatchWorkbenchAction("simulate");
+      if (_item.includes("拟合勾选项") || _item.includes("拟合全部队列")) dispatchWorkbenchAction("fit-selected");
+      if (_item.includes("停止拟合")) dispatchWorkbenchAction("stop");
+    }
     console.info(`[Menu] ${_menu} -> ${_item}`);
   };
 
@@ -326,7 +257,6 @@ function AppInner() {
         fontSize: 13,
       }}
     >
-      <TopBar />
       <MenuBar activeNav={activeNav} onPickMenu={handlePick} />
       <main
         style={{

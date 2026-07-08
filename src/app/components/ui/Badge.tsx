@@ -25,7 +25,7 @@ export function Badge({ children, variant = "default", style, className, onClick
         display: "inline-flex",
         alignItems: "center",
         padding: "1px 6px",
-        borderRadius: 3,
+        borderRadius: "var(--radius-sm)",
         fontSize: 10,
         fontWeight: 500,
         fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",

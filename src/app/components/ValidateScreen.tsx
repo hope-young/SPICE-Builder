@@ -175,7 +175,7 @@ export function ValidateScreen() {
                 gap: 10,
                 padding: "8px 12px",
                 backgroundColor: c.pass ? "transparent" : c.warn ? "#fff9e6" : "#ffe6e6",
-                borderRadius: 4,
+                borderRadius: "var(--radius-sm)",
                 fontSize: 12,
               }}
             >

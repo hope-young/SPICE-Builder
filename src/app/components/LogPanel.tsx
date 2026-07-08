@@ -29,8 +29,31 @@ export function LogPanel() {
   const [paused, setPaused] = useState(false);
   const [buffer, setBuffer] = useState<LogEntry[]>([]);
   const [filterLabel, setFilterLabel] = useState<string>("all");
+  const [height, setHeight] = useState(140);
   const bottomRef = useRef<HTMLDivElement>(null);
   const prevCountRef = useRef(0);
+
+  const beginResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = height;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+
+    const onMove = (ev: PointerEvent) => {
+      const next = startHeight + startY - ev.clientY;
+      setHeight(Math.max(80, Math.min(360, next)));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  };
 
   // 订阅 store logs (不触发外层 re-render, 因为只在 LogPanel 内部 setState)
   useEffect(() => {
@@ -78,6 +101,17 @@ export function LogPanel() {
       flexDirection: "column",
       flexShrink: 0,
     }}>
+      <div
+        onPointerDown={beginResize}
+        title="拖动调整日志栏高度"
+        style={{
+          height: 7,
+          cursor: "row-resize",
+          background: "var(--surface)",
+          borderBottom: "1px solid var(--border)",
+          flexShrink: 0,
+        }}
+      />
       {/* Header */}
       <div style={{
         display: "flex", alignItems: "center", gap: 8,
@@ -96,7 +130,7 @@ export function LogPanel() {
         <span style={{ fontWeight: 600, color: "var(--text)" }}>日志</span>
         <span style={{
           padding: "1px 6px",
-          borderRadius: 8,
+          borderRadius: "var(--radius-lg)",
           background: "var(--hover)",
           fontSize: 10,
           fontFamily: "monospace",
@@ -115,7 +149,7 @@ export function LogPanel() {
               style={{
                 background: filterLabel === opt.label ? "var(--accent)" : "transparent",
                 border: "1px solid var(--border)",
-                borderRadius: 3,
+                borderRadius: "var(--radius-sm)",
                 padding: "1px 5px",
                 fontSize: 9,
                 cursor: "pointer",
@@ -147,8 +181,8 @@ export function LogPanel() {
       {/* Log lines */}
       {!collapsed && (
         <div style={{
-          maxHeight: 140,
-          minHeight: 140,
+          maxHeight: height,
+          minHeight: height,
           overflowY: "auto",
           padding: "6px 12px",
           fontFamily: "monospace",

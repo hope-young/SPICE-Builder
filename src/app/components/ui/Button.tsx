@@ -22,7 +22,7 @@ export function Button({
     justifyContent: "center",
     gap: 6,
     padding: size === "sm" ? "4px 10px" : "6px 14px",
-    borderRadius: 5,
+    borderRadius: "var(--radius-md)",
     border: "none",
     cursor: props.disabled ? "not-allowed" : "pointer",
     fontSize: 12,

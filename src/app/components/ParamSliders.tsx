@@ -1,7 +1,7 @@
 // ParamSliders.tsx - BSIM3 参数滑块组件（供 SingleCurveFit 和 ParamExplorer 共用）
 // 每个参数行: 勾选 | 名称 | min 输入框 | 滑块 | max 输入框 | 当前值 | reset
 // 输入框为空 → 显示默认值 (灰度), 有值 → 自定义
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Lock, Unlock, RotateCcw } from "lucide-react";
 import { BSIM3_PARAMS } from "../../lib/constants";
 
@@ -161,9 +161,70 @@ export function ParamSliders({
     updateBounds(name, { ...customBounds[name], max: val });
   };
   const [hoverParam, setHoverParam] = useState<string | null>(null);
+  const hoverTimerRef = useRef<number | null>(null);
+
+  const handleParamMouseEnter = (paramName: string) => {
+    hoverTimerRef.current = window.setTimeout(() => {
+      setHoverParam(paramName);
+    }, 1000); // 1秒延迟
+  };
+
+  const handleParamMouseLeave = () => {
+    if (hoverTimerRef.current !== null) {
+      clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+    setHoverParam(null);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (hoverTimerRef.current !== null) {
+        clearTimeout(hoverTimerRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div style={{ overflowY: "auto", flex: 1, padding: "0 12px" }}>
+      <style>{`
+        .param-range {
+          appearance: none;
+          -webkit-appearance: none;
+          height: 7px;
+          border-radius: var(--radius-sm);
+          outline: none;
+        }
+        .param-range::-webkit-slider-runnable-track {
+          height: 7px;
+          border-radius: var(--radius-sm);
+          background: transparent;
+        }
+        .param-range::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          appearance: none;
+          width: 15px;
+          height: 15px;
+          border-radius: var(--radius-lg);
+          background: #ffffff;
+          border: 2px solid var(--primary);
+          box-shadow: 0 1px 3px rgba(15, 23, 42, 0.22);
+          margin-top: -4px;
+        }
+        .param-range::-moz-range-track {
+          height: 7px;
+          border-radius: var(--radius-sm);
+          background: transparent;
+        }
+        .param-range::-moz-range-thumb {
+          width: 15px;
+          height: 15px;
+          border-radius: var(--radius-lg);
+          background: #ffffff;
+          border: 2px solid var(--primary);
+          box-shadow: 0 1px 3px rgba(15, 23, 42, 0.22);
+        }
+      `}</style>
       {CATS.map(cat => {
         const params = BSIM3_PARAMS.filter(p => p.category === cat);
         if (params.length === 0) return null;
@@ -197,10 +258,10 @@ export function ParamSliders({
                   {isCollapsed ? "+" : "−"}
                 </button>
               )}
-              <span style={{ fontSize: 11, fontWeight: 700, color: "var(--primary)", textTransform: "uppercase", letterSpacing: "0.05em", flex: 1 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: "var(--primary)", textTransform: "uppercase", letterSpacing: "0.05em", flex: 1 }}>
                 {cat}
               </span>
-              <span style={{ fontSize: 10, color: "var(--muted)" }}>
+              <span style={{ fontSize: 12, color: "var(--muted)" }}>
                 {unlockedParams.length === 0 ? "locked" : `${checkedCount}/${unlockedParams.length}`}
               </span>
               <button
@@ -223,6 +284,8 @@ export function ParamSliders({
               const { lo, hi } = getBounds(p.name, p.lower, p.upper);
               const step = computeStep(lo, hi);
               const hasCustom = customBounds[p.name]?.min !== undefined || customBounds[p.name]?.max !== undefined;
+              const clampedValue = Math.max(lo, Math.min(hi, cur));
+              const fillPct = hi > lo ? Math.max(0, Math.min(100, ((clampedValue - lo) / (hi - lo)) * 100)) : 0;
               return (
                 <div key={p.name} style={{ marginBottom: 4 }}>
                   {/* 第一行: 勾选 + 名称 + 当前值 + reset */}
@@ -236,10 +299,10 @@ export function ParamSliders({
                       title={isLocked ? "参数已锁住，不参与下一轮拟合" : "勾选后参与下一轮拟合"}
                     />
                     <span
-                      onMouseEnter={() => setHoverParam(p.name)}
-                      onMouseLeave={() => setHoverParam(null)}
+                      onMouseEnter={() => handleParamMouseEnter(p.name)}
+                      onMouseLeave={handleParamMouseLeave}
                       style={{
-                        fontSize: 11,
+                        fontSize: 13,
                         color: isChk ? "var(--text)" : "var(--muted)",
                         minWidth: 112,
                         fontWeight: 600,
@@ -265,7 +328,7 @@ export function ParamSliders({
                             width: 16,
                             height: 16,
                             border: 0,
-                            borderRadius: 4,
+                            borderRadius: "var(--radius-sm)",
                             background: isLocked ? "rgba(245, 158, 11, 0.12)" : "transparent",
                             color: isLocked ? "#b45309" : "var(--muted)",
                             cursor: "pointer",
@@ -277,7 +340,7 @@ export function ParamSliders({
                         </button>
                       )}
                       <span style={{
-                        fontSize: 9,
+                        fontSize: 11,
                         color: isLocked ? "#b45309" : isChk ? "var(--primary)" : "var(--muted)",
                         fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",
                         whiteSpace: "nowrap",
@@ -293,11 +356,11 @@ export function ParamSliders({
                           width: 260,
                           padding: "8px 10px",
                           border: "1px solid var(--border)",
-                          borderRadius: 6,
+                          borderRadius: "var(--radius-lg)",
                           background: "#ffffff",
                           color: "var(--text)",
                           boxShadow: "0 8px 24px rgba(15, 23, 42, 0.16)",
-                          fontSize: 11,
+                          fontSize: 13,
                           lineHeight: 1.45,
                           fontWeight: 400,
                           fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",
@@ -315,11 +378,11 @@ export function ParamSliders({
                       )}
                     </span>
                     {p.unit && (
-                      <span style={{ fontSize: 9, color: "var(--muted)" }}>{p.unit}</span>
+                      <span style={{ fontSize: 11, color: "var(--muted)" }}>{p.unit}</span>
                     )}
                     <span style={{ flex: 1 }} />
                     <span style={{
-                      fontSize: 11, fontFamily: "monospace", minWidth: 70,
+                      fontSize: 13, fontFamily: "monospace", minWidth: 78,
                       textAlign: "right",
                       color: isLocked ? "#b45309" : isChk ? "var(--primary)" : "var(--muted)",
                       fontWeight: 600,
@@ -343,22 +406,23 @@ export function ParamSliders({
                       onChange={e => setCustomMin(p.name, e.target.value)}
                       title={`${p.name} 最小值 (留空=用默认 ${fmt(p.lower)})`}
                       style={{
-                        width: 50, fontSize: 9, fontFamily: "monospace",
+                        width: 58, fontSize: 11, fontFamily: "monospace",
                         padding: "2px 3px",
                         border: "1px solid var(--border)",
-                        borderRadius: 3,
+                        borderRadius: "var(--radius-sm)",
                         background: hasCustom && customBounds[p.name]?.min !== undefined ? "#fff" : "var(--surface)",
                         color: hasCustom && customBounds[p.name]?.min !== undefined ? "var(--text)" : "var(--muted)",
                       }}
                     />
                     <input
+                      className="param-range"
                       type="range"
                       min={lo} max={hi} step={step}
-                      value={Math.max(lo, Math.min(hi, cur))}
+                      value={clampedValue}
                       onChange={e => onChange(p.name, parseFloat(e.target.value))}
                       style={{
                         flex: 1, cursor: "pointer",
-                        accentColor: isChk ? "var(--primary)" : "var(--border)",
+                        background: `linear-gradient(to right, var(--primary) 0%, var(--primary) ${fillPct}%, #d5dbe3 ${fillPct}%, #d5dbe3 100%)`,
                       }}
                     />
                     <input
@@ -368,10 +432,10 @@ export function ParamSliders({
                       onChange={e => setCustomMax(p.name, e.target.value)}
                       title={`${p.name} 最大值 (留空=用默认 ${fmt(p.upper)})`}
                       style={{
-                        width: 50, fontSize: 9, fontFamily: "monospace",
+                        width: 58, fontSize: 11, fontFamily: "monospace",
                         padding: "2px 3px",
                         border: "1px solid var(--border)",
-                        borderRadius: 3,
+                        borderRadius: "var(--radius-sm)",
                         background: hasCustom && customBounds[p.name]?.max !== undefined ? "#fff" : "var(--surface)",
                         color: hasCustom && customBounds[p.name]?.max !== undefined ? "var(--text)" : "var(--muted)",
                       }}

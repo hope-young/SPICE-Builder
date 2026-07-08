@@ -73,8 +73,8 @@ export function ModelEditor() {
       // 通过 setLog 让 dashboard 显示 (但 store 没暴露 setModel)
       setLog("success", `Reloaded model: ${Object.keys(m.params || {}).length} params, `
              + `${Object.keys(m.fitted || {}).length} fitted`);
-    } catch (e: any) {
-      setLog("error", `Reload failed: ${e.message}`);
+    } catch (e: unknown) {
+      setLog("error", `Reload failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLoading(false);
     }

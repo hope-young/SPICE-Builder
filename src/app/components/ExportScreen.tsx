@@ -33,8 +33,8 @@ export function ExportScreen() {
         setOutputPath(path);
         setLog("info", `Selected output path: ${path}`);
       }
-    } catch (e: any) {
-      setLog("error", `Dialog failed: ${e.message || e}`);
+    } catch (e: unknown) {
+      setLog("error", `Dialog failed: ${e instanceof Error ? e.message : String(e) || e}`);
     }
   };
 
@@ -59,9 +59,10 @@ export function ExportScreen() {
       } catch (_) { /* ignore */ }
       setLastResult({ path, file_size: size });
       setLog("success", `Exported .lib (${format}): ${path} (${size} bytes)`);
-    } catch (e: any) {
-      setLastError(String(e?.message || e));
-      setLog("error", `Export failed: ${e?.message || e}`);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setLastError(message);
+      setLog("error", `Export failed: ${message}`);
     } finally {
       setExporting(false);
     }
@@ -108,7 +109,7 @@ export function ExportScreen() {
         <div style={{
           padding: 20, textAlign: "center", color: C.muted,
           background: C.accent, border: `1px solid ${C.border}`,
-          borderRadius: 8, marginBottom: 16,
+          borderRadius: "var(--radius-lg)", marginBottom: 16,
         }}>
           <AlertCircle size={20} style={{ marginBottom: 6, opacity: 0.5 }} />
           <div style={{ fontSize: 13 }}>No project loaded.</div>
@@ -184,7 +185,7 @@ export function ExportScreen() {
             {/* Result / Error */}
             {lastResult && (
               <div style={{
-                padding: 10, borderRadius: 6,
+                padding: 10, borderRadius: "var(--radius-md)",
                 background: "#e6f7ed", border: "1px solid #14ae5c",
                 color: C.text, fontSize: 11,
               }}>
@@ -202,7 +203,7 @@ export function ExportScreen() {
             )}
             {lastError && (
               <div style={{
-                padding: 10, borderRadius: 6,
+                padding: 10, borderRadius: "var(--radius-md)",
                 background: "#fff5f5", border: "1px solid #f24822",
                 color: C.text, fontSize: 11,
               }}>
@@ -238,7 +239,7 @@ export function ExportScreen() {
               fontFamily: "'JetBrains Mono', Consolas, monospace",
               fontSize: 11, lineHeight: 1.6,
               padding: 12, background: C.surface,
-              border: `1px solid ${C.border}`, borderRadius: 5,
+              border: `1px solid ${C.border}`, borderRadius: "var(--radius-md)",
               overflow: "auto", maxHeight: 480, margin: 0, color: C.text,
             }}
           >
@@ -264,7 +265,7 @@ ${fittedPreview}
           <div style={{
             marginTop: 12, padding: 10,
             background: C.surface, border: `1px solid ${C.border}`,
-            borderRadius: 6, fontSize: 11, color: C.muted,
+            borderRadius: "var(--radius-md)", fontSize: 11, color: C.muted,
           }}>
             <strong style={{ color: C.text }}>Summary:</strong>{" "}
             {partNumber} · {fittedCount} fitted params ·{" "}

@@ -1,0 +1,62 @@
+// Workbench.tsx - 根据 Figma v2 设计稿移植
+// 左侧 Fit Project Tree + 右侧 Selected Item Panel
+// 顶部沿用 v2 MenuBar / Toolbar
+import { useState, useEffect, useMemo, useRef } from "react";
+import {
+  ChevronRight, ChevronDown, Plus, Activity,
+  LayoutGrid, AlignJustify, AlignLeft,
+  Upload, Play, Square, Download,
+  CheckCircle2, Circle, Minus,
+} from "lucide-react";
+import { useApp } from "../../lib/store";
+
+const C = {
+  pageBg:    "#F6F7F9",
+  panelBg:   "#FFFFFF",
+  border:    "#D7DDE5",
+  borderMd:  "#BFC9D4",
+  primary:   "#0D7F8F",
+  primaryLt: "#DFF4F6",
+  success:   "#2D8A4E",
+  text:      "#1A2633",
+  textSm:    "#6B7A8D",
+  textXs:    "#8D9BAA",
+  selectedBg:  "#E5F3F6",
+  selectedBdr: "#0D7F8F",
+  menuBg: "#EAECF0",
+};
+const ff   = "'Inter','Segoe UI',system-ui,sans-serif";
+const mono = "'JetBrains Mono','Consolas',monospace";
+
+type FitStatus = "done" | "queued" | "running" | "empty" | "error";
+type LayoutMode = "grid" | "vertical" | "horizontal";
+
+interface TreeChild {
+  id: string;
+  label: string;
+  status: FitStatus;
+  r2: string | null;
+  pts: number;
+  bias?: string;
+  csvFile?: string;
+  range?: string;
+  weight?: number;
+  type?: string;
+}
+interface TreeFeature {
+  id: string;
+  label: string;
+  tag: "live" | "next";
+  canAdd: boolean;
+  addLabel?: string;
+  children: TreeChild[];
+}
+
+const MENUS: Record<string, string[]> = {
+  "\u6587\u4EF6": ["\u65B0\u5EFA\u9879\u76EE","\u6253\u5F00\u9879\u76EE","\u2014","\u5BFC\u5165 CSV / Excel","\u2014","\u4FDD\u5B58\u6A21\u578B","\u5BFC\u51FA SPICE .lib"],
+  "\u7F16\u8F91": ["\u64A4\u6D88 Ctrl+Z","\u91CD\u505A Ctrl+Y","\u2014","\u590D\u5236\u53C2\u6570","\u7C98\u8D34\u53C2\u6570","\u2014","\u91CD\u7F6E\u5168\u90E8\u53C2\u6570"],
+  "\u89C6\u56FE": ["Grid \u591A\u56FE\u5E03\u5C40","Vertical \u7EB5\u5411\u5E03\u5C40","Horizontal \u6A2A\u5411\u5E03\u5C40","\u2014","\u663E\u793A/\u9690\u85CF Convergence","\u663E\u793A/\u9690\u85CF Fit Queue"],
+  "\u62DF\u5408": ["\u4EFF\u771F\u5F53\u524D\u9879 F5","\u62DF\u5408\u52FE\u9009\u9879 F7","\u62DF\u5408\u5168\u90E8\u961F\u5217 F8","\u2014","\u505C\u6B62\u62DF\u5408 Esc","\u91CD\u7F6E\u505C\u6B62\u6761\u4EF6"],
+  "\u5DE5\u5177": ["LTspice \u8DEF\u5F84\u8BBE\u7F6E","\u7F51\u683C\u63D0\u53D6\u5DE5\u5177","\u53C2\u6570\u7075\u654F\u5EA6\u5206\u6790","\u2014","\u65E5\u5FD7\u67E5\u770B\u5668"],
+  "\u5E2E\u52A9": ["\u6587\u6863","\u5FEB\u6377\u952E","\u2014","\u5173\u4E8E SpiceBuilder v2.4.1"],
+};

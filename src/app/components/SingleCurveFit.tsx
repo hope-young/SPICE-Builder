@@ -1,6 +1,6 @@
 // SingleCurveFit.tsx - 单曲线 IdVg 拟合工作流（独立页面，无 project_id）
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
-import type { ReactNode } from "react";
+import type { ReactNode, PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
@@ -24,7 +24,23 @@ import { ParamSliders } from "./ParamSliders";
    - 区间通过 recharts 上的 ReferenceLine + 透明覆盖层 div 实现拖动
    ========================================================================= */
 
+import { addWorkbenchActionListener } from "../../lib/events";
+
 const MARGIN = { top: 16, right: 32, bottom: 24, left: 56 };  // 与 recharts LineChart 一致
+const CONFIG_PANEL_MIN_WIDTH = 340;
+const CONFIG_PANEL_MAX_WIDTH = 680;
+const CONFIG_PANEL_DEFAULT_WIDTH = 380;
+const CONFIG_PANEL_WIDTH_KEY = "spicebuilder.workbench.configPanelWidth";
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function readStoredWidth(key: string, fallback: number, min: number, max: number): number {
+  if (typeof window === "undefined") return fallback;
+  const stored = Number(window.localStorage.getItem(key));
+  return Number.isFinite(stored) ? clamp(stored, min, max) : fallback;
+}
 
 type StopPreset = "fast" | "balanced" | "precise" | "custom";
 type FitTargetId = "idvg" | "idvd" | "bv" | "diode" | "cv" | "qg" | "dpt";
@@ -205,7 +221,7 @@ function WorkbenchMenuBar({
                 padding: "3px 0",
                 background: WB.panelBg,
                 border: `1px solid ${WB.border}`,
-                borderRadius: 4,
+                borderRadius: "var(--radius-sm)",
                 boxShadow: WB.shadow,
               }}
             >
@@ -267,7 +283,7 @@ function ToolButton({
         alignItems: "center",
         gap: 5,
         padding: "5px 10px",
-        borderRadius: 4,
+        borderRadius: "var(--radius-sm)",
         border: primary ? 0 : `1px solid ${active ? WB.primary : WB.border}`,
         background: primary ? WB.primary : active ? WB.primaryLt : WB.panelBg,
         color: primary ? "#fff" : active ? WB.primary : disabled ? WB.textXs : WB.textMd,
@@ -329,7 +345,7 @@ function WorkbenchToolbar({
 
       <div style={{ flex: 1 }} />
 
-      <div style={{ display: "flex", border: `1px solid ${WB.border}`, borderRadius: 5, overflow: "hidden" }}>
+      <div style={{ display: "flex", border: `1px solid ${WB.border}`, borderRadius: "var(--radius-md)", overflow: "hidden" }}>
         {([
           { id: "grid" as LayoutMode, icon: <LayoutGrid size={13} />, label: "Grid" },
           { id: "vertical" as LayoutMode, icon: <AlignLeft size={13} />, label: "Vertical" },
@@ -512,6 +528,9 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
   const [animPlaying, setAnimPlaying] = useState(false);
   const [animIndex, setAnimIndex] = useState(0);
   const [plotSplit, setPlotSplit] = useState(0.7);
+  const [configPanelWidth, setConfigPanelWidth] = useState(() =>
+    readStoredWidth(CONFIG_PANEL_WIDTH_KEY, CONFIG_PANEL_DEFAULT_WIDTH, CONFIG_PANEL_MIN_WIDTH, CONFIG_PANEL_MAX_WIDTH)
+  );
   const [draggingSplit, setDraggingSplit] = useState(false);
   const [yScaleMode, setYScaleMode] = useState<"linear" | "log">("linear");
   const [workbenchLayout, setWorkbenchLayout] = useState<LayoutMode>("grid");
@@ -542,11 +561,41 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
   const stepDragRef = useRef<{ stepId: string; startY: number; active: boolean } | null>(null);
   const suppressStepClickRef = useRef(false);
 
+  const beginConfigResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = configPanelWidth;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const onMove = (ev: PointerEvent) => {
+      setConfigPanelWidth(clamp(
+        startWidth + ev.clientX - startX,
+        CONFIG_PANEL_MIN_WIDTH,
+        CONFIG_PANEL_MAX_WIDTH,
+      ));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  }, [configPanelWidth]);
+
   // mount 时 log 一次 (开发模式)
   useEffect(() => {
     setLog("info", "TransferFit mounted");
     return () => setLog("info", "TransferFit unmounted");
   }, [setLog]);
+
+  useEffect(() => {
+    window.localStorage.setItem(CONFIG_PANEL_WIDTH_KEY, String(Math.round(configPanelWidth)));
+  }, [configPanelWidth]);
 
   // 拟合收敛动画自动播放: 抽样到 ~30 帧, 200ms 一步
   useEffect(() => {
@@ -707,10 +756,16 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
     return steps.length;
   }, [steps]);
 
+  // 使用 ref 保存最新的依赖项，避免拖动过程中重新注册监听器
+  const dragDepsRef = useRef({ fitting: false, getStepInsertIndex, onReorderStep });
+  useEffect(() => {
+    dragDepsRef.current = { fitting, getStepInsertIndex, onReorderStep };
+  }, [fitting, getStepInsertIndex, onReorderStep]);
+
   useEffect(() => {
     const onMove = (e: PointerEvent) => {
       const drag = stepDragRef.current;
-      if (!drag || fitting) return;
+      if (!drag || dragDepsRef.current.fitting) return;
       const moved = Math.abs(e.clientY - drag.startY);
       if (!drag.active && moved < 5) return;
       if (!drag.active) {
@@ -718,14 +773,14 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
         suppressStepClickRef.current = true;
         setDragStepId(drag.stepId);
       }
-      setDragOverStepIndex(getStepInsertIndex(e.clientY));
+      setDragOverStepIndex(dragDepsRef.current.getStepInsertIndex(e.clientY));
     };
     const onUp = (e: PointerEvent) => {
       const drag = stepDragRef.current;
       if (!drag) return;
       stepDragRef.current = null;
-      if (drag.active && !fitting) {
-        onReorderStep(drag.stepId, getStepInsertIndex(e.clientY));
+      if (drag.active && !dragDepsRef.current.fitting) {
+        dragDepsRef.current.onReorderStep(drag.stepId, dragDepsRef.current.getStepInsertIndex(e.clientY));
       }
       setDragStepId(null);
       setDragOverStepIndex(null);
@@ -741,7 +796,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-  }, [fitting, getStepInsertIndex, onReorderStep]);
+  }, []); // 空依赖数组，监听器只注册一次
 
   const onCancelFit = useCallback(() => {
     if (fitAbortRef.current) {
@@ -1353,8 +1408,8 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
             throw new Error(ev.error);
           }
         }
-    } catch (e: any) {
-      if (e?.name === "AbortError" || /aborted|cancel/i.test(String(e?.message))) {
+    } catch (e: unknown) {
+      if (e && typeof e === 'object' && 'name' in e && e.name === "AbortError") {
         if (committedEarlyStop) {
           // Already saved the R²-qualified point.
         } else if (bestPoint) {
@@ -1364,7 +1419,8 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
         }
       } else {
         console.error("fit failed:", e);
-        setLog("error", `Fit failed: ${e?.message ?? e}`);
+        const message = e instanceof Error ? e.message : String(e);
+        setLog("error", `Fit failed: ${message}`);
       }
     } finally {
       fitAbortRef.current = null;
@@ -1567,12 +1623,13 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
           throw new Error(ev.error);
         }
       }
-    } catch (e: any) {
-      if (e?.name === "AbortError" || /aborted|cancel/i.test(String(e?.message))) {
+    } catch (e: unknown) {
+      if (e && typeof e === 'object' && 'name' in e && e.name === "AbortError") {
         setLog("info", "Joint fit aborted");
       } else {
         console.error("joint fit failed:", e);
-        setLog("error", `Joint fit failed: ${e?.message ?? e}`);
+        const message = e instanceof Error ? e.message : String(e);
+        setLog("error", `Joint fit failed: ${message}`);
       }
     } finally {
       fitAbortRef.current = null;
@@ -1709,6 +1766,12 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
     }
   }, [checked, doSim, loadedStepCount, lockParamsAfterFit, onCancelFit, onFit, onJointFit, onLoad, onReset, pvals, setLog, steps]);
 
+  useEffect(() => {
+    return addWorkbenchActionListener((action) => {
+      runWorkbenchAction(action);
+    });
+  }, [runWorkbenchAction]);
+
   const canWorkbenchSimulate = Boolean(raw && !fitting && !simulating && selectedFitTargets.has("idvg"));
   const canWorkbenchFit = Boolean(
     selectedFitTargets.has("idvg") &&
@@ -1727,7 +1790,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
       <style>{`
         .spice-workbench ::-webkit-scrollbar { width: 6px; height: 6px; }
         .spice-workbench ::-webkit-scrollbar-track { background: transparent; }
-        .spice-workbench ::-webkit-scrollbar-thumb { background: ${WB.borderMd}; border-radius: 3px; }
+        .spice-workbench ::-webkit-scrollbar-thumb { background: ${WB.borderMd}; border-radius: var(--radius-sm); }
       `}</style>
       {!hideChrome && (<>
         <WorkbenchMenuBar onAction={runWorkbenchAction} onLayout={setWorkbenchLayout} />
@@ -1789,7 +1852,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
                         {target.hint}
                       </div>
                     </div>
-                    <span style={{ fontSize: 9, color: target.implemented ? WB.primary : WB.textXs, border: `1px solid ${target.implemented ? WB.primaryLt : WB.border}`, borderRadius: 3, padding: "1px 4px" }}>
+                    <span style={{ fontSize: 9, color: target.implemented ? WB.primary : WB.textXs, border: `1px solid ${target.implemented ? WB.primaryLt : WB.border}`, borderRadius: "var(--radius-sm)", padding: "1px 4px" }}>
                       {target.implemented ? "LIVE" : "NEXT"}
                     </span>
                   </div>
@@ -1827,6 +1890,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
 
       {/* ===== 右栏: 曲线图 + 拖动覆盖层 ===== */}
       <div style={{
+        order: hideFitTargetsPanel ? 3 : 1,
         flex: 1, minWidth: 360, display: "flex", flexDirection: "column",
         overflow: "hidden",
       }}>
@@ -1836,7 +1900,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
           fontWeight: 600, fontSize: 13,
           display: "flex", alignItems: "center", gap: 8,
         }}>
-          Transfer characteristic · {steps[activeStep]?.name ?? `IdVg @ Vds=${vds}V`}
+          Curves Plot · {steps[activeStep]?.name ?? `IdVg @ Vds=${vds}V`}
           {dragging && <span style={{ fontSize: 10, color: "var(--primary)" }}>拖动 {dragging === "min" ? "min" : "max"} 线...</span>}
         </div>
         <div ref={chartPaneRef} style={{ flex: 1, minHeight: 400, display: "flex", flexDirection: "column", background: "#fff", overflow: "hidden", position: "relative" }}>
@@ -1861,7 +1925,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
               >
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2, position: "relative", zIndex: 12 }}>
                   <div style={{ fontSize: 10, color: "var(--muted)", flex: 1 }}>Vds = {vds} V</div>
-                  <div style={{ display: "inline-flex", border: "1px solid var(--border)", borderRadius: 4, overflow: "hidden" }}>
+                  <div style={{ display: "inline-flex", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden" }}>
                     {(["linear", "log"] as const).map(mode => (
                       <button
                         key={mode}
@@ -1942,13 +2006,13 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
                     <div style={{ fontSize: 11, fontWeight: 700, flex: 1 }}>Convergence</div>
                     <span
                       title="R²(log)：先对 Id 取 log10 再计算 R²，更关注阈值区、低电流区和跨数量级趋势。"
-                      style={{ fontSize: 10, color: "#0d99ff", border: "1px solid rgba(13,153,255,0.35)", borderRadius: 4, padding: "1px 4px", cursor: "help" }}
+                      style={{ fontSize: 10, color: "#0d99ff", border: "1px solid rgba(13,153,255,0.35)", borderRadius: "var(--radius-sm)", padding: "1px 4px", cursor: "help" }}
                     >
                       R²(log)
                     </span>
                     <span
                       title="R²(linear)：直接用原始 Id 计算 R²，更关注大电流区的绝对电流误差。"
-                      style={{ fontSize: 10, color: "#059669", border: "1px solid rgba(16,185,129,0.35)", borderRadius: 4, padding: "1px 4px", cursor: "help" }}
+                      style={{ fontSize: 10, color: "#059669", border: "1px solid rgba(16,185,129,0.35)", borderRadius: "var(--radius-sm)", padding: "1px 4px", cursor: "help" }}
                     >
                       R²(lin)
                     </span>
@@ -2021,7 +2085,33 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
             </>
           )}
     </div>
-      <div style={{ width: 390, minWidth: 340, borderLeft: "1px solid var(--border)", background: WB.panelBg, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      </div>
+      {hideFitTargetsPanel && (
+        <div
+          onPointerDown={beginConfigResize}
+          title="拖动调整 Target Config 宽度"
+          style={{
+            order: 2,
+            width: 7,
+            flexShrink: 0,
+            cursor: "col-resize",
+            borderLeft: "1px solid var(--border)",
+            borderRight: "1px solid var(--border)",
+            background: WB.pageBg,
+          }}
+        />
+      )}
+      <div style={{
+        order: hideFitTargetsPanel ? 1 : 2,
+        width: hideFitTargetsPanel ? configPanelWidth : 390,
+        minWidth: hideFitTargetsPanel ? CONFIG_PANEL_MIN_WIDTH : 340,
+        borderLeft: hideFitTargetsPanel ? 0 : "1px solid var(--border)",
+        borderRight: hideFitTargetsPanel ? "1px solid var(--border)" : 0,
+        background: WB.panelBg,
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+      }}>
         <div style={{ display: "flex", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
           {(["steps", "params"] as const).map(tab => (
             <button
@@ -2035,7 +2125,7 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
                 background: sidePanelTab === tab ? WB.primaryLt : "transparent",
                 color: sidePanelTab === tab ? WB.primary : WB.textSm,
                 padding: "9px 8px",
-                fontSize: 12,
+                fontSize: 13,
                 fontWeight: 700,
                 cursor: "pointer",
               }}
@@ -2047,101 +2137,57 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
         {sidePanelTab === "steps" ? (
           <div style={{ flex: 1, overflow: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 12 }}>
             <section>
-              <div style={{ fontSize: 11, fontWeight: 800, marginBottom: 8 }}>Transfer Steps</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {steps.map((step, idx) => (
-                  <div
-                    key={step.id}
-                    ref={el => { stepRowRefs.current[step.id] = el; }}
-                    onPointerDown={e => { stepDragRef.current = { stepId: step.id, startY: e.clientY, active: false }; }}
-                    onClick={() => {
-                      if (suppressStepClickRef.current) {
-                        suppressStepClickRef.current = false;
-                        return;
-                      }
-                      onSelectStep(idx);
-                    }}
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "18px 1fr auto",
-                      gap: 6,
-                      alignItems: "center",
-                      padding: "7px 8px",
-                      border: `1px solid ${idx === activeStep ? WB.primary : WB.border}`,
-                      background: idx === activeStep ? WB.primaryLt : WB.panelBg,
-                      opacity: dragStepId === step.id ? 0.55 : 1,
-                      cursor: "pointer",
-                    }}
-                  >
-                    <GripVertical size={13} color={WB.textXs} />
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontSize: 11, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{step.name}</div>
-                      <div style={{ fontSize: 10, color: WB.textXs }}>{step.status} · R² {step.r2Log != null ? step.r2Log.toFixed(3) : "—"}</div>
-                    </div>
-                    <input
-                      type="checkbox"
-                      checked={idx === activeStep ? currentStepPatch().selectedForFit : step.selectedForFit}
-                      onClick={e => e.stopPropagation()}
-                      onChange={e => {
-                        const selectedForFit = e.target.checked;
-                        setSteps(prev => prev.map((item, itemIdx) => itemIdx === idx ? { ...item, selectedForFit } : item));
-                      }}
-                    />
-                  </div>
-                ))}
-              </div>
-              <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
-                <Button size="sm" variant="outline" onClick={onAddStep} disabled={fitting}><Plus size={13} />Add</Button>
-                <Button size="sm" variant="outline" onClick={() => onDeleteStep(activeStep)} disabled={fitting || steps.length <= 1}><Trash2 size={13} />Delete</Button>
+              <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Current Target</div>
+              <div style={{ fontSize: 12, color: WB.textSm, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {fileName || "No CSV loaded"} · {fitScopeSummary.mode}
               </div>
             </section>
-
             <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              <label style={{ fontSize: 10, color: WB.textSm }}>Vds (V)<input type="number" value={vds} step={0.1} onChange={e => setVds(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
-              <label style={{ fontSize: 10, color: WB.textSm }}>Vmin<input type="number" value={vmin} step={0.05} onChange={e => setVmin(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
-              <label style={{ fontSize: 10, color: WB.textSm }}>Vmax<input type="number" value={vmax} step={0.05} onChange={e => setVmax(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
-              <label style={{ fontSize: 10, color: WB.textSm }}>Points<input readOnly value={inRange} style={{ width: "100%", marginTop: 3 }} /></label>
+              <label style={{ fontSize: 12, color: WB.textSm }}>Vds (V)<input type="number" value={vds} step={0.1} onChange={e => setVds(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+              <label style={{ fontSize: 12, color: WB.textSm }}>Vmin<input type="number" value={vmin} step={0.05} onChange={e => setVmin(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+              <label style={{ fontSize: 12, color: WB.textSm }}>Vmax<input type="number" value={vmax} step={0.05} onChange={e => setVmax(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+              <label style={{ fontSize: 12, color: WB.textSm }}>Points<input readOnly value={inRange} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
             </section>
 
             <section>
-              <div style={{ fontSize: 11, fontWeight: 800, marginBottom: 8 }}>Stop Criteria</div>
+              <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Stop Criteria</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                <label style={{ fontSize: 10, color: WB.textSm }}>Preset<select value={stopPreset} onChange={e => {
+                <label style={{ fontSize: 12, color: WB.textSm }}>Preset<select value={stopPreset} onChange={e => {
                   const next = e.target.value as StopPreset;
                   setStopPreset(next);
                   if (next !== "custom") setFitStop(STOP_PRESETS[next]);
-                }} style={{ width: "100%", marginTop: 3 }}>
+                }} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}>
                   <option value="fast">Fast</option><option value="balanced">Balanced</option><option value="precise">Precise</option><option value="custom">Custom</option>
                 </select></label>
-                <label style={{ fontSize: 10, color: WB.textSm }}>Max nfev<input type="number" value={fitStop.max_nfev} onChange={e => updateStopValue("max_nfev", Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
-                <label style={{ fontSize: 10, color: WB.textSm }}>R² log<input type="number" value={fitStop.r2_log} step={0.001} onChange={e => updateStopValue("r2_log", Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
-                <label style={{ fontSize: 10, color: WB.textSm }}>R² linear<input type="number" value={fitStop.r2_linear} step={0.001} onChange={e => updateStopValue("r2_linear", Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+                <label style={{ fontSize: 12, color: WB.textSm }}>Max nfev<input type="number" value={fitStop.max_nfev} onChange={e => updateStopValue("max_nfev", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                <label style={{ fontSize: 12, color: WB.textSm }}>R² log<input type="number" value={fitStop.r2_log} step={0.001} onChange={e => updateStopValue("r2_log", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                <label style={{ fontSize: 12, color: WB.textSm }}>R² linear<input type="number" value={fitStop.r2_linear} step={0.001} onChange={e => updateStopValue("r2_linear", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
               </div>
             </section>
 
             <section>
-              <div style={{ fontSize: 11, fontWeight: 800, marginBottom: 8 }}>Power Cell</div>
+              <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Power Cell</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                <label style={{ fontSize: 10, color: WB.textSm }}>Area mm²<input type="number" value={activeAreaMm2} step={0.1} onChange={e => setActiveAreaMm2(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
-                <label style={{ fontSize: 10, color: WB.textSm }}>Pitch µm<input type="number" value={cellPitchUm} step={0.1} onChange={e => setCellPitchUm(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+                <label style={{ fontSize: 12, color: WB.textSm }}>Area mm²<input type="number" value={activeAreaMm2} step={0.1} onChange={e => setActiveAreaMm2(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                <label style={{ fontSize: 12, color: WB.textSm }}>Pitch µm<input type="number" value={cellPitchUm} step={0.1} onChange={e => setCellPitchUm(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
               </div>
-              <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, fontSize: 11, color: WB.textSm }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, fontSize: 13, color: WB.textSm }}>
                 <input type="checkbox" checked={protectPrevious} onChange={e => setProtectPrevious(e.target.checked)} />
                 Protect previous fitted curves
               </label>
-              <label style={{ fontSize: 10, color: WB.textSm, display: "block", marginTop: 8 }}>Protect weight<input type="number" value={protectWeight} min={0} max={1} step={0.05} onChange={e => setProtectWeight(Number(e.target.value))} style={{ width: "100%", marginTop: 3 }} /></label>
+              <label style={{ fontSize: 12, color: WB.textSm, display: "block", marginTop: 8 }}>Protect weight<input type="number" value={protectWeight} min={0} max={1} step={0.05} onChange={e => setProtectWeight(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
             </section>
           </div>
         ) : (
           <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
             <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)", display: "flex", gap: 8, alignItems: "center" }}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 11, fontWeight: 800 }}>BSIM Parameters</div>
-                <div style={{ fontSize: 10, color: WB.textXs }}>{fitParamNames.length} selected · {lockedParams.size} locked</div>
+                <div style={{ fontSize: 13, fontWeight: 800 }}>BSIM Parameters</div>
+                <div style={{ fontSize: 12, color: WB.textXs }}>{fitParamNames.length} selected · {lockedParams.size} locked</div>
               </div>
               <Button size="sm" variant="outline" onClick={() => setLockedParams(new Set())}>Unlock</Button>
             </div>
-            <div style={{ flex: "1 1 58%", minHeight: 220, overflow: "auto", padding: 10 }}>
+            <div style={{ flex: 1, minHeight: 0, overflow: "hidden", padding: 10, display: "flex", flexDirection: "column" }}>
               <ParamSliders
                 values={pvals}
                 checked={checked}
@@ -2157,39 +2203,9 @@ export function SingleCurveFit({ hideChrome = false, hideFitTargetsPanel = false
                 onResetCatBounds={onResetCatBounds}
               />
             </div>
-            <div style={{ flex: "1 1 42%", minHeight: 150, borderTop: "1px solid var(--border)", overflow: "auto", padding: 10 }}>
-              <div style={{ fontSize: 11, fontWeight: 800, marginBottom: 7 }}>Iteration Trail</div>
-              {fitHistory.length === 0 ? (
-                <div style={{ fontSize: 11, color: WB.textXs }}>拟合开始后显示每轮 BSIM 参数和 R² 变化</div>
-              ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                  {fitHistory.slice(-12).map((point, idx) => (
-                    <button
-                      key={`${point.step}-${idx}`}
-                      type="button"
-                      onClick={() => {
-                        setPvals(prev => ({ ...prev, ...point.params }));
-                        setSimCurve(point.sim);
-                        setAnimIndex(Math.max(0, fitHistory.findIndex(item => item === point)));
-                      }}
-                      style={{ border: "1px solid var(--border)", background: idx === fitHistory.slice(-12).length - 1 ? WB.primaryLt : WB.panelBg, padding: 6, textAlign: "left", cursor: "pointer" }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontWeight: 700 }}>
-                        <span>Step {point.step}</span>
-                        <span>R² {point.r2_log.toFixed(4)} / {point.r2_linear.toFixed(4)}</span>
-                      </div>
-                      <div style={{ marginTop: 3, fontFamily: "monospace", fontSize: 10, color: WB.textSm, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {Object.entries(point.params).slice(0, 5).map(([name, value]) => `${name}=${fmtParam(value)}`).join("  ")}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
           </div>
         )}
       </div>
-    </div>
     </div>
     </div>
   );

@@ -32,7 +32,7 @@ export function Dashboard() {
             onClick={refreshBackend}
             style={{
               background: "transparent", border: "1px solid #e5e5e5",
-              padding: "4px 10px", borderRadius: 6, cursor: "pointer",
+              padding: "4px 10px", borderRadius: "var(--radius-md)", cursor: "pointer",
               display: "flex", alignItems: "center", gap: 4, fontSize: 12,
             }}
           >
@@ -120,7 +120,7 @@ function MetricCard({ icon, label, value, sub, color }: {
   return (
     <div style={{
       background: "#fafafa", border: "1px solid #e5e5e5",
-      borderRadius: 8, padding: "12px 14px",
+      borderRadius: "var(--radius-lg)", padding: "12px 14px",
     }}>
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
         {icon}

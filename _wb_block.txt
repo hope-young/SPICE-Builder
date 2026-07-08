@@ -1,0 +1,715 @@
+      </>)}
+      <div className="spice-workbench" style={{ flex: 1, display: "flex", minHeight: 0, overflow: "hidden" }}>
+            {/* ==== 侧边栏: Transfer Steps / BSIM3 切换 ==== */}
+      <div style={{ display: "flex", flexDirection: "column", width: 320, borderRight: `1px solid ${WB.border}`, background: WB.panelBg, flexShrink: 0, minHeight: 0, overflow: "hidden" }}>
+<div style={{ display: "flex", alignItems: "stretch", borderBottom: `1px solid ${WB.border}`, background: WB.menuBg, flexShrink: 0 }}><button type="button" onClick={() => setSidePanelTab("steps")} style={{ flex: 1, padding: "8px 10px", border: 0, borderRight: `1px solid ${WB.border}`, cursor: "pointer", fontSize: 12, fontWeight: sidePanelTab === "steps" ? 700 : 500, color: sidePanelTab === "steps" ? WB.primary : WB.textSm, background: sidePanelTab === "steps" ? WB.panelBg : "transparent", fontFamily: ff }}>Transfer Steps</button><button type="button" onClick={() => setSidePanelTab("params")} style={{ flex: 1, padding: "8px 10px", border: 0, cursor: "pointer", fontSize: 12, fontWeight: sidePanelTab === "params" ? 700 : 500, color: sidePanelTab === "params" ? WB.primary : WB.textSm, background: sidePanelTab === "params" ? WB.panelBg : "transparent", fontFamily: ff }}>BSIM3 参数{simulating && <span style={{ fontSize: 10, color: WB.warning, marginLeft: 4 }}>Sim...</span>}</button></div>
+{sidePanelTab === "steps" ? (
+          <>
+          <div style={{
+width: 320, borderRight: `1px solid ${WB.border}`,
+        background: WB.panelBg,
+        display: "flex", flexDirection: "column",
+        padding: 0, gap: 0, flexShrink: 0,
+        minHeight: 0, overflowY: "hidden",
+      }}>
+        {/* ============================
+             embed 模式: 独立的 Transfer Steps section
+             隐藏 7 电学特性分支但保留 TransferStep 操作
+           ============================ */}
+        {hideFitTargetsPanel && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, flex: 1 }}>Transfer Steps</div>
+              <Button variant="outline" size="sm" onClick={onAddStep} disabled={fitting}>
+                <Plus size={12} style={{ marginRight: 4 }} />
+                IdVg Step
+              </Button>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, paddingLeft: 18 }}>
+            {steps.map((step, idx) => {
+            const active = idx === activeStep && activeTreeItem === "idvg-step";
+            const done = step.status === "fitted";
+            const StepStatusIcon = done ? CheckCircle2 : CircleMinus;
+            return (
+            <div key={step.id}>
+            {dragOverStepIndex === idx && dragStepId !== step.id && (
+            <div style={{
+            height: 2,
+            borderRadius: 999,
+            background: "var(--primary)",
+            margin: "0 4px 4px",
+            boxShadow: "0 0 0 2px rgba(13,153,255,0.12)",
+            }} />
+            )}
+            <div
+            ref={(el) => { stepRowRefs.current[step.id] = el; }}
+            role="button"
+            tabIndex={fitting ? -1 : 0}
+            aria-label={`Select Step ${idx + 1}`}
+            onClick={() => {
+            if (suppressStepClickRef.current) return;
+            setActiveTreeItem("idvg-step");
+            onSelectStep(idx);
+            }}
+            onKeyDown={(e) => {
+            if (fitting) return;
+            if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setActiveTreeItem("idvg-step");
+            onSelectStep(idx);
+            }
+            }}
+            onPointerDown={(e) => {
+            if (fitting || e.button !== 0) return;
+            const targetEl = e.target as HTMLElement | null;
+            if (targetEl?.closest("button")) return;
+            stepDragRef.current = { stepId: step.id, startY: e.clientY, active: false };
+            }}
+            style={{
+            border: `1px solid ${active ? "var(--primary)" : dragStepId && dragStepId !== step.id ? "rgba(13,153,255,0.35)" : "var(--border)"}`,
+            background: active ? "var(--selected)" : "#fff",
+            color: "var(--text)",
+            borderRadius: 6,
+            padding: "6px 7px",
+            cursor: fitting ? "not-allowed" : dragStepId === step.id ? "grabbing" : "grab",
+            textAlign: "left",
+            opacity: dragStepId === step.id ? 0.65 : 1,
+            userSelect: "none",
+            outline: "none",
+            touchAction: "none",
+            transform: dragStepId === step.id ? "scale(0.985)" : "scale(1)",
+            transition: "transform 120ms ease, opacity 120ms ease, border-color 120ms ease, box-shadow 120ms ease",
+            boxShadow: dragStepId === step.id ? "0 8px 18px rgba(0,0,0,0.16)" : "none",
+            }}
+            >
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input
+            type="checkbox"
+            checked={step.selectedForFit}
+            disabled={fitting}
+            onClick={e => e.stopPropagation()}
+            onChange={e => onToggleStepFit(idx, e.target.checked)}
+            title="是否参与下一次 IdVg 拟合"
+            style={{ accentColor: "var(--primary)", margin: 0 }}
+            />
+            <GripVertical size={12} color="var(--muted)" style={{ flexShrink: 0 }} />
+            <StepStatusIcon size={13} color={done ? "var(--success)" : "var(--error)"} />
+            <span style={{
+            fontSize: 9,
+            color: active ? "var(--primary)" : "var(--muted)",
+            minWidth: 36,
+            fontWeight: 800,
+            textTransform: "uppercase",
+            }}>
+            Step {idx + 1}
+            </span>
+            <span style={{ fontSize: 10, fontWeight: 700, flex: 1 }}>{step.name}</span>
+            <button
+            type="button"
+            aria-label={`Delete Step ${idx + 1}`}
+            title={steps.length <= 1 ? "至少保留一个 step" : `Delete Step ${idx + 1}`}
+            disabled={steps.length <= 1 || fitting}
+            onClick={(e) => {
+            e.stopPropagation();
+            onDeleteStep(idx);
+            }}
+            style={{
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: 18,
+            height: 18,
+            border: 0,
+            background: "transparent",
+            borderRadius: 4,
+            color: steps.length <= 1 ? "var(--muted)" : "var(--error)",
+            cursor: steps.length <= 1 || fitting ? "not-allowed" : "pointer",
+            opacity: steps.length <= 1 ? 0.45 : 1,
+            padding: 0,
+            }}
+            >
+            <Trash2 size={11} />
+            </button>
+            </div>
+            <div style={{ fontSize: 9, color: "var(--muted)", marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {step.csvPath ? step.csvPath.split(/[/\\]/).pop() : "No CSV"}
+            {step.r2Log !== null ? ` · R²(log)=${step.r2Log.toFixed(4)}` : ""}
+            </div>
+            </div>
+            {dragOverStepIndex === idx + 1 && dragStepId !== step.id && idx === steps.length - 1 && (
+            <div style={{
+            height: 2,
+            borderRadius: 999,
+            background: "var(--primary)",
+            margin: "4px 4px 0",
+            boxShadow: "0 0 0 2px rgba(13,153,255,0.12)",
+            }} />
+            )}
+            </div>
+            );
+            })}
+            </div>
+            )
+          </div>
+        )}
+
+        {/* 7 个电学特性树 (IdVg / IdVd / BV / ...): hideFitTargetsPanel=true 时隐藏 */}
+        {!hideFitTargetsPanel && (
+        <>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, flex: 1 }}>Fit Project Tree</div>
+          <Button variant="outline" size="sm" onClick={onAddStep} disabled={fitting}>
+            <Plus size={12} style={{ marginRight: 4 }} />
+            IdVg Step
+          </Button>
+        </div>
+
+        <div style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 8, background: "var(--surface)", display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ fontSize: 10, color: "var(--muted)", lineHeight: 1.35 }}>
+            勾选的一级特性会进入同一次拟合目标；1 个为单拟合，2 个及以上为联合拟合。
+          </div>
+          {FIT_TARGET_TEMPLATES.map(target => {
+            const checkedTarget = selectedFitTargets.has(target.id);
+            const activeTarget = activeTreeItem === target.id;
+            const targetDone = target.id === "idvg" && steps.some(step => step.status === "fitted");
+            const StatusIcon = targetDone ? CheckCircle2 : CircleMinus;
+            return (
+              <div key={target.id} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <div
+                  role="button"
+                  tabIndex={fitting ? -1 : 0}
+                  onClick={() => setActiveTreeItem(target.id)}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "16px 16px 1fr auto",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "5px 6px",
+                    border: `1px solid ${activeTarget ? "var(--primary)" : "var(--border)"}`,
+                    borderRadius: 6,
+                    background: activeTarget ? "var(--selected)" : "#fff",
+                    cursor: fitting ? "not-allowed" : "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checkedTarget}
+                    onClick={e => e.stopPropagation()}
+                    onChange={e => onToggleFitTarget(target.id, e.target.checked)}
+                    style={{ accentColor: "var(--primary)", margin: 0 }}
+                    title="是否参与下一次联合拟合"
+                  />
+                  <StatusIcon size={14} color={targetDone ? "var(--success)" : "var(--error)"} />
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 11, fontWeight: 750, color: activeTarget ? "var(--primary)" : "var(--text)" }}>
+                      {target.label}
+                    </div>
+                    <div style={{ fontSize: 9, color: "var(--muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {target.hint}
+                    </div>
+                  </div>
+                  <span style={{
+                    fontSize: 9,
+                    color: target.implemented ? "var(--success)" : "var(--muted)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 4,
+                    padding: "1px 4px",
+                    background: "#fff",
+                  }}>
+                    {target.implemented ? "live" : "next"}
+                  </span>
+                </div>
+
+                {target.id === "idvg" ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, paddingLeft: 18 }}>
+                    {steps.map((step, idx) => {
+                      const active = idx === activeStep && activeTreeItem === "idvg-step";
+                      const done = step.status === "fitted";
+                      const StepStatusIcon = done ? CheckCircle2 : CircleMinus;
+                      return (
+                        <div key={step.id}>
+                          {dragOverStepIndex === idx && dragStepId !== step.id && (
+                            <div style={{
+                              height: 2,
+                              borderRadius: 999,
+                              background: "var(--primary)",
+                              margin: "0 4px 4px",
+                              boxShadow: "0 0 0 2px rgba(13,153,255,0.12)",
+                            }} />
+                          )}
+                          <div
+                            ref={(el) => { stepRowRefs.current[step.id] = el; }}
+                            role="button"
+                            tabIndex={fitting ? -1 : 0}
+                            aria-label={`Select Step ${idx + 1}`}
+                            onClick={() => {
+                              if (suppressStepClickRef.current) return;
+                              setActiveTreeItem("idvg-step");
+                              onSelectStep(idx);
+                            }}
+                            onKeyDown={(e) => {
+                              if (fitting) return;
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                setActiveTreeItem("idvg-step");
+                                onSelectStep(idx);
+                              }
+                            }}
+                            onPointerDown={(e) => {
+                              if (fitting || e.button !== 0) return;
+                              const targetEl = e.target as HTMLElement | null;
+                              if (targetEl?.closest("button")) return;
+                              stepDragRef.current = { stepId: step.id, startY: e.clientY, active: false };
+                            }}
+                            style={{
+                              border: `1px solid ${active ? "var(--primary)" : dragStepId && dragStepId !== step.id ? "rgba(13,153,255,0.35)" : "var(--border)"}`,
+                              background: active ? "var(--selected)" : "#fff",
+                              color: "var(--text)",
+                              borderRadius: 6,
+                              padding: "6px 7px",
+                              cursor: fitting ? "not-allowed" : dragStepId === step.id ? "grabbing" : "grab",
+                              textAlign: "left",
+                              opacity: dragStepId === step.id ? 0.65 : 1,
+                              userSelect: "none",
+                              outline: "none",
+                              touchAction: "none",
+                              transform: dragStepId === step.id ? "scale(0.985)" : "scale(1)",
+                              transition: "transform 120ms ease, opacity 120ms ease, border-color 120ms ease, box-shadow 120ms ease",
+                              boxShadow: dragStepId === step.id ? "0 8px 18px rgba(0,0,0,0.16)" : "none",
+                            }}
+                          >
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <input
+                                type="checkbox"
+                                checked={step.selectedForFit}
+                                disabled={fitting}
+                                onClick={e => e.stopPropagation()}
+                                onChange={e => onToggleStepFit(idx, e.target.checked)}
+                                title="是否参与下一次 IdVg 拟合"
+                                style={{ accentColor: "var(--primary)", margin: 0 }}
+                              />
+                              <GripVertical size={12} color="var(--muted)" style={{ flexShrink: 0 }} />
+                              <StepStatusIcon size={13} color={done ? "var(--success)" : "var(--error)"} />
+                              <span style={{
+                                fontSize: 9,
+                                color: active ? "var(--primary)" : "var(--muted)",
+                                minWidth: 36,
+                                fontWeight: 800,
+                                textTransform: "uppercase",
+                              }}>
+                                Step {idx + 1}
+                              </span>
+                              <span style={{ fontSize: 10, fontWeight: 700, flex: 1 }}>{step.name}</span>
+                              <button
+                                type="button"
+                                aria-label={`Delete Step ${idx + 1}`}
+                                title={steps.length <= 1 ? "至少保留一个 step" : `Delete Step ${idx + 1}`}
+                                disabled={steps.length <= 1 || fitting}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onDeleteStep(idx);
+                                }}
+                                style={{
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                  width: 18,
+                                  height: 18,
+                                  border: 0,
+                                  background: "transparent",
+                                  borderRadius: 4,
+                                  color: steps.length <= 1 ? "var(--muted)" : "var(--error)",
+                                  cursor: steps.length <= 1 || fitting ? "not-allowed" : "pointer",
+                                  opacity: steps.length <= 1 ? 0.45 : 1,
+                                  padding: 0,
+                                }}
+                              >
+                                <Trash2 size={11} />
+                              </button>
+                            </div>
+                            <div style={{ fontSize: 9, color: "var(--muted)", marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                              {step.csvPath ? step.csvPath.split(/[/\\]/).pop() : "No CSV"}
+                              {step.r2Log !== null ? ` · R²(log)=${step.r2Log.toFixed(4)}` : ""}
+                            </div>
+                          </div>
+                          {dragOverStepIndex === idx + 1 && dragStepId !== step.id && idx === steps.length - 1 && (
+                            <div style={{
+                              height: 2,
+                              borderRadius: 999,
+                              background: "var(--primary)",
+                              margin: "4px 4px 0",
+                              boxShadow: "0 0 0 2px rgba(13,153,255,0.12)",
+                            }} />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2, paddingLeft: 34 }}>
+                    {target.children.map(child => (
+                      <div key={child} style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        minHeight: 20,
+                        fontSize: 10,
+                        color: "var(--muted)",
+                      }}>
+                        <CircleMinus size={11} color="var(--error)" />
+                        <span style={{ flex: 1 }}>{child}</span>
+                        <span style={{ fontSize: 9, border: "1px solid var(--border)", borderRadius: 4, padding: "0 4px", background: "#fff" }}>template</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        </>
+        )}
+
+        <div style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 8, background: "var(--surface)", display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ fontWeight: 700, fontSize: 12, flex: 1 }}>Fit Scope</div>
+            <span style={{
+              fontSize: 10,
+              color: fitScopeSummary.count >= 2 ? "var(--primary)" : fitScopeSummary.count === 1 ? "var(--success)" : "var(--error)",
+              border: "1px solid var(--border)",
+              borderRadius: 4,
+              padding: "1px 5px",
+              background: "#fff",
+              fontWeight: 700,
+            }}>
+              {fitScopeSummary.mode}
+            </span>
+          </div>
+          <div style={{ fontSize: 10, color: "var(--muted)", lineHeight: 1.35 }}>
+            {fitScopeSummary.count === 0
+              ? "请选择至少一个一级特性。"
+              : `已勾选 ${fitScopeSummary.count} 个特性：${fitScopeSummary.labels.join(" / ")}`}
+          </div>
+          {fitScopeSummary.implementedCount < fitScopeSummary.count && (
+            <div style={{ fontSize: 10, color: "var(--warning)", lineHeight: 1.35 }}>
+              目前只有 IdVg 已接入真实拟合；其他特性先作为 GUI 模板与后续入口。
+            </div>
+          )}
+        </div>
+
+        <div style={{ fontWeight: 600, fontSize: 13 }}>数据</div>
+
+        <div style={{ fontSize: 11, color: "var(--muted)" }}>当前 Step (Vds = {vds} V)</div>
+        <Button variant="primary" size="sm" onClick={onLoad} disabled={loading}>
+          <Upload size={13} style={{ marginRight: 6 }} />
+          {loading ? "加载中..." : "Load CSV"}
+        </Button>
+        {fileName && (
+          <div style={{ fontSize: 10, color: "var(--muted)", wordBreak: "break-all", lineHeight: 1.3 }}>
+            {fileName}
+          </div>
+        )}
+        {raw && (
+          <div style={{ fontSize: 10, color: "var(--muted)" }}>
+            {raw.ivar.length} pts · Vgs [{xDomain[0].toFixed(2)}, {xDomain[1].toFixed(2)}] V
+          </div>
+        )}
+
+        {/* Vds 输入 */}
+        <div style={{ display: "flex", gap: 8 }}>
+          <label style={{ fontSize: 11, flex: 1 }}>
+            <div style={{ marginBottom: 2 }}>Vds (V)</div>
+            <input type="number" value={vds}
+              step={0.01}
+              onChange={e => {
+                const next = parseFloat(e.target.value) || 0.5;
+                setVds(next);
+                setSteps(prev => prev.map((step, idx) => idx === activeStep ? {
+                  ...step,
+                  vds: next,
+                  name: `IdVg @ Vds=${next}V`,
+                } : step));
+              }}
+              style={{ width: "100%", fontSize: 11, border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px", boxSizing: "border-box" }}
+            />
+          </label>
+        </div>
+
+        <div style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ fontWeight: 600, fontSize: 12 }}>Power MOS Parameters</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <label style={{ fontSize: 11 }}>
+              <div style={{ marginBottom: 2 }}>AA (mm²)</div>
+              <input
+                type="number"
+                value={activeAreaMm2}
+                min={1e-6}
+                max={1e6}
+                step={0.01}
+                disabled={fitting}
+                onChange={e => setActiveAreaMm2(Math.max(1e-6, Number.parseFloat(e.target.value) || 10))}
+                style={{ width: "100%", fontSize: 11, border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px", boxSizing: "border-box" }}
+              />
+            </label>
+            <label style={{ fontSize: 11 }}>
+              <div style={{ marginBottom: 2 }}>CellPitch (µm)</div>
+              <input
+                type="number"
+                value={cellPitchUm}
+                min={0.01}
+                max={1000}
+                step={0.1}
+                disabled={fitting}
+                onChange={e => setCellPitchUm(Math.max(0.01, Number.parseFloat(e.target.value) || 2))}
+                style={{ width: "100%", fontSize: 11, border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px", boxSizing: "border-box" }}
+              />
+            </label>
+          </div>
+        </div>
+
+        {/* 区间选择 */}
+        <div style={{ fontWeight: 600, fontSize: 13, marginTop: 8 }}>Vgs 区间</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <label style={{ fontSize: 11, flex: 1 }}>
+            <div style={{ marginBottom: 2 }}>min (V)</div>
+            <input type="number" value={vmin}
+              step={0.01}
+              onChange={e => setVmin(parseFloat(e.target.value) || 0)}
+              style={{ width: "100%", fontSize: 11, border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px", boxSizing: "border-box" }}
+            />
+          </label>
+          <label style={{ fontSize: 11, flex: 1 }}>
+            <div style={{ marginBottom: 2 }}>max (V)</div>
+            <input type="number" value={vmax}
+              step={0.01}
+              onChange={e => setVmax(parseFloat(e.target.value) || 0)}
+              style={{ width: "100%", fontSize: 11, border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px", boxSizing: "border-box" }}
+            />
+          </label>
+        </div>
+        <button
+          onClick={() => {
+            setVmin(xDomain[0]);
+            setVmax(xDomain[1]);
+          }}
+          style={{ background: "none", border: "1px solid var(--border)", color: "var(--muted)", cursor: "pointer", fontSize: 11, padding: "4px 8px", borderRadius: 4 }}
+        >
+          全选全部
+        </button>
+        <div style={{ fontSize: 11, color: "var(--muted)" }}>区间内 {inRange} pts</div>
+
+        {/* 亚阈值/低电流仪器噪声提示 */}
+        {vmin < 3.5 && (
+          <div style={{
+            fontSize: 10, color: "#92400e", background: "#fef3c7",
+            padding: "4px 6px", borderRadius: 4, lineHeight: 1.3,
+          }}>
+            ⚠ Vgs &lt; 3.5V 是仪器噪声地板（约 30 mA）。建议 vmin ≥ 3.5V。
+          </div>
+        )}
+
+        {/* Fit */}
+        <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ fontWeight: 700, fontSize: 12, flex: 1 }}>停止条件</div>
+              <select
+                value={stopPreset}
+                onChange={e => applyStopPreset(e.target.value as StopPreset)}
+                disabled={fitting}
+                style={{
+                  width: 82,
+                  fontSize: 11,
+                  border: "1px solid var(--border)",
+                  borderRadius: 4,
+                  padding: "3px 6px",
+                  background: "var(--surface)",
+                  color: "var(--text)",
+                }}
+              >
+                <option value="fast">{STOP_PRESETS.fast.label}</option>
+                <option value="balanced">{STOP_PRESETS.balanced.label}</option>
+                <option value="precise">{STOP_PRESETS.precise.label}</option>
+                <option value="custom">自定义</option>
+              </select>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+              {([
+                ["r2_log", "R² log"],
+                ["r2_linear", "R² lin"],
+              ] as const).map(([key, label]) => (
+                <label key={key} style={{ fontSize: 10, color: "var(--muted)" }}>
+                  <div style={{ marginBottom: 2 }}>{label}</div>
+                  <input
+                    type="number"
+                    value={fitStop[key]}
+                    step={0.001}
+                    min={0}
+                    max={0.999999}
+                    disabled={fitting}
+                    onChange={e => updateStopValue(key, Number.parseFloat(e.target.value))}
+                    style={{ width: "100%", fontSize: 10, border: "1px solid var(--border)", borderRadius: 4, padding: "3px 5px", boxSizing: "border-box" }}
+                  />
+                </label>
+              ))}
+              {([
+                ["ftol", "ftol"],
+                ["xtol", "xtol"],
+                ["gtol", "gtol"],
+              ] as const).map(([key, label]) => (
+                <label key={key} style={{ fontSize: 10, color: "var(--muted)" }}>
+                  <div style={{ marginBottom: 2 }}>{label}</div>
+                  <input
+                    type="number"
+                    value={fitStop[key]}
+                    step="any"
+                    min={1e-12}
+                    max={1e-2}
+                    disabled={fitting}
+                    onChange={e => updateStopValue(key, Number.parseFloat(e.target.value))}
+                    style={{ width: "100%", fontSize: 10, border: "1px solid var(--border)", borderRadius: 4, padding: "3px 5px", boxSizing: "border-box" }}
+                  />
+                </label>
+              ))}
+              <label style={{ fontSize: 10, color: "var(--muted)" }}>
+                <div style={{ marginBottom: 2 }}>max evals</div>
+                <input
+                  type="number"
+                  value={fitStop.max_nfev}
+                  step={10}
+                  min={5}
+                  max={10000}
+                  disabled={fitting}
+                  onChange={e => updateStopValue("max_nfev", Number.parseInt(e.target.value, 10))}
+                  style={{ width: "100%", fontSize: 10, border: "1px solid var(--border)", borderRadius: 4, padding: "3px 5px", boxSizing: "border-box" }}
+                />
+              </label>
+            </div>
+            <div style={{ fontSize: 10, color: "var(--muted)", lineHeight: 1.3 }}>
+              宽松停止会更快；精细停止会多做后期微调。
+            </div>
+          </div>
+          {activeStep > 0 && (
+            <div style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={protectPrevious}
+                  onChange={e => setProtectPrevious(e.target.checked)}
+                  style={{ accentColor: "var(--primary)" }}
+                />
+                <span>Protect previous steps</span>
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}>
+                <span style={{ color: "var(--muted)" }}>Weight</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={2}
+                  step={0.05}
+                  value={protectWeight}
+                  onChange={e => setProtectWeight(Math.max(0, Number.parseFloat(e.target.value) || 0))}
+                  disabled={!protectPrevious}
+                  style={{ width: 70, fontSize: 11, border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px" }}
+                />
+                <span style={{ color: "var(--muted)", fontSize: 10 }}>{protectedCurves.length} protected</span>
+              </label>
+            </div>
+          )}
+          <Button variant="outline" onClick={() => void doSim(pvals)} disabled={!raw || fitting || simulating || !selectedFitTargets.has("idvg")}>
+            <Play size={13} style={{ marginRight: 6 }} />
+            Sim Current IdVg Step
+          </Button>
+          {fitting ? (
+            <Button variant="danger" onClick={onCancelFit}>
+              ⏹ 停止拟合
+            </Button>
+          ) : (
+            <>
+              <Button variant="primary" onClick={onFit} disabled={!raw || fitting || !selectedFitTargets.has("idvg") || !steps[activeStep]?.selectedForFit}>
+                <Play size={13} style={{ marginRight: 6 }} />
+                {`Fit IdVg Vds=${vds}V`}
+              </Button>
+              <Button
+                variant="outline"
+                onClick={onJointFit}
+                disabled={fitting || !selectedFitTargets.has("idvg") || loadedStepCount < 2}
+              >
+                <Play size={13} style={{ marginRight: 6 }} />
+                Fit Loaded IdVg Steps
+              </Button>
+            </>
+          )}
+          {fitRMS !== null && (
+            <div style={{ fontSize: 11, color: "var(--text)", textAlign: "center", padding: "6px 4px", border: "1px solid var(--border)", borderRadius: 4, lineHeight: 1.6 }}>
+              RMS = <b>{fitRMS.toFixed(4)}</b><br />
+              R² (log) = <b>{fitR2!.toFixed(4)}</b><br />
+              R² (lin) = <b style={{ color: fitR2Linear! > 0.95 ? "var(--success)" : "var(--warning)" }}>{fitR2Linear!.toFixed(4)}</b>
+            </div>
+          )}
+
+          {/* 拟合收敛动画 */}
+          {fitHistory.length > 1 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8 }}>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  if (animIndex >= fitHistory.length - 1) setAnimIndex(0);
+                  setAnimPlaying(p => !p);
+                }}
+              >
+                {animPlaying
+                  ? <><Pause size={11} style={{ marginRight: 4 }} /> 暂停 ({animIndex + 1}/{fitHistory.length})</>
+                  : <><Play size={11} style={{ marginRight: 4 }} /> 动画播放</>}
+              </Button>
+              <div style={{ fontSize: 10, color: "var(--muted)", textAlign: "center" }}>
+                step {animIndex + 1}/{fitHistory.length} · R²(log)={(fitHistory[animIndex]?.r2_log ?? 0).toFixed(4)}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      
+          </>
+        ) : (
+          <>
+            {/* ===== 中栏: 参数滑块 ===== */}
+      <div style={{
+        width: 320, borderRight: "1px solid var(--border)",
+        display: "flex", flexDirection: "column", flexShrink: 0,
+        minHeight: 0, overflow: "hidden",
+      }}>
+        
+        <ParamSliders
+          values={pvals}
+          checked={checked}
+          locked={lockedParams}
+          onChange={onParamChange}
+          onCheck={onCheck}
+          onToggleLock={onToggleLock}
+          onReset={onReset}
+          onResetCat={onResetCat}
+          bounds={customBounds}
+          onBoundsChange={(name, next) => setCustomBounds(prev => ({ ...prev, [name]: next }))}
+          onResetBounds={(name) => setCustomBounds(prev => {
+            const n = { ...prev };
+            delete n[name];
+            return n;
+          })}
+          onResetCatBounds={(cat) => setCustomBounds(prev => {
+            const n = { ...prev };
+            for (const p of BSIM3_PARAMS.filter(item => item.category === cat)) delete n[p.name];
+            return n;
+          })}
+        />
+      </div>
+
+      
+          </>
+        )}
+      </div>
+
+      {/* ===== 右栏: 曲线图 + 拖动覆盖层 ===== */}

@@ -69,23 +69,25 @@ function runFitWithPolling(
             pollStopped = true;
             reject(new Error("fit cancelled by user"));
           }
-        } catch (e: any) {
+        } catch (e: unknown) {
           pollErrors++;
           if (pollErrors >= MAX_POLL_ERRORS) {
             cleanup();
             pollStopped = true;
-            reject(new Error(`fit polling failed ${pollErrors} times in a row; aborting`));
+            const message = e instanceof Error ? e.message : String(e);
+            reject(new Error(`fit polling failed ${pollErrors} times in a row; aborting: ${message}`));
             return;
           }
-          console.warn("pollFitTask transient error:", e?.message);
+          const message = e instanceof Error ? e.message : String(e);
+          console.warn("pollFitTask transient error:", message);
         }
       };
       timer = window.setInterval(tick, intervalMs);
       void tick();
-    } catch (e: any) {
+    } catch (e: unknown) {
       cleanup();
       pollStopped = true;
-      reject(e);
+      reject(e instanceof Error ? e : new Error(String(e)));
     }
   });
 
@@ -93,8 +95,9 @@ function runFitWithPolling(
     if (taskId !== null) {
       try {
         await api.cancelFitTask(taskId);
-      } catch (e: any) {
-        console.warn("cancelFitTask failed:", e?.message);
+      } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : String(e);
+        console.warn("cancelFitTask failed:", message);
       }
     }
   };
@@ -198,8 +201,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setModel(m);
         setLog("info", `Initialized ${Object.keys(m.params || {}).length} BSIM3 params`);
       }
-    } catch (e: any) {
-      setLog("error", `Load failed: ${e.message}`);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setLog("error", `Load failed: ${message}`);
       throw e;
     } finally {
       loadInFlightRef.current = null;
@@ -220,8 +224,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setModel(m);
       setFitResult(null);
       setLog("success", `Project ${pid.slice(0, 8)} selected`);
-    } catch (e: any) {
-      setLog("error", `Select failed: ${e.message}`);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setLog("error", `Select failed: ${message}`);
     }
   }, [setLog]);
 
@@ -260,8 +265,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
               `Fit ${r.success ? "done" : "failed"}: total RMS = ${r.total_rms.toFixed(3)}`);
       const m = await api.getModel(projectId);
       setModel(m);
-    } catch (e: any) {
-      setLog("error", `Fit failed: ${e.message}`);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setLog("error", `Fit failed: ${message}`);
       throw e;
     } finally {
       fitHandleRef.current = null;

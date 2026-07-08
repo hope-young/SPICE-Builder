@@ -15,7 +15,7 @@ export const Input = React.forwardRef<HTMLInputElement, InputProps>(
         style={{
           padding: size === "sm" ? "3px 8px" : "5px 10px",
           border: "1px solid var(--border)",
-          borderRadius: 5,
+          borderRadius: "var(--radius-md)",
           background: "var(--input-bg, #f5f5f5)",
           color: "var(--text)",
           fontSize: 12,
@@ -43,7 +43,7 @@ export const Select = React.forwardRef<HTMLSelectElement, SelectProps>(
         style={{
           padding: size === "sm" ? "3px 8px" : "5px 10px",
           border: "1px solid var(--border)",
-          borderRadius: 5,
+          borderRadius: "var(--radius-md)",
           background: "#f5f5f5",
           color: "var(--text)",
           fontSize: 12,

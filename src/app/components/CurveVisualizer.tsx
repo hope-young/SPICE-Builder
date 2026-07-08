@@ -74,9 +74,10 @@ export function CurveVisualizer() {
         [id]: { ivar: c.ivar, dvar: c.dvar, metadata: c.metadata, loading: false, error: null },
       }));
       setLog("success", `Loaded ${curveType}: ${c.ivar.length} pts`);
-    } catch (e: any) {
-      setData((prev) => ({ ...prev, [id]: { ...prev[id], loading: false, error: e.message } }));
-      setLog("error", `Load ${curveType} failed: ${e.message}`);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setData((prev) => ({ ...prev, [id]: { ...prev[id], loading: false, error: message } }));
+      setLog("error", `Load ${curveType} failed: ${message}`);
     }
   };
 
@@ -170,7 +171,7 @@ function Subplot({ def, data, onRefresh }: {
           title="Refresh curve"
           style={{
             background: "transparent", border: `1px solid ${C.border}`,
-            borderRadius: 4, padding: "2px 6px", cursor: data.loading ? "wait" : "pointer",
+            borderRadius: "var(--radius-sm)", padding: "2px 6px", cursor: data.loading ? "wait" : "pointer",
             display: "flex", alignItems: "center", gap: 3,
             fontSize: 10, color: C.muted, opacity: data.loading ? 0.5 : 1,
           }}
@@ -215,7 +216,7 @@ function Subplot({ def, data, onRefresh }: {
               <Tooltip
                 contentStyle={{
                   background: "#fff", border: `1px solid ${C.border}`,
-                  borderRadius: 4, fontSize: 10,
+                  borderRadius: "var(--radius-sm)", fontSize: 10,
                 }}
                 formatter={(v: number) => v.toExponential(2)}
               />
