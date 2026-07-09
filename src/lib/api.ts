@@ -454,12 +454,15 @@ export async function csvSimulate(
 export async function csvFit(
   csvPath: string,
   opts: {
+    curveType?: "idvg" | "idvd";
     paramNames: string[];
     paramBounds?: Record<string, [number, number]>;
     initialParams?: Record<string, number>;
     vmin: number;
     vmax: number;
     vds?: number;
+    vgs_v?: number;
+    vds_max?: number;
     historyInterval?: number;  // 每 N 步记录一次 history, 0=不记录
     signal?: AbortSignal;       // 用于取消拟合
     powerParams?: PowerMOSSubcktParams;
@@ -492,13 +495,15 @@ export async function csvFit(
 }> {
   const body = {
     csv_path: csvPath,
-    curve_type: "idvg",
+    curve_type: opts.curveType ?? "idvg",
     param_names: opts.paramNames,
     param_bounds: opts.paramBounds ?? {},
     initial_params: opts.initialParams ?? {},
     vmin: opts.vmin,
     vmax: opts.vmax,
     vds: opts.vds ?? 0.5,
+    vgs_v: opts.vgs_v ?? 10.0,
+    vds_max: opts.vds_max ?? 12.0,
     history_interval: opts.historyInterval ?? 0,
     power_params: opts.powerParams,
     stop: opts.stop,
@@ -534,10 +539,10 @@ export async function csvFit(
   return resp.body;
 }
 
-/** 联合拟合: 多条 Id-Vg 曲线 (不同 Vds) 共享参数 */
+/** 联合拟合: 多条 IV 曲线共享参数 */
 export async function csvDualFit(
   opts: {
-    curves: Array<{ csvPath: string; vds: number; vmin: number; vmax: number; weight?: number }>;
+    curves: Array<{ csvPath: string; curveType?: "idvg" | "idvd"; vds: number; vgs_v?: number; vds_max?: number; vmin: number; vmax: number; weight?: number }>;
     paramNames: string[];
     paramBounds?: Record<string, [number, number]>;
     initialParams?: Record<string, number>;
@@ -550,7 +555,10 @@ export async function csvDualFit(
   fitted_params: Record<string, number>;
   curves: Array<{
     csv_path: string;
+    curve_type?: "idvg" | "idvd";
     vds: number;
+    vgs_v?: number;
+    vds_max?: number;
     vmin: number;
     vmax: number;
     weight?: number;
@@ -572,7 +580,10 @@ export async function csvDualFit(
   const body = {
     curves: opts.curves.map(c => ({
       csv_path: c.csvPath,
+      curve_type: c.curveType ?? "idvg",
       vds: c.vds,
+      vgs_v: c.vgs_v ?? 10.0,
+      vds_max: c.vds_max ?? 12.0,
       vmin: c.vmin,
       vmax: c.vmax,
       weight: c.weight ?? 1,
@@ -598,10 +609,10 @@ export async function csvDualFit(
   return resp.body;
 }
 
-/** 流式联合拟合: 多条 Id-Vg 曲线共享参数, 每步返回所有曲线当前 sim/R² */
+/** 流式联合拟合: 多条 IV 曲线共享参数, 每步返回所有曲线当前 sim/R² */
 export async function* csvDualFitStream(
   opts: {
-    curves: Array<{ csvPath: string; vds: number; vmin: number; vmax: number; weight?: number }>;
+    curves: Array<{ csvPath: string; curveType?: "idvg" | "idvd"; vds: number; vgs_v?: number; vds_max?: number; vmin: number; vmax: number; weight?: number }>;
     paramNames: string[];
     paramBounds?: Record<string, [number, number]>;
     initialParams?: Record<string, number>;
@@ -618,7 +629,10 @@ export async function* csvDualFitStream(
   curves?: Array<{
     index: number;
     csv_path: string;
+    curve_type?: "idvg" | "idvd";
     vds: number;
+    vgs_v?: number;
+    vds_max?: number;
     vmin: number;
     vmax: number;
     weight?: number;
@@ -645,7 +659,10 @@ export async function* csvDualFitStream(
   const body = {
     curves: opts.curves.map(c => ({
       csv_path: c.csvPath,
+      curve_type: c.curveType ?? "idvg",
       vds: c.vds,
+      vgs_v: c.vgs_v ?? 10.0,
+      vds_max: c.vds_max ?? 12.0,
       vmin: c.vmin,
       vmax: c.vmax,
       weight: c.weight ?? 1,
@@ -710,13 +727,16 @@ export async function* csvDualFitStream(
 export async function* csvFitStream(
   opts: {
     csvPath: string;
+    curveType?: "idvg" | "idvd";
     paramNames: string[];
     paramBounds?: Record<string, [number, number]>;
     initialParams?: Record<string, number>;
-    protectCurves?: Array<{ csvPath: string; vds: number; vmin: number; vmax: number; weight: number }>;
+    protectCurves?: Array<{ csvPath: string; curve_type?: "idvg" | "idvd"; vds: number; vgs_v?: number; vds_max?: number; vmin: number; vmax: number; weight: number }>;
     vmin: number;
     vmax: number;
     vds?: number;
+    vgs_v?: number;
+    vds_max?: number;
     historyInterval?: number;
     signal?: AbortSignal;
     powerParams?: PowerMOSSubcktParams;
@@ -747,7 +767,7 @@ export async function* csvFitStream(
 }> {
   const body = {
     csv_path: opts.csvPath,
-    curve_type: "idvg",
+    curve_type: opts.curveType ?? "idvg",
     param_names: opts.paramNames,
     param_bounds: opts.paramBounds ?? {},
     initial_params: opts.initialParams ?? {},
@@ -755,19 +775,46 @@ export async function* csvFitStream(
     vmin: opts.vmin,
     vmax: opts.vmax,
     vds: opts.vds ?? 0.5,
+    vgs_v: opts.vgs_v ?? 10.0,
+    vds_max: opts.vds_max ?? 12.0,
     history_interval: opts.historyInterval ?? 1,
     power_params: opts.powerParams,
     stop: opts.stop,
   };
-  try {
-    // Web 和 Tauri 都优先直连本地 FastAPI，以保留 NDJSON streaming。
+
+  async function* streamOnce(): AsyncGenerator<{
+    step: number;
+    kind?: "step" | "final" | "error";
+    params?: Record<string, number>;
+    sim?: number[];
+    r2?: number;
+    fitted_params?: Record<string, number>;
+    ivar?: number[];
+    meas?: number[];
+    r2_linear?: number;
+    r2_log?: number;
+    ftol_metric?: number;
+    xtol_metric?: number;
+    gtol_metric?: number;
+    fit_rms?: number;
+    rms?: number;
+    iterations?: number;
+    nfev?: number;
+    success?: boolean;
+    optimizer_message?: string;
+    error?: string;
+    bound_events?: Array<Record<string, unknown>>;
+  }> {
     const res = await fetch(`${PYTHON_BACKEND}/api/csv/fit/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
       signal: opts.signal,
     });
-    if (!res.ok) throw new Error(`csvFitStream failed: ${res.status}`);
+    if (!res.ok) {
+      const backendText = await res.text().catch(() => "");
+      throw new Error(`csvFitStream failed: ${res.status} ${backendText.slice(0, 800)}`);
+    }
     if (!res.body) throw new Error("csvFitStream failed: response body is not readable");
     const reader = res.body!.getReader();
     const dec = new TextDecoder();
@@ -784,10 +831,24 @@ export async function* csvFitStream(
       }
     }
     if (buf.trim()) yield JSON.parse(buf);
+  }
+
+  try {
+    // Web 和 Tauri 都优先直连本地 FastAPI，以保留 NDJSON streaming。
+    yield* streamOnce();
     return;
   } catch (e) {
     if (opts.signal?.aborted) throw e;
     if (!isTauri()) throw e;
+    const streamMessage = e instanceof Error ? e.message : String(e);
+    if (opts.curveType === "idvd" && /\b422\b/.test(streamMessage)) {
+      await stopBackend();
+      const restarted = await startBackend();
+      if (restarted) {
+        yield* streamOnce();
+        return;
+      }
+    }
 
     // Tauri fallback: IPC 不能稳定传递流式 body，失败时至少返回最终曲线。
     const resp = await cmd<{ status: number; ok: boolean; body: any; error?: string }>("call_api", {
@@ -795,7 +856,10 @@ export async function* csvFitStream(
       endpoint: `/api/csv/fit`,
       body: JSON.stringify(body),
     });
-    if (!resp.ok) throw new Error(`csvFitStream fallback failed: ${resp.status} ${resp.error || ""}`);
+    if (!resp.ok) {
+      const detail = stringifyBackendBody(resp.body) || resp.error || "";
+      throw new Error(`csvFitStream fallback failed: ${resp.status} ${detail}`);
+    }
     if (resp.body) {
       yield {
         kind: "final",

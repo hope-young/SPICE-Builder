@@ -285,7 +285,7 @@ class CsvFitStopConfig(BaseModel):
 class CsvFitRequest(BaseModel):
     """Stateless fit: 区间拟合单个 CSV。"""
     csv_path: str = Field(..., description="CSV path")
-    curve_type: Literal["idvg"] = Field("idvg")
+    curve_type: Literal["idvg", "idvd"] = Field("idvg")
     param_names: List[str]
     param_bounds: Dict[str, List[float]] = Field(default_factory=dict)
     initial_params: Dict[str, float] = Field(default_factory=dict)
@@ -293,6 +293,8 @@ class CsvFitRequest(BaseModel):
     vmin: float
     vmax: float
     vds: float = Field(0.5)
+    vgs_v: float = Field(10.0)
+    vds_max: float = Field(12.0)
     history_interval: int = Field(0, description="每 N 步记录一次 history (0=不记录, 1=每步都记)")
     power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
     stop: CsvFitStopConfig = Field(default_factory=CsvFitStopConfig)
@@ -331,9 +333,12 @@ class CsvFitResponse(BaseModel):
 class CurveSpec(BaseModel):
     """联合拟合中的一条曲线规格"""
     csv_path: str = Field(..., description="CSV 路径")
-    vds: float = Field(..., description="该曲线的 Vds 偏置 (V)")
-    vmin: float = Field(..., description="拟合区间下限 Vgs")
-    vmax: float = Field(..., description="拟合区间上限 Vgs")
+    curve_type: Literal["idvg", "idvd"] = Field("idvg", description="曲线类型")
+    vds: float = Field(0.5, description="IdVg 曲线的 Vds 偏置 (V)")
+    vgs_v: float = Field(10.0, description="IdVd 曲线的 Vgs 偏置 (V)")
+    vds_max: float = Field(12.0, description="IdVd sweep 的最大 Vds (V)")
+    vmin: float = Field(..., description="拟合区间下限")
+    vmax: float = Field(..., description="拟合区间上限")
     weight: float = Field(1.0, description="该曲线在联合 residual 中的权重")
 
 

@@ -188,27 +188,77 @@ def _csv_r2_stop_from_request(req) -> tuple[float, float]:
     return r2(req.stop.r2_log), r2(req.stop.r2_linear)
 
 
-def _load_protection_idvg_curves(req: CsvFitRequest) -> list[SimData]:
+def _load_csv_fit_curve(path: Path, curve_type: str) -> SimData:
+    if curve_type == "idvd":
+        return load_idvd_csv(path)
+    return load_idvg_csv(path)
+
+
+def _set_csv_fit_metadata(
+    sd: SimData,
+    *,
+    curve_type: str,
+    vmin: float,
+    vmax: float,
+    vds: float,
+    vgs_v: float,
+    weight: float,
+) -> None:
+    sd.metadata["vmin"] = vmin
+    sd.metadata["vmax"] = vmax
+    sd.metadata["loss_weight"] = max(0.0, float(weight))
+    if curve_type == "idvd":
+        sd.metadata["vgs_v"] = vgs_v
+    else:
+        sd.metadata["vds_v"] = vds
+
+
+def _eval_csv_fit_curve(
+    sim: LTspiceEvaluator,
+    model: BSIM3Model,
+    sd: SimData,
+    *,
+    curve_type: str,
+    vds: float,
+    vgs_v: float,
+    vds_max: float | None = None,
+) -> np.ndarray:
+    if curve_type == "idvd":
+        max_vds = vds_max if vds_max is not None else float(sd.ivar.max() * 1.1)
+        return sim.eval_idvd(model, sd.ivar, vgs=vgs_v, vds_max=max_vds)
+    return sim.eval_idvg(model, sd.ivar, vds=vds)
+
+
+def _load_protection_curves(req: CsvFitRequest) -> list[SimData]:
     curves: list[SimData] = []
     for i, spec in enumerate(req.protect_curves or []):
         try:
             path = Path(spec.get("csv_path", ""))
             if not path.exists():
                 continue
-            sd = load_idvg_csv(path)
+            curve_type = str(spec.get("curve_type", "idvg")).lower()
+            if curve_type not in ("idvg", "idvd"):
+                curve_type = "idvg"
+            sd = _load_csv_fit_curve(path, curve_type)
             vmin = float(spec.get("vmin", float(sd.ivar.min())))
             vmax = float(spec.get("vmax", float(sd.ivar.max())))
             vds = float(spec.get("vds", sd.metadata.get("vds_v", req.vds)))
+            vgs_v = float(spec.get("vgs_v", sd.metadata.get("vgs_v", req.vgs_v)))
             weight = float(spec.get("weight", 0.35))
             if weight <= 0:
                 continue
             if sd.filter_range(vmin, vmax).ivar.size == 0:
                 continue
             sd.name = f"{sd.name}_protect_{i + 1}"
-            sd.metadata["vmin"] = vmin
-            sd.metadata["vmax"] = vmax
-            sd.metadata["vds_v"] = vds
-            sd.metadata["loss_weight"] = weight
+            _set_csv_fit_metadata(
+                sd,
+                curve_type=curve_type,
+                vmin=vmin,
+                vmax=vmax,
+                vds=vds,
+                vgs_v=vgs_v,
+                weight=weight,
+            )
             sd.metadata["protected"] = True
             curves.append(sd)
         except Exception:
@@ -1064,18 +1114,23 @@ def csv_fit_stream(req: CsvFitRequest):
 
     # 准备数据
     try:
-        sd = load_idvg_csv(Path(req.csv_path))
+        sd = _load_csv_fit_curve(Path(req.csv_path), req.curve_type)
     except Exception as e:
         raise HTTPException(400, f"Failed to parse CSV: {e}")
 
     sd_range = sd.filter_range(req.vmin, req.vmax)
     if sd_range.ivar.size == 0:
         raise HTTPException(400, f"No data in range [{req.vmin}, {req.vmax}]")
-    sd.metadata["vmin"] = req.vmin
-    sd.metadata["vmax"] = req.vmax
-    sd.metadata["vds_v"] = req.vds
-    sd.metadata["loss_weight"] = 1.0
-    protected_sds = _load_protection_idvg_curves(req)
+    _set_csv_fit_metadata(
+        sd,
+        curve_type=req.curve_type,
+        vmin=req.vmin,
+        vmax=req.vmax,
+        vds=req.vds,
+        vgs_v=req.vgs_v,
+        weight=1.0,
+    )
+    protected_sds = _load_protection_curves(req)
 
     model = BSIM3Model(name="EVAL")
     _apply_param_bounds(model, req.param_bounds)
@@ -1127,7 +1182,15 @@ def csv_fit_stream(req: CsvFitRequest):
         try:
             opt = _csv_optimizer_from_request(req)
             result = stage.run(opt)
-            sim_full = sim.eval_idvg(model, sd.ivar, vds=req.vds)
+            sim_full = _eval_csv_fit_curve(
+                sim,
+                model,
+                sd,
+                curve_type=req.curve_type,
+                vds=req.vds,
+                vgs_v=req.vgs_v,
+                vds_max=req.vds_max,
+            )
             arr_meas = np.asarray(sd.dvar, dtype=float)
             arr_sim = np.asarray(sim_full, dtype=float)
             valid = (arr_meas > 0) & np.isfinite(arr_sim)
@@ -1183,11 +1246,8 @@ def csv_fit(req: CsvFitRequest):
     if not path.exists():
         raise HTTPException(404, f"CSV not found: {req.csv_path}")
 
-    if req.curve_type != "idvg":
-        raise HTTPException(400, "csv/fit 仅支持 idvg")
-
     try:
-        sd = load_idvg_csv(path)
+        sd = _load_csv_fit_curve(path, req.curve_type)
     except Exception as e:
         raise HTTPException(400, f"Failed to parse CSV: {e}")
 
@@ -1195,11 +1255,16 @@ def csv_fit(req: CsvFitRequest):
     sd_range = sd.filter_range(req.vmin, req.vmax)
     if sd_range.ivar.size == 0:
         raise HTTPException(400, f"No data in range [{req.vmin}, {req.vmax}]")
-    sd.metadata["vmin"] = req.vmin
-    sd.metadata["vmax"] = req.vmax
-    sd.metadata["vds_v"] = req.vds
-    sd.metadata["loss_weight"] = 1.0
-    protected_sds = _load_protection_idvg_curves(req)
+    _set_csv_fit_metadata(
+        sd,
+        curve_type=req.curve_type,
+        vmin=req.vmin,
+        vmax=req.vmax,
+        vds=req.vds,
+        vgs_v=req.vgs_v,
+        weight=1.0,
+    )
+    protected_sds = _load_protection_curves(req)
 
     model = BSIM3Model(name="EVAL")
     _apply_param_bounds(model, req.param_bounds)
@@ -1227,7 +1292,15 @@ def csv_fit(req: CsvFitRequest):
     result = stage.run(opt)
 
     # 用最终模型跑全段仿真
-    sim_full = sim.eval_idvg(model, sd.ivar, vds=req.vds)
+    sim_full = _eval_csv_fit_curve(
+        sim,
+        model,
+        sd,
+        curve_type=req.curve_type,
+        vds=req.vds,
+        vgs_v=req.vgs_v,
+        vds_max=req.vds_max,
+    )
 
     # 全段 linear R² (基于全段 ivar/sim/meas, 不只是拟合区间)
     arr_meas = np.asarray(sd.dvar, dtype=float)
@@ -1291,7 +1364,7 @@ def csv_fit(req: CsvFitRequest):
 
 @router.post("/csv/dual_fit", response_model=DualFitResponse)
 def csv_dual_fit(req: DualFitRequest):
-    """联合拟合: 多条 Id-Vg 曲线共享一组参数。
+    """联合拟合: 多条 IV 曲线共享一组参数。
 
     每条曲线在自己的 [vmin, vmax] 内贡献 residual, 优化器最小化所有曲线
     的加权总 residual。R² 停止条件要求所有参与曲线同时达标。
@@ -1307,18 +1380,27 @@ def csv_dual_fit(req: DualFitRequest):
         if not path.exists():
             raise HTTPException(404, f"CSV not found: {c.csv_path}")
         try:
-            sd = load_idvg_csv(path)
+            sd = _load_csv_fit_curve(path, c.curve_type)
         except Exception as e:
             raise HTTPException(400, f"Failed to parse {c.csv_path}: {e}")
 
         if sd.filter_range(c.vmin, c.vmax).ivar.size == 0:
             raise HTTPException(400, f"No data in [{c.vmin}, {c.vmax}] in {c.csv_path}")
 
-        sd.name = f"IdVg_joint_{i + 1}_Vds{float(c.vds):g}"
-        sd.metadata["vmin"] = c.vmin
-        sd.metadata["vmax"] = c.vmax
-        sd.metadata["vds_v"] = c.vds
-        sd.metadata["loss_weight"] = max(0.0, float(c.weight))
+        sd.name = (
+            f"IdVd_joint_{i + 1}_Vgs{float(c.vgs_v):g}"
+            if c.curve_type == "idvd"
+            else f"IdVg_joint_{i + 1}_Vds{float(c.vds):g}"
+        )
+        _set_csv_fit_metadata(
+            sd,
+            curve_type=c.curve_type,
+            vmin=c.vmin,
+            vmax=c.vmax,
+            vds=c.vds,
+            vgs_v=c.vgs_v,
+            weight=c.weight,
+        )
         sds.append(sd)
 
     model = BSIM3Model(name="EVAL_DUAL")
@@ -1354,7 +1436,15 @@ def csv_dual_fit(req: DualFitRequest):
     log_sim_parts: list[np.ndarray] = []
 
     for c, sd in zip(req.curves, sds):
-        sim_arr = sim.eval_idvg(model, sd.ivar, vds=c.vds)
+        sim_arr = _eval_csv_fit_curve(
+            sim,
+            model,
+            sd,
+            curve_type=c.curve_type,
+            vds=c.vds,
+            vgs_v=c.vgs_v,
+            vds_max=c.vds_max,
+        )
         m = np.asarray(sd.dvar, dtype=float)
         s = np.asarray(sim_arr, dtype=float)
         mask = stage._fit_mask(sd, s)
@@ -1372,7 +1462,10 @@ def csv_dual_fit(req: DualFitRequest):
             r2_lin = 0.0
         curve_results.append({
             "csv_path": c.csv_path,
+            "curve_type": c.curve_type,
             "vds": c.vds,
+            "vgs_v": c.vgs_v,
+            "vds_max": c.vds_max,
             "vmin": c.vmin,
             "vmax": c.vmax,
             "weight": c.weight,
@@ -1440,17 +1533,26 @@ def csv_dual_fit_stream(req: DualFitRequest):
         if not path.exists():
             raise HTTPException(404, f"CSV not found: {c.csv_path}")
         try:
-            sd = load_idvg_csv(path)
+            sd = _load_csv_fit_curve(path, c.curve_type)
         except Exception as e:
             raise HTTPException(400, f"Failed to parse {c.csv_path}: {e}")
         if sd.filter_range(c.vmin, c.vmax).ivar.size == 0:
             raise HTTPException(400, f"No data in [{c.vmin}, {c.vmax}] in {c.csv_path}")
 
-        sd.name = f"IdVg_joint_{i + 1}_Vds{float(c.vds):g}"
-        sd.metadata["vmin"] = c.vmin
-        sd.metadata["vmax"] = c.vmax
-        sd.metadata["vds_v"] = c.vds
-        sd.metadata["loss_weight"] = max(0.0, float(c.weight))
+        sd.name = (
+            f"IdVd_joint_{i + 1}_Vgs{float(c.vgs_v):g}"
+            if c.curve_type == "idvd"
+            else f"IdVg_joint_{i + 1}_Vds{float(c.vds):g}"
+        )
+        _set_csv_fit_metadata(
+            sd,
+            curve_type=c.curve_type,
+            vmin=c.vmin,
+            vmax=c.vmax,
+            vds=c.vds,
+            vgs_v=c.vgs_v,
+            weight=c.weight,
+        )
         sds.append(sd)
 
     model = BSIM3Model(name="EVAL_DUAL_STREAM")
@@ -1484,7 +1586,10 @@ def csv_dual_fit_stream(req: DualFitRequest):
             curves.append({
                 "index": idx,
                 "csv_path": c.csv_path,
+                "curve_type": c.curve_type,
                 "vds": c.vds,
+                "vgs_v": c.vgs_v,
+                "vds_max": c.vds_max,
                 "vmin": c.vmin,
                 "vmax": c.vmax,
                 "ivar": sd.ivar.tolist(),
@@ -1521,7 +1626,15 @@ def csv_dual_fit_stream(req: DualFitRequest):
             log_sim_parts: list[np.ndarray] = []
 
             for idx, (c, sd) in enumerate(zip(req.curves, sds)):
-                sim_arr = sim.eval_idvg(model, sd.ivar, vds=c.vds)
+                sim_arr = _eval_csv_fit_curve(
+                    sim,
+                    model,
+                    sd,
+                    curve_type=c.curve_type,
+                    vds=c.vds,
+                    vgs_v=c.vgs_v,
+                    vds_max=c.vds_max,
+                )
                 m = np.asarray(sd.dvar, dtype=float)
                 s = np.asarray(sim_arr, dtype=float)
                 mask = stage._fit_mask(sd, s)
@@ -1540,7 +1653,10 @@ def csv_dual_fit_stream(req: DualFitRequest):
                 final_curves.append({
                     "index": idx,
                     "csv_path": c.csv_path,
+                    "curve_type": c.curve_type,
                     "vds": c.vds,
+                    "vgs_v": c.vgs_v,
+                    "vds_max": c.vds_max,
                     "vmin": c.vmin,
                     "vmax": c.vmax,
                     "weight": c.weight,

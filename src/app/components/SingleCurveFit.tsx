@@ -52,8 +52,11 @@ function readStoredWidth(key: string, fallback: number, min: number, max: number
 }
 
 type StopPreset = "fast" | "balanced" | "precise" | "custom";
+type CurveType = "idvg" | "idvd";
 type FitTargetId = "idvg" | "idvd" | "bv" | "diode" | "cv" | "qg" | "dpt";
 type LayoutMode = "grid" | "vertical" | "horizontal";
+
+const IDVD_DEFAULT_VGS = [5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 10];
 
 const FIT_TARGET_TEMPLATES: Array<{
   id: FitTargetId;
@@ -73,8 +76,8 @@ const FIT_TARGET_TEMPLATES: Array<{
     id: "idvd",
     label: "IdVd / Output",
     hint: "Vgs 可自定义",
-    children: ["IdVd @ Vgs=5V", "IdVd @ Vgs=6V", "IdVd @ Vgs=10V"],
-    implemented: false,
+    children: IDVD_DEFAULT_VGS.map(vgs => `IdVd @ Vgs=${Number.parseFloat(vgs.toPrecision(6)).toString()}V`),
+    implemented: true,
   },
   {
     id: "bv",
@@ -147,7 +150,7 @@ const WORKBENCH_MENUS: Record<string, string[]> = {
   文件: ["导入 CSV", "导出结果", "—", "关闭项目"],
   编辑: ["重置当前参数", "锁定已拟合参数"],
   视图: ["Grid 多图布局", "Vertical 纵向布局", "Horizontal 横向布局"],
-  拟合: ["仿真当前 Step", "拟合当前 Step", "拟合勾选 IdVg", "停止拟合"],
+  拟合: ["仿真当前 Step", "拟合当前 Step", "拟合勾选 Steps", "停止拟合"],
   帮助: ["关于 SpiceBuilder"],
 };
 
@@ -180,7 +183,7 @@ function WorkbenchMenuBar({
     if (item === "Horizontal 横向布局") onLayout("horizontal");
     if (item === "仿真当前 Step") onAction("simulate");
     if (item === "拟合当前 Step") onAction("fit-current");
-    if (item === "拟合勾选 IdVg") onAction("fit-selected");
+    if (item === "拟合勾选 Steps") onAction("fit-selected");
     if (item === "停止拟合") onAction("stop");
     if (item === "关于 SpiceBuilder") onAction("about");
   };
@@ -389,7 +392,7 @@ function WorkbenchToolbar({
       <ToolButton disabled={!canSimulate} onClick={() => onAction("simulate")} title="用当前参数仿真当前 step">
         <Activity size={13} />Simulate
       </ToolButton>
-      <ToolButton primary disabled={!canFit || isRunning} onClick={() => onAction("fit-selected")} title="一个已加载 step 时执行单拟合，两个及以上执行联合 IdVg 拟合">
+      <ToolButton primary disabled={!canFit || isRunning} onClick={() => onAction("fit-selected")} title="一个已加载 step 时执行单拟合，两个及以上执行联合拟合">
         <Play size={13} />Fit Selected
       </ToolButton>
       <ToolButton disabled={!isRunning} onClick={() => onAction("stop")} title="停止当前拟合，并保存当前最好结果">
@@ -420,7 +423,10 @@ type FitHistoryPoint = {
 type TransferStep = {
   id: string;
   name: string;
+  curveType: CurveType;
   vds: number;
+  vgs: number;
+  vdsMax: number;
   csvPath: string;
   raw: CurveRaw | null;
   simCurve: number[];
@@ -438,9 +444,12 @@ type TransferStep = {
 export type StepRuntimeSummary = {
   id: string;
   status: "empty" | "loaded" | "simulated" | "fitted" | "running";
+  curveType: CurveType;
   csvPath: string;
   pts: number;
   vds: number;
+  vgs: number;
+  vdsMax: number;
   vmin: number;
   vmax: number;
   r2Log: number | null;
@@ -448,16 +457,25 @@ export type StepRuntimeSummary = {
   rms: number | null;
 };
 
-function makeTransferStep(index: number, vds: number, id?: string, name?: string): TransferStep {
+function makeTransferStep(
+  index: number,
+  bias: number,
+  id?: string,
+  name?: string,
+  curveType: CurveType = "idvg",
+): TransferStep {
   return {
     id: id ?? `step-${Date.now()}-${index}`,
-    name: name ?? `IdVg @ Vds=${vds}V`,
-    vds,
+    name: name ?? (curveType === "idvd" ? `IdVd @ Vgs=${bias}V` : `IdVg @ Vds=${bias}V`),
+    curveType,
+    vds: curveType === "idvg" ? bias : 0.5,
+    vgs: curveType === "idvd" ? bias : 10.0,
+    vdsMax: 12.0,
     csvPath: "",
     raw: null,
     simCurve: [],
-    vmin: 3.5,
-    vmax: 5.0,
+    vmin: curveType === "idvd" ? 0.0 : 3.5,
+    vmax: curveType === "idvd" ? 12.0 : 5.0,
     status: "empty",
     rms: null,
     r2Log: null,
@@ -559,6 +577,26 @@ function parseBiasVoltage(bias: string | undefined, fallback: number): number {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function initialFitRange(values: number[], curveType: CurveType): [number, number] {
+  const finite = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (finite.length === 0) return curveType === "idvd" ? [0, 1] : [3.5, 5.0];
+  const lo = finite[0];
+  const hi = finite[finite.length - 1];
+  if (!(hi > lo)) {
+    const pad = Math.max(Math.abs(hi) * 0.05, curveType === "idvd" ? 0.1 : 0.05);
+    return [lo - pad, hi + pad];
+  }
+  const q = (p: number) => finite[Math.min(finite.length - 1, Math.max(0, Math.round((finite.length - 1) * p)))];
+  let nextMin = q(curveType === "idvd" ? 0.2 : 0.4);
+  let nextMax = q(curveType === "idvd" ? 0.85 : 0.6);
+  if (!(nextMax > nextMin)) {
+    nextMin = lo + (hi - lo) * (curveType === "idvd" ? 0.15 : 0.35);
+    nextMax = lo + (hi - lo) * (curveType === "idvd" ? 0.85 : 0.65);
+  }
+  if (!(nextMax > nextMin)) return [lo, hi];
+  return [Number(nextMin.toPrecision(6)), Number(nextMax.toPrecision(6))];
+}
+
 export function SingleCurveFit({
   hideChrome = false,
   hideFitTargetsPanel = false,
@@ -637,6 +675,8 @@ export function SingleCurveFit({
   const [vmin, setVmin] = useState(3.5);
   const [vmax, setVmax] = useState(5.0);
   const [vds, setVds] = useState(0.5);  // 曲线 1 的 Vds 偏置 (V)
+  const [vgs, setVgs] = useState(10.0);  // IdVd 的固定 Vgs 偏置 (V)
+  const [vdsMax, setVdsMax] = useState(12.0);  // IdVd 的 Vds sweep 上限
   const [dragging, setDragging] = useState<null | "min" | "max">(null);
 
   // ---- 参数 ----
@@ -806,12 +846,14 @@ export function SingleCurveFit({
     vmin,
     vmax,
     vds,
+    vgs,
+    vdsMax,
     rms: fitRMS,
     r2Log: fitR2,
     r2Linear: fitR2Linear,
     fitHistory,
     ...overrides,
-  }), [steps, activeStep, csvPath, raw, simCurve, vmin, vmax, vds, fitRMS, fitR2, fitR2Linear, fitHistory]);
+  }), [steps, activeStep, csvPath, raw, simCurve, vmin, vmax, vds, vgs, vdsMax, fitRMS, fitR2, fitR2Linear, fitHistory]);
 
   const updateActiveStep = useCallback((overrides: Partial<TransferStep> = {}) => {
     setSteps(prev => prev.map((step, idx) => (
@@ -824,6 +866,8 @@ export function SingleCurveFit({
             vmin,
             vmax,
             vds,
+            vgs,
+            vdsMax,
             rms: fitRMS,
             r2Log: fitR2,
             r2Linear: fitR2Linear,
@@ -832,7 +876,7 @@ export function SingleCurveFit({
           }
         : step
     )));
-  }, [activeStep, csvPath, raw, simCurve, vmin, vmax, vds, fitRMS, fitR2, fitR2Linear, fitHistory]);
+  }, [activeStep, csvPath, raw, simCurve, vmin, vmax, vds, vgs, vdsMax, fitRMS, fitR2, fitR2Linear, fitHistory]);
 
   const loadStepIntoEditor = useCallback((step: TransferStep) => {
     setCsvPath(step.csvPath);
@@ -841,6 +885,8 @@ export function SingleCurveFit({
     setVmin(step.vmin);
     setVmax(step.vmax);
     setVds(step.vds);
+    setVgs(step.vgs);
+    setVdsMax(step.vdsMax);
     setFitRMS(step.rms);
     setFitR2(step.r2Log);
     setFitR2Linear(step.r2Linear);
@@ -878,12 +924,17 @@ export function SingleCurveFit({
       return;
     }
 
-    const nextVds = parseBiasVoltage(externalSelectedStep.bias, steps[steps.length - 1]?.vds ?? 0.5);
+    const nextCurveType: CurveType = externalSelectedStep.type === "IdVd" ? "idvd" : "idvg";
+    const nextBias = parseBiasVoltage(
+      externalSelectedStep.bias,
+      nextCurveType === "idvd" ? (steps[steps.length - 1]?.vgs ?? 10.0) : (steps[steps.length - 1]?.vds ?? 0.5),
+    );
     const next = makeTransferStep(
       steps.length + 1,
-      nextVds,
+      nextBias,
       externalSelectedStep.id,
       externalSelectedStep.label,
+      nextCurveType,
     );
     setSteps(prev => prev.map((step, i) => i === activeStep ? saved : step).concat(next));
     loadStepIntoEditor(next);
@@ -1158,9 +1209,10 @@ export function SingleCurveFit({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadCsvData = useCallback(async (path: string) => {
+    const activeCurveType = steps[activeStep]?.curveType ?? (externalSelectedStep?.type === "IdVd" ? "idvd" : "idvg");
     setCsvPath(path);
     setLog("info", `Loading CSV: ${path}`);
-    const r = await csvLoad(path);
+    const r = await csvLoad(path, { curveType: activeCurveType });
     console.log("[loadCsvData] received", r.ivar.length, "points, path:", path);
     console.log("[loadCsvData] first ivar/dvar:", r.ivar[0], r.dvar[0], r.ivar[r.ivar.length-1], r.dvar[r.dvar.length-1]);
     setLog("success", `Loaded ${r.ivar.length} pts from ${path.split(/[/\\]/).pop()}`);
@@ -1168,14 +1220,18 @@ export function SingleCurveFit({
     const nextRaw = { ivar: r.ivar, dvar: r.dvar, meta: r.metadata };
     setRaw(nextRaw);
     const metadataVds = Number((r.metadata as any)?.vds_v);
+    const metadataVgs = Number((r.metadata as any)?.vgs_v);
     const nextVds = Number.isFinite(metadataVds) ? metadataVds : vds;
+    const nextVgs = Number.isFinite(metadataVgs) ? metadataVgs : vgs;
+    const nextVdsMax = activeCurveType === "idvd" && Number.isFinite(b) ? Math.max(b, vdsMax) : vdsMax;
 
-    const nextVmin = Math.round((a + (b - a) * 0.4) * 2) / 2;
-    const nextVmax = Math.round((a + (b - a) * 0.6) * 2) / 2;
+    const [nextVmin, nextVmax] = initialFitRange(r.ivar, activeCurveType);
     const nextSim = new Array(r.ivar.length).fill(0);
     setVmin(nextVmin);
     setVmax(nextVmax);
     setVds(nextVds);
+    setVgs(nextVgs);
+    setVdsMax(nextVdsMax);
     setSimCurve(nextSim);
     setFitRMS(null);
     setFitR2(null);
@@ -1185,19 +1241,22 @@ export function SingleCurveFit({
     setAnimPlaying(false);
     setSteps(prev => prev.map((step, idx) => idx === activeStep ? {
       ...step,
+      curveType: activeCurveType,
       csvPath: path,
       raw: nextRaw,
       simCurve: nextSim,
       vmin: nextVmin,
       vmax: nextVmax,
       vds: nextVds,
+      vgs: nextVgs,
+      vdsMax: nextVdsMax,
       status: "loaded",
       rms: null,
       r2Log: null,
       r2Linear: null,
       fitHistory: [],
     } : step));
-  }, [activeStep, setLog, vds]);
+  }, [activeStep, externalSelectedStep?.type, setLog, steps, vds, vgs, vdsMax]);
 
   const onLoad = useCallback(async () => {
     setLoading(true);
@@ -1268,7 +1327,9 @@ export function SingleCurveFit({
       .filter(step => step.status === "fitted" || step.status === "loaded" || step.status === "simulated")
       .map(step => ({
         name: step.name,
+        curveType: step.curveType,
         vds: step.vds,
+        vgs: step.vgs,
         vmin: step.vmin,
         vmax: step.vmax,
         pts: step.raw?.ivar.length ?? 0,
@@ -1284,7 +1345,7 @@ export function SingleCurveFit({
       .join("\n");
     const stepLines = fittedStepSummaries.length > 0
       ? fittedStepSummaries.map(step => (
-        `* Step: ${step.name}, Vds=${fmtParam(step.vds)}V, range=${fmtParam(step.vmin)}-${fmtParam(step.vmax)}V, pts=${step.pts}` +
+        `* Step: ${step.name}, ${step.curveType === "idvd" ? `Vgs=${fmtParam(step.vgs)}V` : `Vds=${fmtParam(step.vds)}V`}, range=${fmtParam(step.vmin)}-${fmtParam(step.vmax)}V, pts=${step.pts}` +
         `${step.r2Log != null ? `, R2log=${step.r2Log.toFixed(4)}` : ""}` +
         `${step.r2Linear != null ? `, R2lin=${step.r2Linear.toFixed(4)}` : ""}`
       )).join("\n")
@@ -1366,6 +1427,7 @@ export function SingleCurveFit({
   // ---- 实时 LTspice 仿真（防抖 300ms）----
   const doSim = useCallback(async (params: Record<string, number>) => {
     if (!csvPath) return;
+    const activeCurveType = steps[activeStep]?.curveType ?? "idvg";
     simAbortRef.current?.abort();
     const abort = new AbortController();
     const runId = simRunIdRef.current + 1;
@@ -1374,9 +1436,11 @@ export function SingleCurveFit({
     setSimulating(true);
     try {
       const r = await csvSimulate(csvPath, {
-        curveType: "idvg",
+        curveType: activeCurveType,
         paramOverrides: params,
         vds,
+        vgs_v: vgs,
+        vds_max: vdsMax,
         powerParams,
         signal: abort.signal,
       });
@@ -1399,7 +1463,7 @@ export function SingleCurveFit({
         setSimulating(false);
       }
     }
-  }, [activeStep, csvPath, vds, powerParams, setLog]);
+  }, [activeStep, csvPath, vds, vgs, vdsMax, powerParams, setLog, steps]);
 
   // 参数变化 -> 防抖刷新 sim
   const [simulating, setSimulating] = useState(false);
@@ -1545,7 +1609,10 @@ export function SingleCurveFit({
       .filter(step => step.status === "fitted" && step.csvPath && step.raw)
       .map(step => ({
         csvPath: step.csvPath,
+        curve_type: step.curveType,
         vds: step.vds,
+        vgs_v: step.vgs,
+        vds_max: step.vdsMax,
         vmin: step.vmin,
         vmax: step.vmax,
         weight: protectWeight,
@@ -1616,6 +1683,8 @@ export function SingleCurveFit({
         vmin,
         vmax,
         vds,
+        vgs,
+        vdsMax,
         status: "fitted",
         rms: point.fit_rms,
         r2Log: point.r2_log,
@@ -1650,17 +1719,19 @@ export function SingleCurveFit({
     let committedEarlyStop = false;
     try {
       const params = fitParamNames;
+      const activeCurveType = steps[activeStep]?.curveType ?? "idvg";
+      const activeTargetId: FitTargetId = activeCurveType === "idvd" ? "idvd" : "idvg";
       if (!csvPath || !raw) {
         setFitting(false);
         return;
       }
-      if (!selectedFitTargets.has("idvg")) {
-        setLog("warn", "IdVg / Transfer 未勾选，无法执行当前 IdVg 拟合。");
+      if (!selectedFitTargets.has(activeTargetId)) {
+        setLog("warn", `${activeCurveType === "idvd" ? "IdVd / Output" : "IdVg / Transfer"} 未勾选，无法执行当前 step 拟合。`);
         setFitting(false);
         return;
       }
       if (!isStepSelectedForFit(steps[activeStep])) {
-        setLog("warn", "当前 IdVg step 未勾选，不会参与拟合。请先在左侧 tree 勾选该 step。");
+        setLog("warn", "当前 step 未勾选，不会参与拟合。请先在左侧 tree 勾选该 step。");
         setFitting(false);
         return;
       }
@@ -1670,18 +1741,20 @@ export function SingleCurveFit({
         return;
       }
       const protectText = protectedCurves.length > 0 ? `, protect=${protectedCurves.length} step(s), weight=${protectWeight}` : "";
-      setLog("info", `Fit start: Vds=${vds}V, range [${vmin.toFixed(2)}, ${vmax.toFixed(2)}] V${protectText}, AA=${powerParams.active_area_mm2}mm², pitch=${powerParams.cell_pitch_um}µm, stop=R²log:${fitStopPayload.r2_log.toFixed(3)}, R²lin:${fitStopPayload.r2_linear.toFixed(3)}, ftol:${fmtTol(fitStopPayload.ftol)}, xtol:${fmtTol(fitStopPayload.xtol)}, gtol:${fmtTol(fitStopPayload.gtol)}, max_nfev:${fitStopPayload.max_nfev}, params=${params.join(",")}`);
+      const biasText = activeCurveType === "idvd" ? `Vgs=${vgs}V` : `Vds=${vds}V`;
+      setLog("info", `Fit start: ${biasText}, range [${vmin.toFixed(2)}, ${vmax.toFixed(2)}] V${protectText}, AA=${powerParams.active_area_mm2}mm², pitch=${powerParams.cell_pitch_um}µm, stop=R²log:${fitStopPayload.r2_log.toFixed(3)}, R²lin:${fitStopPayload.r2_linear.toFixed(3)}, ftol:${fmtTol(fitStopPayload.ftol)}, xtol:${fmtTol(fitStopPayload.xtol)}, gtol:${fmtTol(fitStopPayload.gtol)}, max_nfev:${fitStopPayload.max_nfev}, params=${params.join(",")}`);
       setSimulating(true);
       let stepCount = 0;
       const streamedHistory: FitHistoryPoint[] = [];
       let lastBoundEventCount = 0;
       for await (const ev of csvFitStream({
         csvPath,
+        curveType: activeCurveType,
         paramNames: params,
         paramBounds: fitParamBounds,
         initialParams: pvals,
         protectCurves: protectedCurves,
-        vmin, vmax, vds, historyInterval: 1,
+        vmin, vmax, vds, vgs_v: vgs, vds_max: vdsMax, historyInterval: 1,
         stop: fitStopPayload,
         powerParams,
         signal: abort.signal,
@@ -1754,6 +1827,8 @@ export function SingleCurveFit({
               vmin,
               vmax,
               vds,
+              vgs,
+              vdsMax,
               status: "fitted",
               rms: ev.rms ?? null,
               r2Log,
@@ -1796,21 +1871,22 @@ export function SingleCurveFit({
       setSimulating(false);
       setFitting(false);
     }
-  }, [activeStep, csvPath, raw, fitParamNames, fitParamBounds, protectedCurves, protectWeight, fitStopPayload, powerParams, pvals, selectedFitTargets, steps, vmin, vmax, vds, setLog, applyActiveFitHistory, lockParamsAfterFit, isStepSelectedForFit]);
+  }, [activeStep, csvPath, raw, fitParamNames, fitParamBounds, protectedCurves, protectWeight, fitStopPayload, powerParams, pvals, selectedFitTargets, steps, vmin, vmax, vds, vgs, vdsMax, setLog, applyActiveFitHistory, lockParamsAfterFit, isStepSelectedForFit]);
 
   const onJointFit = useCallback(async () => {
     const saved = currentStepPatch();
     const materialized = steps.map((step, idx) => idx === activeStep ? saved : step);
-    if (!selectedFitTargets.has("idvg")) {
-      setLog("warn", "IdVg / Transfer 未勾选，当前只有 IdVg 已接入真实拟合。");
-      return;
-    }
     const loadedSteps = materialized
       .map((step, idx) => ({ step, idx }))
-      .filter(({ step }) => isStepSelectedForFit(step) && step.csvPath && step.raw);
+      .filter(({ step }) => (
+        isStepSelectedForFit(step) &&
+        selectedFitTargets.has(step.curveType === "idvd" ? "idvd" : "idvg") &&
+        step.csvPath &&
+        step.raw
+      ));
 
     if (loadedSteps.length < 2) {
-      setLog("warn", "IdVg joint fit needs at least 2 checked and loaded steps");
+      setLog("warn", "Joint fit needs at least 2 checked and loaded steps");
       return;
     }
 
@@ -1857,7 +1933,10 @@ export function SingleCurveFit({
       ));
       setSteps(preparedSteps);
       const curveText = loadedSteps
-        .map(({ step }, i) => `Step${i + 1}:Vds=${step.vds}V,[${step.vmin.toFixed(2)},${step.vmax.toFixed(2)}]`)
+        .map(({ step }, i) => {
+          const bias = step.curveType === "idvd" ? `Vgs=${step.vgs}V` : `Vds=${step.vds}V`;
+          return `Step${i + 1}:${step.curveType.toUpperCase()},${bias},[${step.vmin.toFixed(2)},${step.vmax.toFixed(2)}]`;
+        })
         .join("; ");
       setLog("info", `Joint fit start: ${loadedSteps.length} steps, ${curveText}, params=${params.join(",")}`);
 
@@ -1870,7 +1949,10 @@ export function SingleCurveFit({
       for await (const ev of csvDualFitStream({
         curves: loadedSteps.map(({ step }) => ({
           csvPath: step.csvPath,
+          curveType: step.curveType,
           vds: step.vds,
+          vgs_v: step.vgs,
+          vds_max: step.vdsMax,
           vmin: step.vmin,
           vmax: step.vmax,
           weight: 1.0,
@@ -2005,7 +2087,7 @@ export function SingleCurveFit({
       setSimulating(false);
       setFitting(false);
     }
-  }, [activeStep, fitParamNames, currentStepPatch, fitParamBounds, fitStopPayload, pvals, powerParams, selectedFitTargets, setLog, steps, applyActiveFitHistory, lockParamsAfterFit]);
+  }, [activeStep, fitParamNames, currentStepPatch, fitParamBounds, fitStopPayload, pvals, powerParams, selectedFitTargets, setLog, steps, applyActiveFitHistory, lockParamsAfterFit, isStepSelectedForFit]);
 
   // ---- 图表数据 (动画时显示动画帧的 sim) ----
   const chartData = useMemo(() => {
@@ -2071,9 +2153,14 @@ export function SingleCurveFit({
     const saved = currentStepPatch();
     return steps.filter((step, idx) => {
       const s = idx === activeStep ? saved : step;
-      return Boolean(isStepSelectedForFit(s) && s.csvPath && s.raw);
+      return Boolean(
+        isStepSelectedForFit(s) &&
+        selectedFitTargets.has(s.curveType === "idvd" ? "idvd" : "idvg") &&
+        s.csvPath &&
+        s.raw
+      );
     }).length;
-  }, [activeStep, currentStepPatch, steps, isStepSelectedForFit]);
+  }, [activeStep, currentStepPatch, steps, isStepSelectedForFit, selectedFitTargets]);
   const fitScopeSummary = useMemo(() => {
     const selected = FIT_TARGET_TEMPLATES.filter(item => selectedFitTargets.has(item.id));
     const count = selected.length;
@@ -2142,10 +2229,12 @@ export function SingleCurveFit({
     });
   }, [runWorkbenchAction]);
 
-  const canWorkbenchSimulate = Boolean(raw && !fitting && !simulating && selectedFitTargets.has("idvg"));
+  const activeCurveType = steps[activeStep]?.curveType ?? "idvg";
+  const activeTargetId: FitTargetId = activeCurveType === "idvd" ? "idvd" : "idvg";
+  const canWorkbenchSimulate = Boolean(raw && !fitting && !simulating && selectedFitTargets.has(activeTargetId));
   const canWorkbenchFit = Boolean(
-    selectedFitTargets.has("idvg") &&
-    ((raw && isStepSelectedForFit(steps[activeStep])) || loadedStepCount >= 2)
+    (raw && isStepSelectedForFit(steps[activeStep]) && selectedFitTargets.has(activeTargetId)) ||
+    loadedStepCount >= 2
   );
   const workbenchIsRunning = fitting || simulating;
   const targetConfigStep = externalSelectedStep?.id
@@ -2154,7 +2243,7 @@ export function SingleCurveFit({
   const targetConfigFileName = targetConfigStep?.csvPath
     ? targetConfigStep.csvPath.split(/[/\\]/).pop()
     : "";
-  const isTargetLoadSupported = !externalSelectedStep?.type || externalSelectedStep.type === "IdVg";
+  const isTargetLoadSupported = !externalSelectedStep?.type || externalSelectedStep.type === "IdVg" || externalSelectedStep.type === "IdVd";
   const canLoadTargetCsv = (
     !loading &&
     !workbenchIsRunning &&
@@ -2185,7 +2274,7 @@ export function SingleCurveFit({
       loading,
       isRunning: workbenchIsRunning,
       loadedStepCount,
-      activeStepName: steps[activeStep]?.name ?? `IdVg @ Vds=${vds}V`,
+      activeStepName: steps[activeStep]?.name ?? (activeCurveType === "idvd" ? `IdVd @ Vgs=${vgs}V` : `IdVg @ Vds=${vds}V`),
     });
   }, [
     activeStep,
@@ -2198,6 +2287,8 @@ export function SingleCurveFit({
     raw,
     simulating,
     steps,
+    activeCurveType,
+    vgs,
     vds,
     workbenchIsRunning,
   ]);
@@ -2210,9 +2301,12 @@ export function SingleCurveFit({
       return {
         id: liveStep.id,
         status: workbenchIsRunning && idx === activeStep ? "running" : liveStep.status,
+        curveType: liveStep.curveType,
         csvPath: liveStep.csvPath,
         pts: liveStep.raw?.ivar.length ?? 0,
         vds: liveStep.vds,
+        vgs: liveStep.vgs,
+        vdsMax: liveStep.vdsMax,
         vmin: liveStep.vmin,
         vmax: liveStep.vmax,
         r2Log: liveStep.r2Log,
@@ -2242,7 +2336,7 @@ export function SingleCurveFit({
           layout={workbenchLayout}
           isRunning={fitting}
           loadedCount={loadedStepCount}
-          activeStepName={steps[activeStep]?.name ?? `IdVg @ Vds=${vds}V`}
+          activeStepName={steps[activeStep]?.name ?? (activeCurveType === "idvd" ? `IdVd @ Vgs=${vgs}V` : `IdVg @ Vds=${vds}V`)}
           canImport={!loading && !fitting}
           canSimulate={canWorkbenchSimulate}
           canFit={canWorkbenchFit}
@@ -2344,7 +2438,7 @@ export function SingleCurveFit({
           fontWeight: 600, fontSize: 13,
           display: "flex", alignItems: "center", gap: 8,
         }}>
-          {isExportPanelVisible ? "SPICE Model Preview" : `Curves Plot · ${steps[activeStep]?.name ?? `IdVg @ Vds=${vds}V`}`}
+          {isExportPanelVisible ? "SPICE Model Preview" : `Curves Plot · ${steps[activeStep]?.name ?? (activeCurveType === "idvd" ? `IdVd @ Vgs=${vgs}V` : `IdVg @ Vds=${vds}V`)}`}
           {dragging && <span style={{ fontSize: 10, color: "var(--primary)" }}>拖动 {dragging === "min" ? "min" : "max"} 线...</span>}
         </div>
         <div ref={chartPaneRef} style={{ flex: 1, minHeight: 400, display: "flex", flexDirection: "column", background: "#fff", overflow: "hidden", position: "relative" }}>
@@ -2425,7 +2519,9 @@ export function SingleCurveFit({
                 }}
               >
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2, position: "relative", zIndex: 12 }}>
-                  <div style={{ fontSize: 10, color: "var(--muted)", flex: 1 }}>Vds = {vds} V</div>
+                  <div style={{ fontSize: 10, color: "var(--muted)", flex: 1 }}>
+                    {activeCurveType === "idvd" ? `Vgs = ${vgs} V` : `Vds = ${vds} V`}
+                  </div>
                   <div style={{ display: "inline-flex", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden" }}>
                     {(["linear", "log"] as const).map(mode => (
                       <button
@@ -2460,7 +2556,7 @@ export function SingleCurveFit({
                     />
                     <Tooltip
                       formatter={(v: number) => Number(v).toExponential(3)}
-                      labelFormatter={v => `Vgs=${(v as number).toFixed(3)}`}
+                      labelFormatter={v => `${activeCurveType === "idvd" ? "Vds" : "Vgs"}=${(v as number).toFixed(3)}`}
                       contentStyle={{ fontSize: 11 }}
                     />
                     <Legend wrapperStyle={{ fontSize: 11 }} />
@@ -2701,13 +2797,19 @@ export function SingleCurveFit({
                     <label style={{ fontSize: 12, color: WB.textSm }}>
                       {externalSelectedStep.type === "IdVg" ? "Vds (V)" : "Vgs (V)"}
                       <input
-                        type="text"
-                        value={externalSelectedStep.bias || "?"}
+                        type="number"
+                        value={targetConfigStep?.curveType === "idvd" ? vgs : vds}
                         placeholder="?"
+                        step={0.1}
+                        onChange={e => {
+                          const value = Number(e.target.value);
+                          if (targetConfigStep?.curveType === "idvd") setVgs(value);
+                          else setVds(value);
+                        }}
                         style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}
                       />
                     </label>
-                    <label style={{ fontSize: 12, color: WB.textSm }}>Range<input type="text" value={externalSelectedStep.range || "?"} readOnly style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px", backgroundColor: WB.pageBg }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Range<input type="text" value={`${targetConfigStep?.curveType === "idvd" ? "Vds" : "Vgs"} ${vmin}-${vmax}V`} readOnly style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px", backgroundColor: WB.pageBg }} /></label>
                   </div>
                 </section>
                 <section>
@@ -2757,7 +2859,11 @@ export function SingleCurveFit({
                   </Button>
                 </section>
                 <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                  <label style={{ fontSize: 12, color: WB.textSm }}>Vds (V)<input type="number" value={vds} step={0.1} onChange={e => setVds(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  {activeCurveType === "idvd" ? (
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Vgs (V)<input type="number" value={vgs} step={0.1} onChange={e => setVgs(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  ) : (
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Vds (V)<input type="number" value={vds} step={0.1} onChange={e => setVds(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  )}
                   <label style={{ fontSize: 12, color: WB.textSm }}>Vmin<input type="number" value={vmin} step={0.05} onChange={e => setVmin(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
                   <label style={{ fontSize: 12, color: WB.textSm }}>Vmax<input type="number" value={vmax} step={0.05} onChange={e => setVmax(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
                   <label style={{ fontSize: 12, color: WB.textSm }}>Points<input readOnly value={inRange} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>

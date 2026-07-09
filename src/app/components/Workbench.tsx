@@ -54,6 +54,12 @@ function fmtTreeNumber(value: number): string {
   return Number.isFinite(value) ? Number.parseFloat(value.toPrecision(6)).toString() : "?";
 }
 
+const IDVD_DEFAULT_VGS = [5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 10];
+
+function idvdStepId(vgs: number): string {
+  return `idvd_vgs${String(vgs).replace(".", "p")}`;
+}
+
 type FitStatus = "done" | "loaded" | "queued" | "running" | "empty" | "error";
 
 interface TreeChild {
@@ -698,15 +704,25 @@ export function Workbench(props: WorkbenchProps) {
         bias: "Vds=5V", csvFile: "IdVg.csv", range: "Vgs 0–10V", weight: 1.0, type: "IdVg" },
     ]);
     // 添加默认的 IdVd 步骤
-    initialMap.set("idvd", [
-      { id: "idvd_default", label: "IdVd @ Vgs=10V", status: "empty", r2: null, pts: 0,
-        bias: "Vgs=10V", csvFile: "IdVd.csv", range: "Vds 0–30V", weight: 1.0, type: "IdVd" },
-    ]);
+    initialMap.set("idvd", IDVD_DEFAULT_VGS.map(vgs => ({
+      id: idvdStepId(vgs),
+      label: `IdVd @ Vgs=${fmtTreeNumber(vgs)}V`,
+      status: "empty" as const,
+      r2: null,
+      pts: 0,
+      bias: `Vgs=${fmtTreeNumber(vgs)}V`,
+      csvFile: "IdVd.csv",
+      range: "Vds 0-30V",
+      weight: 1.0,
+      type: "IdVd",
+    })));
     return initialMap;
   });
   const treeData = useTreeData(userSteps);
   const [checkedFeatures, setCheckedFeatures]   = useState<Set<string>>(new Set(["idvg", "idvd"]));
-  const [checkedChildren, setCheckedChildren]   = useState<Set<string>>(new Set(["idvg_05", "idvg_5"]));
+  const [checkedChildren, setCheckedChildren]   = useState<Set<string>>(
+    () => new Set(["idvg_05", "idvg_5", ...IDVD_DEFAULT_VGS.map(idvdStepId)])
+  );
   const [expandedFeatures, setExpandedFeatures] = useState<Set<string>>(new Set(["idvg", "idvd"]));
   const [selectedId, setSelectedId] = useState<string | null>("idvg_5");
 
@@ -838,10 +854,10 @@ export function Workbench(props: WorkbenchProps) {
             status,
             r2,
             pts: summary.pts,
-            bias: step.type === "IdVg" ? `Vds=${fmtTreeNumber(summary.vds)}V` : step.bias,
+            bias: summary.curveType === "idvd" ? `Vgs=${fmtTreeNumber(summary.vgs)}V` : `Vds=${fmtTreeNumber(summary.vds)}V`,
             csvFile,
             range: summary.pts > 0
-              ? `Vgs ${fmtTreeNumber(summary.vmin)}-${fmtTreeNumber(summary.vmax)}V`
+              ? `${summary.curveType === "idvd" ? "Vds" : "Vgs"} ${fmtTreeNumber(summary.vmin)}-${fmtTreeNumber(summary.vmax)}V`
               : step.range,
           };
           changed = changed || JSON.stringify(nextStep) !== JSON.stringify(step);
