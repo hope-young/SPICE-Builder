@@ -54,6 +54,13 @@ function fmtTreeNumber(value: number): string {
   return Number.isFinite(value) ? Number.parseFloat(value.toPrecision(6)).toString() : "?";
 }
 
+function axisLabelForSummary(summary: StepRuntimeSummary): string {
+  if (summary.curveType === "idvd") return "Vds";
+  if (summary.curveType === "cv") return "Vds";
+  if (summary.curveType === "bv") return summary.bvKind === "bvdss" ? "Vds" : "Vgs";
+  return "Vgs";
+}
+
 const IDVD_DEFAULT_VGS = [5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 10];
 
 function idvdStepId(vgs: number): string {
@@ -128,21 +135,18 @@ function useTreeData(userSteps: Map<string, TreeChild[]>) {
         id: "idvd", label: "IdVd / Output", tag: "live", canAdd: true, addLabel: "Add Vgs step",
         children: updateStepStatus(userSteps.get("idvd") || [], "idvd"),
       },
-      { id: "bv",         label: "BV / Leakage",      tag: "next", canAdd: false, children: [
-        { id: "bvdss",  label: "BVDSS", status: "empty", r2: null, pts: 0, type: "BV" },
-        { id: "idss",   label: "IDSS",  status: "empty", r2: null, pts: 0, type: "BV" },
-        { id: "igss_p", label: "IGSS+", status: "empty", r2: null, pts: 0, type: "BV" },
-        { id: "igss_n", label: "IGSS−", status: "empty", r2: null, pts: 0, type: "BV" },
-      ]},
+      {
+        id: "bv", label: "BV / Leakage", tag: "live", canAdd: false,
+        children: userSteps.get("bv") || [],
+      },
       { id: "bodydiode",  label: "Body Diode",        tag: "next", canAdd: false, children: [
         { id: "isvsd", label: "Is-Vsd", status: "empty", r2: null, pts: 0, type: "BodyDiode" },
         { id: "qrr",   label: "Qrr",    status: "empty", r2: null, pts: 0, type: "BodyDiode" },
       ]},
-      { id: "cv", label: "CV / Capacitance", tag: "next", canAdd: false, children: [
-        { id: "ciss", label: "Ciss", status: "empty", r2: null, pts: 0, type: "CV" },
-        { id: "coss", label: "Coss", status: "empty", r2: null, pts: 0, type: "CV" },
-        { id: "crss", label: "Crss", status: "empty", r2: null, pts: 0, type: "CV" },
-      ]},
+      {
+        id: "cv", label: "CV / Capacitance", tag: "live", canAdd: false,
+        children: userSteps.get("cv") || [],
+      },
       { id: "qg", label: "Qg / Gate Charge", tag: "next", canAdd: false, children: [
         { id: "qg_total", label: "Qg total", status: "empty", r2: null, pts: 0, type: "Qg" },
         { id: "qgs",      label: "Qgs",      status: "empty", r2: null, pts: 0, type: "Qg" },
@@ -716,14 +720,30 @@ export function Workbench(props: WorkbenchProps) {
       weight: 1.0,
       type: "IdVd",
     })));
+    initialMap.set("bv", [
+      { id: "bvdss", label: "BVDSS", status: "empty", r2: null, pts: 0,
+        bias: "Vgs=0V", csvFile: "BVDSS.csv", range: "Vds sweep", weight: 1.0, type: "BV" },
+      { id: "bvgss_p", label: "BVGSS+", status: "empty", r2: null, pts: 0,
+        bias: "Vgs=+", csvFile: "BVGSS_pos.csv", range: "Vgs+ sweep", weight: 1.0, type: "BV" },
+      { id: "bvgss_n", label: "BVGSS-", status: "empty", r2: null, pts: 0,
+        bias: "Vgs=-", csvFile: "BVGSS_neg.csv", range: "Vgs- sweep", weight: 1.0, type: "BV" },
+    ]);
+    initialMap.set("cv", [
+      { id: "ciss", label: "Ciss", status: "empty", r2: null, pts: 0,
+        bias: "f=1MHz", csvFile: "Ciss.csv", range: "Vds sweep", weight: 1.0, type: "CV" },
+      { id: "coss", label: "Coss", status: "empty", r2: null, pts: 0,
+        bias: "f=1MHz", csvFile: "Coss.csv", range: "Vds sweep", weight: 1.0, type: "CV" },
+      { id: "crss", label: "Crss", status: "empty", r2: null, pts: 0,
+        bias: "f=1MHz", csvFile: "Crss.csv", range: "Vds sweep", weight: 1.0, type: "CV" },
+    ]);
     return initialMap;
   });
   const treeData = useTreeData(userSteps);
-  const [checkedFeatures, setCheckedFeatures]   = useState<Set<string>>(new Set(["idvg", "idvd"]));
+  const [checkedFeatures, setCheckedFeatures]   = useState<Set<string>>(new Set(["idvg", "idvd", "bv", "cv"]));
   const [checkedChildren, setCheckedChildren]   = useState<Set<string>>(
-    () => new Set(["idvg_05", "idvg_5", ...IDVD_DEFAULT_VGS.map(idvdStepId)])
+    () => new Set(["idvg_05", "idvg_5", ...IDVD_DEFAULT_VGS.map(idvdStepId), "bvdss", "bvgss_p", "bvgss_n", "ciss", "coss", "crss"])
   );
-  const [expandedFeatures, setExpandedFeatures] = useState<Set<string>>(new Set(["idvg", "idvd"]));
+  const [expandedFeatures, setExpandedFeatures] = useState<Set<string>>(new Set(["idvg", "idvd", "bv", "cv"]));
   const [selectedId, setSelectedId] = useState<string | null>("idvg_5");
 
   // Power Cell 配置
@@ -854,10 +874,16 @@ export function Workbench(props: WorkbenchProps) {
             status,
             r2,
             pts: summary.pts,
-            bias: summary.curveType === "idvd" ? `Vgs=${fmtTreeNumber(summary.vgs)}V` : `Vds=${fmtTreeNumber(summary.vds)}V`,
+            bias: summary.curveType === "idvd"
+              ? `Vgs=${fmtTreeNumber(summary.vgs)}V`
+              : summary.curveType === "bv"
+                ? step.bias
+                : summary.curveType === "cv"
+                  ? step.bias
+                : `Vds=${fmtTreeNumber(summary.vds)}V`,
             csvFile,
             range: summary.pts > 0
-              ? `${summary.curveType === "idvd" ? "Vds" : "Vgs"} ${fmtTreeNumber(summary.vmin)}-${fmtTreeNumber(summary.vmax)}V`
+              ? `${axisLabelForSummary(summary)} ${fmtTreeNumber(summary.vmin)}-${fmtTreeNumber(summary.vmax)}V`
               : step.range,
           };
           changed = changed || JSON.stringify(nextStep) !== JSON.stringify(step);

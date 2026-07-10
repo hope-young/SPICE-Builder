@@ -334,7 +334,8 @@ class LTspiceBackend:
 
     def __init__(self,
                  ltspice_path: Optional[str] = None,
-                 cleanup: bool = True):
+                 cleanup: bool = True,
+                 verbose: bool = False):
         self.ltspice_path = ltspice_path or find_ltspice()
         if not self.ltspice_path:
             raise RuntimeError(
@@ -342,6 +343,7 @@ class LTspiceBackend:
                 "下载地址: https://www.analog.com/en/design-center/design-tools-and-calculators/ltspice-simulator.html"
             )
         self.cleanup = cleanup
+        self.verbose = verbose
         # Tracks tmpdirs explicitly retained by the caller (cleanup=False).
         # These are still wiped on interpreter shutdown so the process never
         # exits with leaked temp directories.
@@ -542,16 +544,18 @@ class LTspiceBackend:
             measurements[name] = val
         return measurements
 
-    def parse_raw(self, raw_path: Path) -> dict:
+    def parse_raw(self, raw_path: Path, complex_mode: str = "magnitude") -> dict:
         """解析 .raw 波形文件（ASCII 格式）
 
         Returns: {trace_name: {ivar: ndarray, dvar: ndarray}}
 
         Handles both real-only traces (".tran", ".dc") and complex
-        traces (".ac").  For complex traces, each value is the
-        pair "real,imag"; we store the magnitude (sqrt(re^2+im^2)) so
-        downstream consumers (e.g. eval_cv's C = |I|/(2*pi*f*|V|)) can
-        read a single float per datapoint.
+        traces (".ac").  For complex traces, each value is the pair
+        "real,imag".  complex_mode controls the scalar projection:
+          - "magnitude": sqrt(re^2+im^2), the legacy behavior
+          - "imag_abs": abs(imag), useful for C-V extraction because
+            conductive small-signal current should not be counted as
+            capacitance.
 
         The layout in the file (when Flags include "complex"):
             0  v0_re, v0_im
@@ -598,7 +602,11 @@ class LTspiceBackend:
             if "," in tok:
                 try:
                     re, im = tok.split(",", 1)
-                    return float((float(re) ** 2 + float(im) ** 2) ** 0.5)
+                    re_f = float(re)
+                    im_f = float(im)
+                    if complex_mode == "imag_abs":
+                        return abs(im_f)
+                    return float((re_f ** 2 + im_f ** 2) ** 0.5)
                 except ValueError:
                     return float("nan")
             try:
@@ -714,12 +722,60 @@ Vgs G 0 {vgs_v}
 """
 
 
+def gen_bv_netlist(model_path: str,
+                   kind: str = "bvdss",
+                   vmin: float = 0.0,
+                   vmax: float = 120.0,
+                   vstep: float = 0.5,
+                   model_name: str = "nmos1",
+                   use_subckt: bool = True) -> str:
+    """Generate breakdown/leakage DC sweep netlists.
+
+    kind:
+        bvdss   - sweep Vds with gate/source grounded, read I(Vds)
+        bvgss_p - sweep positive Vgs with drain/source grounded, read I(Vgs)
+        bvgss_n - sweep negative Vgs with drain/source grounded, read I(Vgs)
+    """
+    abs_path = Path(model_path).resolve()
+    if use_subckt:
+        x_line = f"X1 D G 0 {model_name}"
+    else:
+        x_line = f"M1 D G 0 0 {model_name}"
+    norm_kind = kind.lower()
+    step = abs(float(vstep)) if vstep else 0.1
+    if norm_kind == "bvdss":
+        return f"""* BVDSS scan
+.include "{abs_path}"
+{x_line}
+Vds D 0 0
+Vgs G 0 0
+.dc Vds {vmin} {vmax} {step}
+.print dc V(d) I(Vds)
+.end
+"""
+    if norm_kind in ("bvgss_p", "bvgss_n"):
+        start = vmin
+        stop = vmax
+        signed_step = step if stop >= start else -step
+        return f"""* BVGSS scan ({norm_kind})
+.include "{abs_path}"
+{x_line}
+Vds D 0 0
+Vgs G 0 0
+.dc Vgs {start} {stop} {signed_step}
+.print dc V(g) I(Vgs)
+.end
+"""
+    raise ValueError(f"Unknown BV kind: {kind!r}")
+
+
 def gen_cv_netlist(model_path: str,
                    vds_max: float = 25.0,
                    vds_step: float = 0.5,
                    freq: float = 1e6,
                    model_name: str = "nmos1",
                    use_subckt: bool = True,
+                   vds_values: list[float] | np.ndarray | None = None,
                    cap_type: str = "ciss") -> str:
     """生成 C-V 扫描的 netlist (3 种 cap_type 各自匹配测量)
 
@@ -731,53 +787,73 @@ def gen_cv_netlist(model_path: str,
         crss  - Iac 1A AC at drain, Rgs_short 短 G 到地, 测 V(D_int)
                 C = |I|/(omega*|V(D_int)|) = Cgd (only)
 
-    .step Vds 1..vds_max (skip 0; at Vds=0 the cap is fully discharged
-    and Iac has nothing to flow through).  .ac list f runs AC at a
-    single frequency f (1 MHz by default) so the output is a clean
-    (nVds, nVars) matrix instead of cross-product.
+    When vds_values is provided, the .step uses an explicit list so the raw
+    points line up with the CSV / GUI grid used by the fitter.  Otherwise it
+    falls back to a regular 1..vds_max sweep.  .ac list f runs AC at a single
+    frequency f (1 MHz by default).
     """
     abs_path = Path(model_path).resolve()
     if use_subckt:
-        x_line = f"X1 D_int G_int 0 {model_name}"
+        x_line = f"X1 D G 0 {model_name}"
     else:
-        x_line = f"M1 D_int G_int 0 0 {model_name}"
+        x_line = f"M1 D G 0 0 {model_name}"
+
+    def _fmt_num(value: float) -> str:
+        return f"{float(value):.12g}"
+
+    if vds_values is not None:
+        vals = np.asarray(vds_values, dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            tokens = [_fmt_num(v) for v in vals]
+            lines = [".step param VDSVAL list"]
+            current = "+ "
+            for token in tokens:
+                piece = token + " "
+                if len(current) + len(piece) > 110:
+                    lines.append(current.rstrip())
+                    current = "+ " + piece
+                else:
+                    current += piece
+            if current.strip() != "+":
+                lines.append(current.rstrip())
+            step_line = "\n".join(lines)
+        else:
+            step_line = f".step param VDSVAL 1 {_fmt_num(vds_max)} {_fmt_num(vds_step)}"
+    else:
+        step_line = f".step param VDSVAL 1 {_fmt_num(vds_max)} {_fmt_num(vds_step)}"
 
     if cap_type == "ciss":
-        return f"""* C-V Ciss: Iac on gate, drain shorted
+        return f"""* C-V Ciss: 1V AC on gate, drain DC-biased and AC-grounded
 .include "{abs_path}"
 {x_line}
-Rds_short D_int 0 0.001
-Rgs_pull G_int 0 1G
-Iac G_int 0 DC 0 AC 1 sin(0 1 {freq:g})
-Vac D 0 DC 1 AC 1 sin(0 1 {freq:g})
-.step param Vds 1 {vds_max} {vds_step}
+Vd_bias D 0 {{VDSVAL}}
+Vg_ac G 0 DC 0 AC 1
+{step_line}
 .ac list {freq:g}
-.print ac V(G_int) I(Iac)
+.print ac I(Vg_ac)
 .end
 """
     elif cap_type == "coss":
-        return f"""* C-V Coss: Iac on drain, gate shorted
+        return f"""* C-V Coss: 1V AC on drain, gate/source AC-grounded
 .include "{abs_path}"
 {x_line}
-Rgs_short G_int 0 0.001
-Rds_pull D_int 0 1G
-Iac D_int 0 DC 0 AC 1 sin(0 1 {freq:g})
-Vac D 0 DC 1 AC 1 sin(0 1 {freq:g})
-.step param Vds 1 {vds_max} {vds_step}
+Vg_short G 0 0
+Vd_ac D 0 DC {{VDSVAL}} AC 1
+{step_line}
 .ac list {freq:g}
-.print ac V(D_int) I(Iac)
+.print ac I(Vd_ac)
 .end
 """
     elif cap_type == "crss":
-        return f"""* C-V Crss: Iac on drain, gate shorted
+        return f"""* C-V Crss: drain AC drive, read gate short-circuit current
 .include "{abs_path}"
 {x_line}
-Rgs_short G_int 0 0.001
-Iac D_int 0 DC 0 AC 1 sin(0 1 {freq:g})
-Vac D 0 DC 1 AC 1 sin(0 1 {freq:g})
-.step param Vds 1 {vds_max} {vds_step}
+Vg_short G 0 0
+Vd_ac D 0 DC {{VDSVAL}} AC 1
+{step_line}
 .ac list {freq:g}
-.print ac V(D_int) I(Iac)
+.print ac I(Vg_short)
 .end
 """
     else:

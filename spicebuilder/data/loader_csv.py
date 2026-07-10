@@ -32,6 +32,10 @@ HEADER_ALIASES = {
     "is": "is_a",
     "sourcecurrent": "is_a",
     "sourcecurrenta": "is_a",
+    "iga": "ig_a",
+    "ig": "ig_a",
+    "gatecurrent": "ig_a",
+    "gatecurrenta": "ig_a",
     "temperaturec": "temperature_c",
     "tempc": "temperature_c",
     "tj": "temperature_c",
@@ -220,6 +224,57 @@ def load_idvd_csv(path: str | Path, temperature_c: int = 25) -> SimData:
 
     sd = SimData.from_idvd(rows, vgs_v=float(vgs_v), temperature_c=temperature_c)
     sd.metadata.update(_base_metadata(path, columns, header_map, inferred))
+    return sd
+
+
+def _infer_bv_kind(path: str | Path, columns: list[str], rows: list[dict]) -> str:
+    stem = Path(path).stem.lower()
+    if "bvdss" in stem:
+        return "bvdss"
+    if "bvgss" in stem or "vgss" in stem:
+        if any(tok in stem for tok in ("neg", "minus", "negative", "_n", "-n")) or "-" in stem:
+            return "bvgss_n"
+        return "bvgss_p"
+    if "ig_a" in columns or "vgs_v" in columns:
+        vals = [float(r["vgs_v"]) for r in rows if r.get("vgs_v") is not None]
+        if vals and sum(vals) / len(vals) < 0:
+            return "bvgss_n"
+        return "bvgss_p"
+    return "bvdss"
+
+
+def load_bv_csv(path: str | Path, kind: str | None = None, temperature_c: int = 25) -> SimData:
+    """CSV columns:
+
+    - BVDSS:  vds_v, id_a, optional temperature_c
+    - BVGSS:  vgs_v, ig_a, optional temperature_c
+    """
+    rows, columns, header_map = _read_csv(path)
+    bv_kind = (kind or _infer_bv_kind(path, columns, rows)).lower()
+    if bv_kind not in {"bvdss", "bvgss_p", "bvgss_n"}:
+        raise ValueError(f"未知 BV 曲线类型: {bv_kind}")
+
+    inferred: list[str] = []
+    if bv_kind == "bvdss":
+        _require_columns(rows, ["vds_v", "id_a"], path)
+        _normalize_numeric(rows, ["vds_v", "id_a", "vgs_v", "temperature_c"], path)
+        if "vgs_v" not in columns:
+            _fill_constant(rows, "vgs_v", 0.0)
+            inferred.append("vgs_v")
+    else:
+        _require_columns(rows, ["vgs_v", "ig_a"], path)
+        _normalize_numeric(rows, ["vgs_v", "ig_a", "vds_v", "temperature_c"], path)
+        if "vds_v" not in columns:
+            _fill_constant(rows, "vds_v", 0.0)
+            inferred.append("vds_v")
+
+    if "temperature_c" not in columns:
+        _fill_constant(rows, "temperature_c", temperature_c)
+        inferred.append("temperature_c")
+
+    sd = SimData.from_bv(rows, kind=bv_kind, temperature_c=temperature_c)
+    sd.metadata.update(_base_metadata(path, columns, header_map, inferred))
+    sd.metadata["bv_kind"] = bv_kind
     return sd
 
 

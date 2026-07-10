@@ -52,6 +52,23 @@ class PowerMOSSubcktParamsRequest(BaseModel):
     cell_pitch_um: float = Field(2.0, description="Cell pitch in micrometers")
 
 
+class CapTableRequest(BaseModel):
+    """Voltage-dependent capacitance table used by the CV wrapper."""
+    name: str
+    voltage_v: List[float] = Field(default_factory=list)
+    capacitance_pf: List[float] = Field(default_factory=list)
+    charge_pc: List[float] = Field(default_factory=list)
+
+
+class PowerCapWrapperRequest(BaseModel):
+    """Residual behavioral capacitance wrapper."""
+    enabled: bool = True
+    mode: str = "residual"
+    cgs: Optional[CapTableRequest] = None
+    cgd: Optional[CapTableRequest] = None
+    cds: Optional[CapTableRequest] = None
+
+
 class ExportRequest(BaseModel):
     """Request payload for POST /projects/{id}/export."""
     format: str = Field("B", description="A: pure BSIM3 .model, B: .subckt wrapper")
@@ -88,6 +105,7 @@ class CsvExportModelRequest(BaseModel):
     model_name: str = Field("BSIM3_core")
     params: Dict[str, float] = Field(default_factory=dict)
     power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
+    cap_wrapper: Optional[PowerCapWrapperRequest] = Field(None)
     include_diode: bool = Field(True)
     rg_ohm: float = Field(1.6)
 
@@ -230,7 +248,9 @@ class FitSingleResponse(BaseModel):
 class LoadCsvRequest(BaseModel):
     """Request payload for POST /projects/{id}/load_csv."""
     csv_path: str = Field(..., description="Absolute path to the CSV file")
-    curve_type: Literal["idvg", "idvd", "cv", "qg", "body_diode"] = Field("idvg")
+    curve_type: Literal["idvg", "idvd", "bv", "cv", "qg", "body_diode"] = Field("idvg")
+    bv_kind: Literal["bvdss", "bvgss_p", "bvgss_n"] = Field("bvdss")
+    cap_type: Literal["ciss", "coss", "crss"] = Field("ciss")
 
 
 class LoadCsvResponse(BaseModel):
@@ -243,18 +263,23 @@ class LoadCsvResponse(BaseModel):
 class CsvLoadRequest(BaseModel):
     """Stateless CSV load: 只读 CSV, 不需要 project state。"""
     csv_path: str = Field(..., description="Absolute path to the CSV file")
-    curve_type: Literal["idvg", "idvd", "cv", "qg", "body_diode"] = Field("idvg")
+    curve_type: Literal["idvg", "idvd", "bv", "cv", "qg", "body_diode"] = Field("idvg")
+    bv_kind: Literal["bvdss", "bvgss_p", "bvgss_n"] = Field("bvdss")
+    cap_type: Literal["ciss", "coss", "crss"] = Field("ciss")
 
 
 class CsvSimulateRequest(BaseModel):
     """Stateless simulate: 给定 CSV + 参数覆盖, 跑 LTspice 返回 sim+meas。"""
     csv_path: str = Field(..., description="CSV path")
-    curve_type: Literal["idvg", "idvd"] = Field("idvg")
+    curve_type: Literal["idvg", "idvd", "bv", "cv"] = Field("idvg")
+    bv_kind: Literal["bvdss", "bvgss_p", "bvgss_n"] = Field("bvdss")
+    cap_type: Literal["ciss", "coss", "crss"] = Field("ciss")
     param_overrides: Dict[str, float] = Field(default_factory=dict)
     vds: float = Field(0.5)
     vgs_v: float = Field(10.0)
     vds_max: float = Field(12.0)
     power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
+    cap_wrapper: Optional[PowerCapWrapperRequest] = Field(None)
 
 
 class CsvLoadResponse(BaseModel):
@@ -285,7 +310,9 @@ class CsvFitStopConfig(BaseModel):
 class CsvFitRequest(BaseModel):
     """Stateless fit: 区间拟合单个 CSV。"""
     csv_path: str = Field(..., description="CSV path")
-    curve_type: Literal["idvg", "idvd"] = Field("idvg")
+    curve_type: Literal["idvg", "idvd", "bv", "cv"] = Field("idvg")
+    bv_kind: Literal["bvdss", "bvgss_p", "bvgss_n"] = Field("bvdss")
+    cap_type: Literal["ciss", "coss", "crss"] = Field("ciss")
     param_names: List[str]
     param_bounds: Dict[str, List[float]] = Field(default_factory=dict)
     initial_params: Dict[str, float] = Field(default_factory=dict)
@@ -333,7 +360,9 @@ class CsvFitResponse(BaseModel):
 class CurveSpec(BaseModel):
     """联合拟合中的一条曲线规格"""
     csv_path: str = Field(..., description="CSV 路径")
-    curve_type: Literal["idvg", "idvd"] = Field("idvg", description="曲线类型")
+    curve_type: Literal["idvg", "idvd", "bv", "cv"] = Field("idvg", description="曲线类型")
+    bv_kind: Literal["bvdss", "bvgss_p", "bvgss_n"] = Field("bvdss", description="BV step type")
+    cap_type: Literal["ciss", "coss", "crss"] = Field("ciss", description="CV capacitance type")
     vds: float = Field(0.5, description="IdVg 曲线的 Vds 偏置 (V)")
     vgs_v: float = Field(10.0, description="IdVd 曲线的 Vgs 偏置 (V)")
     vds_max: float = Field(12.0, description="IdVd sweep 的最大 Vds (V)")
@@ -365,6 +394,27 @@ class DualFitResponse(BaseModel):
     optimizer_message: str = ""
     success: bool = True
     history: List[Dict] = []      # [{step, params, r2_linear_per_curve}, ...]
+
+
+class CvWrapperCurveSpec(BaseModel):
+    csv_path: str
+    cap_type: Literal["ciss", "coss", "crss"] = "ciss"
+    weight: float = 1.0
+
+
+class CsvCvWrapperFitRequest(BaseModel):
+    """Build a residual behavioral CV wrapper from loaded Ciss/Coss/Crss CSVs."""
+    curves: List[CvWrapperCurveSpec] = Field(default_factory=list)
+    csv_path: Optional[str] = Field(None, description="Fallback single CSV path")
+    cap_type: Literal["ciss", "coss", "crss"] = "ciss"
+    params: Dict[str, float] = Field(default_factory=dict)
+    power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
+
+
+class CsvCvWrapperFitResponse(BaseModel):
+    cap_wrapper: Dict[str, Any]
+    curves: List[Dict[str, Any]] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
 
 
 class ErrorResponse(BaseModel):

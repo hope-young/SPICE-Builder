@@ -5,7 +5,7 @@ import { useState, useRef, useEffect } from "react";
 import { Lock, Unlock, RotateCcw } from "lucide-react";
 import { BSIM3_PARAMS } from "../../lib/constants";
 
-const CAT_ORDER = ["Threshold", "Mobility", "Saturation", "OutputRes", "Capacitance", "Junction", "Temperature", "Diode", "Process", "Doping"];
+const CAT_ORDER = ["Threshold", "Mobility", "Saturation", "Parasitic", "OutputRes", "Capacitance", "Junction", "Temperature", "Diode", "GateLeakage", "Process", "Doping"];
 const CATS = CAT_ORDER.filter(c => BSIM3_PARAMS.some(p => p.category === c));
 
 const PARAM_CN: Record<string, { short: string; detail: string }> = {
@@ -26,6 +26,8 @@ const PARAM_CN: Record<string, { short: string; detail: string }> = {
   A0: { short: "体电荷效应", detail: "bulk charge effect 参数。影响饱和区电流形状和高 Vgs 区域曲率。" },
   AGS: { short: "栅偏 A0", detail: "A0 的栅偏依赖项。常用于调整高栅压下的饱和电流形状。" },
   KETA: { short: "体偏 VSAT", detail: "体偏相关的饱和速度修正。单条 Id-Vg 中通常不强约束。" },
+  RD: { short: "漏串联电阻", detail: "漏极串联电阻。会影响大电流区电压降和 Id-Vd 输出特性，导出/导入模型时必须保留。" },
+  RS: { short: "源串联电阻", detail: "源极串联电阻。会反馈到有效 Vgs，影响大电流区电流和转移曲线高端形状。" },
   PCLM: { short: "沟长调制", detail: "沟长调制系数。主要影响输出特性 Id-Vd 的饱和区斜率，对 Id-Vg 单曲线约束较弱。" },
   PDIBLC1: { short: "DIBL 1", detail: "漏致势垒降低参数 1。需要不同 Vds 的 Id-Vg 对比来约束。" },
   PDIBLC2: { short: "DIBL 2", detail: "漏致势垒降低参数 2。影响高漏压下阈值漂移，适合多 Vds 转移曲线拟合。" },
@@ -51,12 +53,15 @@ const PARAM_CN: Record<string, { short: string; detail: string }> = {
   N: { short: "二极管理想因子", detail: "体二极管理想因子。需要二极管 I-V 数据约束。" },
   BV: { short: "击穿电压", detail: "体二极管反向击穿电压。用于击穿/体二极管模型。" },
   IBV: { short: "击穿电流", detail: "达到 BV 时的参考电流。用于反向击穿区域。" },
+  IGS0: { short: "栅漏电流", detail: "栅源击穿模型的参考漏电流。用于 BVGSS+ / BVGSS- 拟合。" },
+  VGSLP: { short: "栅击穿斜率", detail: "栅源击穿后的电流上升软化斜率。数值越小，击穿拐点越陡。" },
+  BVGSP: { short: "正栅击穿", detail: "正向栅源击穿电压，对应 BVGSS+ 曲线。" },
+  BVGSN: { short: "负栅击穿", detail: "负向栅源击穿电压，对应 BVGSS- 曲线。" },
   TOX: { short: "栅氧厚度", detail: "栅氧厚度。影响栅氧电容和沟道电流强度，和 U0/VTH0 可能存在相关性。" },
   XL: { short: "沟长偏差", detail: "有效沟道长度偏差。影响电流尺度和短沟道效应，需谨慎释放。" },
   XW: { short: "沟宽偏差", detail: "有效沟道宽度偏差。影响电流尺度，可能和器件并联倍数/宽度设置互相补偿。" },
   DELTA: { short: "Vds平滑", detail: "有效 Vds 相关平滑参数。用于数值和小 Vds 区域修正。" },
   NSUB: { short: "衬底掺杂", detail: "衬底掺杂浓度。影响阈值和体效应，单曲线拟合中通常与 VTH0/K1 强相关。" },
-  NGATE: { short: "多晶硅掺杂", detail: "栅极掺杂浓度。影响栅耗尽等效应，通常不在常规 Id-Vg 单曲线中释放。" },
 };
 
 function computeStep(lower: number, upper: number): number {

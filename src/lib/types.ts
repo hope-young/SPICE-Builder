@@ -72,9 +72,9 @@ export interface BodyDiodePoint {
 
 // BSIM3 参数定义
 export type ParamCategory =
-  | "Threshold" | "Mobility" | "Saturation" | "OutputRes"
+  | "Threshold" | "Mobility" | "Saturation" | "Parasitic" | "OutputRes"
   | "Capacitance" | "Junction" | "Temperature" | "Diode"
-  | "Process" | "Doping";
+  | "GateLeakage" | "Process" | "Doping";
 
 export interface BSIM3ParamSpec {
   name: string;

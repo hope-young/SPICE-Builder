@@ -138,7 +138,7 @@ class Stage:
                     "本工程禁止 mock 评估。"
                 )
             meas = sd.dvar
-            mask = (meas > 1e-9) & np.isfinite(meas) & np.isfinite(fit)
+            mask = (meas > 1e-30) & np.isfinite(meas) & np.isfinite(fit) & (fit > 0)
 
             # 区间过滤
             if "vmin" in sd.metadata:
@@ -184,6 +184,14 @@ class Stage:
                 elif sd.curve_type == "IdVd":
                     vgs = sd.metadata.get("vgs_v", 10.0)
                     sim_arr = self.simulator.eval_idvd(self.model, sd.ivar, vgs=vgs, vds_max=float(sd.ivar.max() * 1.1))
+                elif sd.curve_type == "BV":
+                    kind = sd.metadata.get("bv_kind", "bvdss")
+                    sim_arr = self.simulator.eval_bv(self.model, sd.ivar, kind=kind)
+                elif sd.curve_type == "CvVds":
+                    cap = sd.metadata.get("cap_type") or "ciss"
+                    sim_arr = self.simulator.eval_cv(self.model, sd.ivar, cap_type=cap)
+                    if sim_arr is None:
+                        continue
                 else:
                     continue
                 sim_curves[sd.name] = sim_arr.tolist()
@@ -317,6 +325,10 @@ class Stage:
                 mask &= sd.ivar >= vgs_min
         if sd.curve_type == "IdVd":
             mask &= sd.ivar >= 0
+        if sd.curve_type == "BV":
+            kind = sd.metadata.get("bv_kind", "bvdss")
+            if kind == "bvdss":
+                mask &= sd.ivar >= 0
         return mask
 
     @staticmethod
@@ -351,6 +363,9 @@ class Stage:
         elif sd.curve_type == "IdVd":
             vgs = sd.metadata.get('vgs_v', 10.0)
             return self.simulator.eval_idvd(self.model, sd.ivar, vgs=vgs)
+        elif sd.curve_type == "BV":
+            kind = sd.metadata.get("bv_kind", "bvdss")
+            return self.simulator.eval_bv(self.model, sd.ivar, kind=kind)
         elif sd.curve_type == "CvVds":
             cap = sd.metadata.get("cap_type") or "ciss"
             return self.simulator.eval_cv(self.model, sd.ivar, cap_type=cap)

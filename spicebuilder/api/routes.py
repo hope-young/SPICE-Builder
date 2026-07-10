@@ -22,13 +22,19 @@ from .models import (
     CsvLoadRequest, CsvLoadResponse, CsvSimulateRequest, CsvSimulateResponse,
     CsvFitRequest, CsvFitResponse,
     DualFitRequest, DualFitResponse, CsvExportModelRequest,
+    CsvCvWrapperFitRequest, CsvCvWrapperFitResponse,
 )
 
 from spicebuilder.data.loader_sdh import load_sdh_excel
 from spicebuilder.data.loader_csv import (
-    load_idvg_csv, load_idvd_csv, load_cv_csv, load_qg_csv, load_body_diode_csv
+    load_idvg_csv, load_idvd_csv, load_bv_csv, load_cv_csv, load_qg_csv, load_body_diode_csv
 )
 from spicebuilder.data.simdata import SimData
+from spicebuilder.models.cap_wrapper import (
+    PowerCapWrapper,
+    fit_residual_cap_wrapper,
+    wrapper_terminal_caps,
+)
 
 
 def _populate_fit_cache(project, engine) -> None:
@@ -129,6 +135,31 @@ def _apply_initial_params(model: BSIM3Model, values: dict | None) -> None:
             continue
 
 
+def _apply_sim_params_unchecked(model: BSIM3Model, values: dict | None) -> tuple[int, list[str]]:
+    """Apply user/model-state parameters exactly for simulation.
+
+    Fit paths clamp values to optimizer bounds before least-squares runs.  A
+    plain simulate, however, should reproduce an imported/exported SPICE model
+    as faithfully as possible, including fitted BSIM values that sit outside
+    the default slider bounds.
+    """
+    if not values:
+        return 0, []
+    applied = 0
+    skipped: list[str] = []
+    for name, val in values.items():
+        try:
+            f = float(val)
+            if not np.isfinite(f):
+                skipped.append(str(name))
+                continue
+            model.set_unchecked(name, f)
+            applied += 1
+        except (KeyError, TypeError, ValueError):
+            skipped.append(str(name))
+    return applied, skipped
+
+
 def _power_params_from_request(
     req,
     base: PowerMOSSubcktParams | None = None,
@@ -151,6 +182,22 @@ def _evaluator_power_params_from_request(req) -> PowerMOSSubcktParams | None:
         req,
         base=PowerMOSSubcktParams(rg_ohm=1.6, cell_count=100, cell_w_m=0.2),
     )
+
+
+def _cap_wrapper_from_request(req) -> PowerCapWrapper | None:
+    payload = getattr(req, "cap_wrapper", None)
+    if payload is None:
+        return None
+    if hasattr(payload, "model_dump"):
+        data = payload.model_dump()
+    elif isinstance(payload, dict):
+        data = payload
+    else:
+        return None
+    wrapper = PowerCapWrapper.from_dict(data)
+    if wrapper and wrapper.enabled:
+        return wrapper
+    return None
 
 
 def _csv_optimizer_from_request(req) -> Optimizer:
@@ -188,9 +235,13 @@ def _csv_r2_stop_from_request(req) -> tuple[float, float]:
     return r2(req.stop.r2_log), r2(req.stop.r2_linear)
 
 
-def _load_csv_fit_curve(path: Path, curve_type: str) -> SimData:
+def _load_csv_fit_curve(path: Path, curve_type: str, bv_kind: str = "bvdss", cap_type: str = "ciss") -> SimData:
     if curve_type == "idvd":
         return load_idvd_csv(path)
+    if curve_type == "bv":
+        return load_bv_csv(path, kind=bv_kind)
+    if curve_type == "cv":
+        return load_cv_csv(path, cap_type=cap_type)
     return load_idvg_csv(path)
 
 
@@ -202,6 +253,8 @@ def _set_csv_fit_metadata(
     vmax: float,
     vds: float,
     vgs_v: float,
+    bv_kind: str = "bvdss",
+    cap_type: str = "ciss",
     weight: float,
 ) -> None:
     sd.metadata["vmin"] = vmin
@@ -209,6 +262,15 @@ def _set_csv_fit_metadata(
     sd.metadata["loss_weight"] = max(0.0, float(weight))
     if curve_type == "idvd":
         sd.metadata["vgs_v"] = vgs_v
+    elif curve_type == "bv":
+        sd.metadata["bv_kind"] = sd.metadata.get("bv_kind", bv_kind)
+        if sd.metadata["bv_kind"] == "bvdss":
+            sd.metadata["vgs_v"] = 0.0
+        else:
+            sd.metadata["vds_v"] = 0.0
+    elif curve_type == "cv":
+        sd.metadata["cap_type"] = sd.metadata.get("cap_type", cap_type)
+        sd.metadata["vds_v"] = vds
     else:
         sd.metadata["vds_v"] = vds
 
@@ -222,10 +284,20 @@ def _eval_csv_fit_curve(
     vds: float,
     vgs_v: float,
     vds_max: float | None = None,
+    bv_kind: str = "bvdss",
+    cap_type: str = "ciss",
 ) -> np.ndarray:
     if curve_type == "idvd":
         max_vds = vds_max if vds_max is not None else float(sd.ivar.max() * 1.1)
         return sim.eval_idvd(model, sd.ivar, vgs=vgs_v, vds_max=max_vds)
+    if curve_type == "bv":
+        return sim.eval_bv(model, sd.ivar, kind=sd.metadata.get("bv_kind", bv_kind))
+    if curve_type == "cv":
+        max_vds = vds_max if vds_max is not None else float(sd.ivar.max())
+        out = sim.eval_cv(model, sd.ivar, vds_max=max_vds, cap_type=sd.metadata.get("cap_type", cap_type))
+        if out is None:
+            raise RuntimeError("LTspice CV evaluation failed")
+        return out
     return sim.eval_idvg(model, sd.ivar, vds=vds)
 
 
@@ -237,9 +309,11 @@ def _load_protection_curves(req: CsvFitRequest) -> list[SimData]:
             if not path.exists():
                 continue
             curve_type = str(spec.get("curve_type", "idvg")).lower()
-            if curve_type not in ("idvg", "idvd"):
+            if curve_type not in ("idvg", "idvd", "bv", "cv"):
                 curve_type = "idvg"
-            sd = _load_csv_fit_curve(path, curve_type)
+            bv_kind = str(spec.get("bv_kind", req.bv_kind))
+            cap_type = str(spec.get("cap_type", req.cap_type))
+            sd = _load_csv_fit_curve(path, curve_type, bv_kind=bv_kind, cap_type=cap_type)
             vmin = float(spec.get("vmin", float(sd.ivar.min())))
             vmax = float(spec.get("vmax", float(sd.ivar.max())))
             vds = float(spec.get("vds", sd.metadata.get("vds_v", req.vds)))
@@ -257,6 +331,8 @@ def _load_protection_curves(req: CsvFitRequest) -> list[SimData]:
                 vmax=vmax,
                 vds=vds,
                 vgs_v=vgs_v,
+                bv_kind=bv_kind,
+                cap_type=cap_type,
                 weight=weight,
             )
             sd.metadata["protected"] = True
@@ -671,15 +747,11 @@ def simulate_curve(project_id: str, req: SimulateRequest):
     # Copy current (possibly fitted) values first
     for name in project.model._values:
         try:
-            sim_model.set(name, project.model.get(name))
+            sim_model.set_unchecked(name, project.model.get(name))
         except (KeyError, ValueError):
             pass
     # Apply user overrides
-    for name, val in req.param_overrides.items():
-        try:
-            sim_model.set(name, val)
-        except (KeyError, ValueError):
-            pass  # Silently skip unknown params
+    applied_params, skipped_params = _apply_sim_params_unchecked(sim_model, req.param_overrides)
 
     ltspice_ok = True
     try:
@@ -693,7 +765,11 @@ def simulate_curve(project_id: str, req: SimulateRequest):
         ltspice_ok = False
         evaluator = None
 
-    metadata = {"ltspice_available": ltspice_ok}
+    metadata = {
+        "ltspice_available": ltspice_ok,
+        "applied_param_count": applied_params,
+        "skipped_params": skipped_params,
+    }
 
     if req.curve_type == "idvg":
         # Choose Vgs grid from dataset
@@ -854,8 +930,10 @@ def load_csv(project_id: str, req: LoadCsvRequest):
             sd = load_idvg_csv(path)
         elif req.curve_type == "idvd":
             sd = load_idvd_csv(path)
+        elif req.curve_type == "bv":
+            sd = load_bv_csv(path, kind=req.bv_kind)
         elif req.curve_type == "cv":
-            sd = load_cv_csv(path)
+            sd = load_cv_csv(path, cap_type=req.cap_type)
         elif req.curve_type == "qg":
             sd = load_qg_csv(path)
         elif req.curve_type == "body_diode":
@@ -994,8 +1072,10 @@ def csv_load(req: CsvLoadRequest):
             sd = load_idvg_csv(path)
         elif req.curve_type == "idvd":
             sd = load_idvd_csv(path)
+        elif req.curve_type == "bv":
+            sd = load_bv_csv(path, kind=req.bv_kind)
         elif req.curve_type == "cv":
-            sd = load_cv_csv(path)
+            sd = load_cv_csv(path, cap_type=req.cap_type)
         elif req.curve_type == "qg":
             sd = load_qg_csv(path)
         elif req.curve_type == "body_diode":
@@ -1049,6 +1129,7 @@ def csv_export_model(req: CsvExportModelRequest):
                 include_diode=req.include_diode,
                 rg_ohm=req.rg_ohm,
                 power_params=_power_params_from_request(req),
+                cap_wrapper=_cap_wrapper_from_request(req),
             )
     except Exception as e:
         raise HTTPException(500, f"Export failed: {e}")
@@ -1068,19 +1149,19 @@ def csv_simulate(req: CsvSimulateRequest):
     try:
         if req.curve_type == "idvg":
             sd = load_idvg_csv(path)
-        else:
+        elif req.curve_type == "idvd":
             sd = load_idvd_csv(path)
+        elif req.curve_type == "bv":
+            sd = load_bv_csv(path, kind=req.bv_kind)
+        else:
+            sd = load_cv_csv(path, cap_type=req.cap_type)
     except Exception as e:
         raise HTTPException(400, f"Failed to parse CSV: {e}")
 
     # 构造全新 BSIM3Model (用 key_params 默认, 但 dataset.key_params 不可用 → 全部默认)
     model = BSIM3Model(name="EVAL")
     # 没法接 init_from_key_params（没数据集），改用 BSIM3Model 默认值
-    for name, val in req.param_overrides.items():
-        try:
-            model.set(name, float(val))
-        except (KeyError, ValueError, TypeError):
-            pass
+    applied_params, skipped_params = _apply_sim_params_unchecked(model, req.param_overrides)
 
     # LTspice 评估
     try:
@@ -1089,11 +1170,18 @@ def csv_simulate(req: CsvSimulateRequest):
             rg_ohm=1.6,
             verbose=False,
             power_params=_evaluator_power_params_from_request(req),
+            cap_wrapper=_cap_wrapper_from_request(req),
         )
         if req.curve_type == "idvg":
             sim_arr = ev.eval_idvg(model, sd.ivar, vds=req.vds)
-        else:
+        elif req.curve_type == "idvd":
             sim_arr = ev.eval_idvd(model, sd.ivar, vgs=req.vgs_v, vds_max=req.vds_max)
+        elif req.curve_type == "bv":
+            sim_arr = ev.eval_bv(model, sd.ivar, kind=sd.metadata.get("bv_kind", req.bv_kind))
+        else:
+            sim_arr = ev.eval_cv(model, sd.ivar, vds_max=req.vds_max, cap_type=sd.metadata.get("cap_type", req.cap_type))
+            if sim_arr is None:
+                raise RuntimeError("LTspice CV evaluation failed")
     except Exception as e:
         raise HTTPException(500, f"LTspice simulate failed: {e}")
 
@@ -1102,7 +1190,131 @@ def csv_simulate(req: CsvSimulateRequest):
         ivar=sd.ivar.tolist(),
         sim=sim_arr.tolist(),
         meas=sd.dvar.tolist(),
-        metadata={"vds_v": req.vds, "vgs_v": req.vgs_v, "param_overrides": req.param_overrides},
+        metadata={
+            "vds_v": req.vds,
+            "vgs_v": req.vgs_v,
+            "bv_kind": sd.metadata.get("bv_kind", req.bv_kind),
+            "cap_type": sd.metadata.get("cap_type", req.cap_type),
+            "param_overrides": req.param_overrides,
+            "applied_param_count": applied_params,
+            "skipped_params": skipped_params,
+        },
+    )
+
+
+def _r2_linear_safe(meas: np.ndarray, sim: np.ndarray) -> float:
+    valid = np.isfinite(meas) & np.isfinite(sim)
+    if valid.sum() <= 1:
+        return 0.0
+    y = meas[valid]
+    yhat = sim[valid]
+    ss_res = float(np.sum((yhat - y) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    return max(0.0, 1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+
+def _r2_log_safe(meas: np.ndarray, sim: np.ndarray) -> float:
+    valid = (meas > 0) & (sim > 0) & np.isfinite(meas) & np.isfinite(sim)
+    if valid.sum() <= 1:
+        return 0.0
+    return _r2_linear_safe(np.log10(meas[valid]), np.log10(sim[valid]))
+
+
+@router.post("/csv/cv_wrapper_fit", response_model=CsvCvWrapperFitResponse)
+def csv_cv_wrapper_fit(req: CsvCvWrapperFitRequest):
+    """Build a residual behavioral capacitance wrapper from CV CSVs."""
+    specs = list(req.curves or [])
+    if not specs:
+        if not req.csv_path:
+            raise HTTPException(400, "curves or csv_path is required")
+        specs = [{"csv_path": req.csv_path, "cap_type": req.cap_type}]  # type: ignore[list-item]
+
+    loaded: dict[str, SimData] = {}
+    warnings: list[str] = []
+    for spec in specs:
+        csv_path = spec.csv_path if hasattr(spec, "csv_path") else str(spec.get("csv_path", ""))
+        cap_type = spec.cap_type if hasattr(spec, "cap_type") else str(spec.get("cap_type", "ciss"))
+        path = Path(csv_path)
+        if not path.exists():
+            raise HTTPException(404, f"CSV not found: {csv_path}")
+        try:
+            loaded[str(cap_type)] = load_cv_csv(path, cap_type=str(cap_type))
+        except Exception as e:
+            raise HTTPException(400, f"Failed to parse CV CSV {csv_path}: {e}")
+
+    if not loaded:
+        raise HTTPException(400, "No CV curves loaded")
+
+    v_parts = [np.asarray(sd.ivar, dtype=float) for sd in loaded.values()]
+    v_grid = np.unique(np.concatenate(v_parts))
+    v_grid = v_grid[np.isfinite(v_grid)]
+    if v_grid.size < 2:
+        raise HTTPException(400, "CV wrapper fit needs at least 2 Vds points")
+    v_grid.sort()
+
+    measured: dict[str, np.ndarray] = {}
+    for cap_type, sd in loaded.items():
+        measured[cap_type] = np.interp(
+            v_grid,
+            np.asarray(sd.ivar, dtype=float),
+            np.asarray(sd.dvar, dtype=float),
+        )
+
+    model = BSIM3Model(name="EVAL")
+    _apply_sim_params_unchecked(model, req.params)
+    pwr = _evaluator_power_params_from_request(req)
+
+    baseline: dict[str, np.ndarray] = {}
+    try:
+        base_ev = LTspiceEvaluator(
+            subckt_name="MY_MOSFET",
+            rg_ohm=1.6,
+            verbose=False,
+            power_params=pwr,
+        )
+        for cap_type in loaded.keys():
+            arr = base_ev.eval_cv(model, v_grid, vds_max=float(v_grid.max()), cap_type=cap_type)
+            baseline[cap_type] = np.asarray(arr, dtype=float) if arr is not None else np.zeros_like(v_grid)
+            if arr is None:
+                warnings.append(f"Baseline LTspice CV failed for {cap_type}; using zero baseline")
+    except Exception as e:
+        warnings.append(f"Baseline LTspice CV failed: {e}; using zero baseline")
+        baseline = {cap_type: np.zeros_like(v_grid) for cap_type in loaded.keys()}
+
+    wrapper = fit_residual_cap_wrapper(v_grid, measured, baseline)
+
+    curve_results: list[dict] = []
+    try:
+        wrapped_ev = LTspiceEvaluator(
+            subckt_name="MY_MOSFET",
+            rg_ohm=1.6,
+            verbose=False,
+            power_params=pwr,
+            cap_wrapper=wrapper,
+        )
+        for cap_type, meas in measured.items():
+            sim_arr = wrapped_ev.eval_cv(model, v_grid, vds_max=float(v_grid.max()), cap_type=cap_type)
+            if sim_arr is None:
+                sim = baseline.get(cap_type, np.zeros_like(v_grid))
+                warnings.append(f"Wrapped LTspice CV failed for {cap_type}; returning baseline")
+            else:
+                sim = np.asarray(sim_arr, dtype=float)
+            curve_results.append({
+                "cap_type": cap_type,
+                "ivar": v_grid.tolist(),
+                "meas": meas.tolist(),
+                "sim": sim.tolist(),
+                "baseline": baseline.get(cap_type, np.zeros_like(v_grid)).tolist(),
+                "r2_linear": _r2_linear_safe(meas, sim),
+                "r2_log": _r2_log_safe(meas, sim),
+            })
+    except Exception as e:
+        raise HTTPException(500, f"CV wrapper LTspice verification failed: {e}")
+
+    return CsvCvWrapperFitResponse(
+        cap_wrapper=wrapper.to_dict(),
+        curves=curve_results,
+        warnings=warnings,
     )
 
 
@@ -1114,7 +1326,7 @@ def csv_fit_stream(req: CsvFitRequest):
 
     # 准备数据
     try:
-        sd = _load_csv_fit_curve(Path(req.csv_path), req.curve_type)
+        sd = _load_csv_fit_curve(Path(req.csv_path), req.curve_type, bv_kind=req.bv_kind, cap_type=req.cap_type)
     except Exception as e:
         raise HTTPException(400, f"Failed to parse CSV: {e}")
 
@@ -1128,6 +1340,8 @@ def csv_fit_stream(req: CsvFitRequest):
         vmax=req.vmax,
         vds=req.vds,
         vgs_v=req.vgs_v,
+        bv_kind=req.bv_kind,
+        cap_type=req.cap_type,
         weight=1.0,
     )
     protected_sds = _load_protection_curves(req)
@@ -1190,6 +1404,8 @@ def csv_fit_stream(req: CsvFitRequest):
                 vds=req.vds,
                 vgs_v=req.vgs_v,
                 vds_max=req.vds_max,
+                bv_kind=req.bv_kind,
+                cap_type=req.cap_type,
             )
             arr_meas = np.asarray(sd.dvar, dtype=float)
             arr_sim = np.asarray(sim_full, dtype=float)
@@ -1247,7 +1463,7 @@ def csv_fit(req: CsvFitRequest):
         raise HTTPException(404, f"CSV not found: {req.csv_path}")
 
     try:
-        sd = _load_csv_fit_curve(path, req.curve_type)
+        sd = _load_csv_fit_curve(path, req.curve_type, bv_kind=req.bv_kind, cap_type=req.cap_type)
     except Exception as e:
         raise HTTPException(400, f"Failed to parse CSV: {e}")
 
@@ -1262,6 +1478,8 @@ def csv_fit(req: CsvFitRequest):
         vmax=req.vmax,
         vds=req.vds,
         vgs_v=req.vgs_v,
+        bv_kind=req.bv_kind,
+        cap_type=req.cap_type,
         weight=1.0,
     )
     protected_sds = _load_protection_curves(req)
@@ -1300,6 +1518,8 @@ def csv_fit(req: CsvFitRequest):
         vds=req.vds,
         vgs_v=req.vgs_v,
         vds_max=req.vds_max,
+        bv_kind=req.bv_kind,
+        cap_type=req.cap_type,
     )
 
     # 全段 linear R² (基于全段 ivar/sim/meas, 不只是拟合区间)
@@ -1380,7 +1600,7 @@ def csv_dual_fit(req: DualFitRequest):
         if not path.exists():
             raise HTTPException(404, f"CSV not found: {c.csv_path}")
         try:
-            sd = _load_csv_fit_curve(path, c.curve_type)
+            sd = _load_csv_fit_curve(path, c.curve_type, bv_kind=c.bv_kind, cap_type=c.cap_type)
         except Exception as e:
             raise HTTPException(400, f"Failed to parse {c.csv_path}: {e}")
 
@@ -1390,7 +1610,11 @@ def csv_dual_fit(req: DualFitRequest):
         sd.name = (
             f"IdVd_joint_{i + 1}_Vgs{float(c.vgs_v):g}"
             if c.curve_type == "idvd"
-            else f"IdVg_joint_{i + 1}_Vds{float(c.vds):g}"
+            else (
+                f"BV_joint_{i + 1}_{c.bv_kind}"
+                if c.curve_type == "bv"
+                else (f"CV_joint_{i + 1}_{c.cap_type}" if c.curve_type == "cv" else f"IdVg_joint_{i + 1}_Vds{float(c.vds):g}")
+            )
         )
         _set_csv_fit_metadata(
             sd,
@@ -1399,6 +1623,8 @@ def csv_dual_fit(req: DualFitRequest):
             vmax=c.vmax,
             vds=c.vds,
             vgs_v=c.vgs_v,
+            bv_kind=c.bv_kind,
+            cap_type=c.cap_type,
             weight=c.weight,
         )
         sds.append(sd)
@@ -1444,6 +1670,8 @@ def csv_dual_fit(req: DualFitRequest):
             vds=c.vds,
             vgs_v=c.vgs_v,
             vds_max=c.vds_max,
+            bv_kind=c.bv_kind,
+            cap_type=c.cap_type,
         )
         m = np.asarray(sd.dvar, dtype=float)
         s = np.asarray(sim_arr, dtype=float)
@@ -1466,6 +1694,8 @@ def csv_dual_fit(req: DualFitRequest):
             "vds": c.vds,
             "vgs_v": c.vgs_v,
             "vds_max": c.vds_max,
+            "bv_kind": c.bv_kind,
+            "cap_type": c.cap_type,
             "vmin": c.vmin,
             "vmax": c.vmax,
             "weight": c.weight,
@@ -1533,7 +1763,7 @@ def csv_dual_fit_stream(req: DualFitRequest):
         if not path.exists():
             raise HTTPException(404, f"CSV not found: {c.csv_path}")
         try:
-            sd = _load_csv_fit_curve(path, c.curve_type)
+            sd = _load_csv_fit_curve(path, c.curve_type, bv_kind=c.bv_kind, cap_type=c.cap_type)
         except Exception as e:
             raise HTTPException(400, f"Failed to parse {c.csv_path}: {e}")
         if sd.filter_range(c.vmin, c.vmax).ivar.size == 0:
@@ -1542,7 +1772,11 @@ def csv_dual_fit_stream(req: DualFitRequest):
         sd.name = (
             f"IdVd_joint_{i + 1}_Vgs{float(c.vgs_v):g}"
             if c.curve_type == "idvd"
-            else f"IdVg_joint_{i + 1}_Vds{float(c.vds):g}"
+            else (
+                f"BV_joint_{i + 1}_{c.bv_kind}"
+                if c.curve_type == "bv"
+                else (f"CV_joint_{i + 1}_{c.cap_type}" if c.curve_type == "cv" else f"IdVg_joint_{i + 1}_Vds{float(c.vds):g}")
+            )
         )
         _set_csv_fit_metadata(
             sd,
@@ -1551,6 +1785,8 @@ def csv_dual_fit_stream(req: DualFitRequest):
             vmax=c.vmax,
             vds=c.vds,
             vgs_v=c.vgs_v,
+            bv_kind=c.bv_kind,
+            cap_type=c.cap_type,
             weight=c.weight,
         )
         sds.append(sd)
@@ -1590,6 +1826,8 @@ def csv_dual_fit_stream(req: DualFitRequest):
                 "vds": c.vds,
                 "vgs_v": c.vgs_v,
                 "vds_max": c.vds_max,
+                "bv_kind": c.bv_kind,
+                "cap_type": c.cap_type,
                 "vmin": c.vmin,
                 "vmax": c.vmax,
                 "ivar": sd.ivar.tolist(),
@@ -1634,6 +1872,8 @@ def csv_dual_fit_stream(req: DualFitRequest):
                     vds=c.vds,
                     vgs_v=c.vgs_v,
                     vds_max=c.vds_max,
+                    bv_kind=c.bv_kind,
+                    cap_type=c.cap_type,
                 )
                 m = np.asarray(sd.dvar, dtype=float)
                 s = np.asarray(sim_arr, dtype=float)
@@ -1657,6 +1897,8 @@ def csv_dual_fit_stream(req: DualFitRequest):
                     "vds": c.vds,
                     "vgs_v": c.vgs_v,
                     "vds_max": c.vds_max,
+                    "bv_kind": c.bv_kind,
+                    "cap_type": c.cap_type,
                     "vmin": c.vmin,
                     "vmax": c.vmax,
                     "weight": c.weight,

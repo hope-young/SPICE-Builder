@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
 from .bsim3 import BSIM3Model, PARAM_SPECS
+from .cap_wrapper import PowerCapWrapper, CapTable
 from .powermos import PowerMOSSubcktParams
 
 
@@ -42,6 +43,9 @@ class LibExporter:
             f"* SpiceBuilder Export - {self.part_number}",
             f"* Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"* Format: A (pure BSIM3 .model)",
+            f"* NOTICE: Core model only. This file does not include AA/CellPitch scaling,",
+            f"* package resistance, or the power-MOS wrapper. External netlists must provide",
+            f"* the intended W/L/M scaling when instantiating this model.",
             "",
             f".MODEL {name} NMOS LEVEL=49",
             model.to_spice_card(name),
@@ -61,7 +65,8 @@ class LibExporter:
                       rs_ohm: float | None = None,
                       cell_count: int = 20000,
                       cell_w_m: float = 0.2,
-                      power_params: PowerMOSSubcktParams | dict | None = None) -> Path:
+                      power_params: PowerMOSSubcktParams | dict | None = None,
+                      cap_wrapper: PowerCapWrapper | dict | None = None) -> Path:
         """B 形式：subckt 包装（推荐）
 
         输出示例：
@@ -104,6 +109,10 @@ class LibExporter:
                 cell_count=None if cell_count == 20000 else cell_count,
                 cell_w_m=None if cell_w_m == 0.2 else cell_w_m,
             )
+        if isinstance(cap_wrapper, dict):
+            capw = PowerCapWrapper.from_dict(cap_wrapper)
+        else:
+            capw = cap_wrapper
 
         # RD/RS 默认从 BSIM model 取；PowerMOS 显式值优先。
         rd_ext_ohm = model.get("RD") if pwr.rd_ext_ohm is None else pwr.rd_ext_ohm
@@ -118,24 +127,49 @@ class LibExporter:
         n = model.get("N")
         bv = model.get("BV")
         ibv = model.get("IBV")
+        igs0 = model.get("IGS0")
+        vgslp = model.get("VGSLP")
+        bvgsp = model.get("BVGSP")
+        bvgsn = model.get("BVGSN")
 
         lines = [
             f"* SpiceBuilder Export - {self.part_number}",
             f"* Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"* Format: B (subckt wrapper, recommended)",
             f"* Subckt: {subckt_name}",
+            f"* NOTICE: Complete power MOSFET subcircuit. Use: X1 D G S {subckt_name}",
+            f"* Do not instantiate BSIM3_core directly unless your netlist supplies its own",
+            f"* W/L/M scaling. AA and CellPitch are baked into the internal M1 multiplier.",
             f"* Power wrapper: Rg={pwr.rg_ohm:.6g} Rd_ext={rd_ext_ohm:.6g} "
             f"Rs_ext={rs_ext_ohm:.6g} Rdrift={pwr.rdrift_ohm:.6g} Rjfet={pwr.rjfet_ohm:.6g} "
             f"AA={pwr.active_area_mm2:.6g}mm2 CellPitch={pwr.cell_pitch_um:.6g}um UnitM={unit_multiplier:.6g}",
+        ]
+        if capw and capw.enabled:
+            lines.extend([
+                f"* NOTICE: CV wrapper enabled ({capw.mode}).",
+                f"* Ciss/Coss/Crss residuals are represented by behavioral capacitance currents.",
+            ])
+        lines.extend([
             "",
             f".SUBCKT {subckt_name} D G S",
+            f".param IGS0={igs0:.8e} VGSLP={vgslp:.8g} BVGSP={bvgsp:.8g} BVGSN={bvgsn:.8g}",
             f"M1 D_int G_int S_int S_int BSIM3_core L=1u W={unit_width_m:.12g} M={unit_multiplier:.12g}",
-        ]
+        ])
         # Gate resistance (in series with G)
         if pwr.rg_ohm > 0:
             lines.append(f"Rg G G_int {pwr.rg_ohm:.4g}")
         else:
             lines.append("Rg_link G G_int 1e-12")
+
+        # Gate-source leakage / oxide breakdown wrapper.  Current is near zero
+        # below +/-BVGSS and rises exponentially after either breakdown knee.
+        lines.append(
+            "Bgate_leak G_int S "
+            "I={if(V(G_int,S)>BVGSP,IGS0*exp(min((V(G_int,S)-BVGSP)/VGSLP,80)),"
+            "if(V(G_int,S)<-BVGSN,-IGS0*exp(min((-V(G_int,S)-BVGSN)/VGSLP,80)),0))}"
+        )
+        if capw and capw.enabled:
+            lines.extend(self._cap_wrapper_lines(capw))
 
         # Power MOS drain-side series network.  Keep D_int stable because
         # LTspice C-V templates and future extraction code use it as a probe.
@@ -174,6 +208,35 @@ class LibExporter:
 
         out.write_text("\n".join(lines), encoding='utf-8')
         return out
+
+    @staticmethod
+    def _format_table_function(name: str, table: CapTable) -> str:
+        pairs: list[str] = []
+        for v, c_pf in zip(table.voltage_v, table.capacitance_pf):
+            pairs.append(f"{float(v):.8g},{float(c_pf) * 1e-12:.12e}")
+        if not pairs:
+            pairs.append("0,0")
+        return f".func SB_{name.upper()}(x) table(x,{','.join(pairs)})"
+
+    def _cap_wrapper_lines(self, capw: PowerCapWrapper) -> list[str]:
+        lines = [
+            "* CV residual wrapper: table capacitance values are in Farads",
+            "* Residual sources are connected at external package pins to match",
+            "* datasheet-style Ciss/Coss/Crss terminal measurements.",
+        ]
+        if capw.cgs:
+            lines.append(self._format_table_function("cgs", capw.cgs))
+        if capw.cgd:
+            lines.append(self._format_table_function("cgd", capw.cgd))
+        if capw.cds:
+            lines.append(self._format_table_function("cds", capw.cds))
+        if capw.cgs:
+            lines.append("Bcv_cgs G S I={SB_CGS(V(D,S))*ddt(V(G,S))}")
+        if capw.cgd:
+            lines.append("Bcv_cgd G D I={SB_CGD(V(D,S))*ddt(V(G,D))}")
+        if capw.cds:
+            lines.append("Bcv_cds D S I={SB_CDS(V(D,S))*ddt(V(D,S))}")
+        return lines
 
     def export_both(self,
                     model: BSIM3Model,

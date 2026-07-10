@@ -141,6 +141,8 @@ export const BSIM3_PARAMS: BSIM3ParamSpec[] = [
   { name: "A0", default: 1, lower: 0, upper: 10, unit: "", category: "Saturation", stage: "S4", description: "Bulk charge effect coefficient" },
   { name: "AGS", default: 0, lower: -1, upper: 1, unit: "V^-1", category: "Saturation", stage: "S4", description: "Gate-bias dependent A0" },
   { name: "KETA", default: 0, lower: -1, upper: 1, unit: "V^-1", category: "Saturation", stage: "S4", description: "Body-bias dependent VSAT" },
+  { name: "RD", default: 1e-4, lower: 0, upper: 1, unit: "ohm", category: "Parasitic", stage: "S4", description: "Drain series resistance" },
+  { name: "RS", default: 1e-4, lower: 0, upper: 1, unit: "ohm", category: "Parasitic", stage: "S4", description: "Source series resistance" },
   // Output Resistance
   { name: "PCLM", default: 0.5, lower: 0, upper: 5, unit: "", category: "OutputRes", stage: "S5", description: "Channel length modulation" },
   { name: "PDIBLC1", default: 0.3, lower: 0, upper: 1, unit: "", category: "OutputRes", stage: "S5", description: "DIBL parameter 1" },
@@ -171,6 +173,11 @@ export const BSIM3_PARAMS: BSIM3ParamSpec[] = [
   { name: "N", default: 1.5, lower: 1, upper: 5, unit: "", category: "Diode", stage: "S6", description: "Body diode ideality factor" },
   { name: "BV", default: 100, lower: 50, upper: 200, unit: "V", category: "Diode", stage: "S6", description: "Body diode breakdown voltage" },
   { name: "IBV", default: 1e-3, lower: 1e-6, upper: 1, unit: "A", category: "Diode", stage: "S6", description: "Body diode breakdown current" },
+  // Gate leakage / BVGSS wrapper
+  { name: "IGS0", default: 1e-12, lower: 1e-18, upper: 1e-3, unit: "A", category: "GateLeakage", stage: "S6", description: "Gate-source breakdown reference current" },
+  { name: "VGSLP", default: 0.5, lower: 0.02, upper: 5, unit: "V", category: "GateLeakage", stage: "S6", description: "Gate-source breakdown soft slope" },
+  { name: "BVGSP", default: 30, lower: 1, upper: 100, unit: "V", category: "GateLeakage", stage: "S6", description: "Positive gate-source breakdown voltage" },
+  { name: "BVGSN", default: 30, lower: 1, upper: 100, unit: "V", category: "GateLeakage", stage: "S6", description: "Negative gate-source breakdown voltage" },
   // Process
   { name: "TOX", default: 5e-8, lower: 1e-9, upper: 1e-7, unit: "m", category: "Process", stage: "S5", description: "Gate oxide thickness" },
   { name: "XL", default: 0, lower: -1e-7, upper: 1e-7, unit: "m", category: "Process", stage: "S5", description: "L offset for mask" },
@@ -178,6 +185,5 @@ export const BSIM3_PARAMS: BSIM3ParamSpec[] = [
   { name: "DELTA", default: 0.01, lower: 0, upper: 1, unit: "", category: "Process", stage: "S5", description: "Effective Vds parameter" },
   // Doping
   { name: "NSUB", default: 1e17, lower: 1e15, upper: 1e19, unit: "cm^-3", category: "Doping", stage: "S5", description: "Substrate doping" },
-  { name: "NGATE", default: 1e20, lower: 1e18, upper: 1e22, unit: "cm^-3", category: "Doping", stage: "S5", description: "Poly gate doping" },
 ];
 

@@ -111,9 +111,8 @@ function useTreeData() {
       },
       { id: "bv",         label: "BV / Leakage",      tag: "next", canAdd: false, children: [
         { id: "bvdss",  label: "BVDSS", status: "empty", r2: null, pts: 0, type: "BV" },
-        { id: "idss",   label: "IDSS",  status: "empty", r2: null, pts: 0, type: "BV" },
-        { id: "igss_p", label: "IGSS+", status: "empty", r2: null, pts: 0, type: "BV" },
-        { id: "igss_n", label: "IGSS−", status: "empty", r2: null, pts: 0, type: "BV" },
+        { id: "bvgss_p", label: "BVGSS+", status: "empty", r2: null, pts: 0, type: "BV" },
+        { id: "bvgss_n", label: "BVGSS-", status: "empty", r2: null, pts: 0, type: "BV" },
       ]},
       { id: "bodydiode",  label: "Body Diode",        tag: "next", canAdd: false, children: [
         { id: "isvsd", label: "Is-Vsd", status: "empty", r2: null, pts: 0, type: "BodyDiode" },

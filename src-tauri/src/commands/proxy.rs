@@ -56,6 +56,13 @@ pub async fn call_api(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
+            log::info!(
+                "[call_api] response endpoint={} status={} body_len={} body_preview={}",
+                endpoint,
+                status,
+                text.len(),
+                &text.chars().take(200).collect::<String>()
+            );
             let body: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
             Ok(ApiResponse {
                 status,
@@ -64,12 +71,15 @@ pub async fn call_api(
                 error: None,
             })
         }
-        Err(e) => Ok(ApiResponse {
-            status: 0,
-            ok: false,
-            body: Value::Null,
-            error: Some(e.to_string()),
-        }),
+        Err(e) => {
+            log::error!("[call_api] request failed endpoint={} error={}", endpoint, e);
+            Ok(ApiResponse {
+                status: 0,
+                ok: false,
+                body: Value::Null,
+                error: Some(e.to_string()),
+            })
+        }
     }
 }
 

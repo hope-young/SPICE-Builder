@@ -277,6 +277,25 @@ export type CsvFitStopConfig = {
   max_nfev: number;
 };
 
+export type FitCurveType = "idvg" | "idvd" | "bv" | "cv";
+export type BvKind = "bvdss" | "bvgss_p" | "bvgss_n";
+export type CapType = "ciss" | "coss" | "crss";
+
+export type CapTable = {
+  name: string;
+  voltage_v: number[];
+  capacitance_pf: number[];
+  charge_pc: number[];
+};
+
+export type PowerCapWrapper = {
+  enabled: boolean;
+  mode: string;
+  cgs?: CapTable | null;
+  cgd?: CapTable | null;
+  cds?: CapTable | null;
+};
+
 export type CsvExportModelResponse = {
   success: boolean;
   file_path: string;
@@ -344,21 +363,31 @@ async function webFetch<T>(path: string, body: any, signal?: AbortSignal): Promi
 /** 读一个 CSV，解析为 ivar/dvar, 不需要 project state */
 export async function csvLoad(
   csvPath: string,
-  opts: { curveType?: "idvg" | "idvd" | "cv" | "qg" | "body_diode" } = {}
+  opts: { curveType?: FitCurveType | "qg" | "body_diode"; bvKind?: BvKind; capType?: CapType } = {}
 ): Promise<{ curve_type: string; ivar: number[]; dvar: number[]; metadata: Record<string, unknown> }> {
+  const body = {
+    csv_path: csvPath,
+    curve_type: opts.curveType ?? "idvg",
+    bv_kind: opts.bvKind ?? "bvdss",
+    cap_type: opts.capType ?? "ciss",
+  };
   if (!isTauri()) {
-    return webFetch("/api/csv/load", { csv_path: csvPath, curve_type: opts.curveType ?? "idvg" });
+    return webFetch("/api/csv/load", body);
   }
   const resp = await cmd<{
     status: number; ok: boolean; body: {
       curve_type: string; ivar: number[]; dvar: number[]; metadata: Record<string, unknown>;
     };
+    error?: string;
   }>("call_api", {
     method: "POST",
     endpoint: `/api/csv/load`,
-    body: JSON.stringify({ csv_path: csvPath, curve_type: opts.curveType ?? "idvg" }),
+    body: JSON.stringify(body),
   });
-  if (!resp.ok) throw new Error(`csvLoad failed: ${resp.status}`);
+  if (!resp.ok) {
+    const detail = stringifyBackendBody(resp.body) || resp.error || "";
+    throw new Error(`csvLoad failed: ${resp.status} ${detail}`);
+  }
   return resp.body;
 }
 
@@ -370,6 +399,7 @@ export async function csvExportModel(opts: {
   modelName?: string;
   params: Record<string, number>;
   powerParams?: PowerMOSSubcktParams;
+  capWrapper?: PowerCapWrapper | null;
   includeDiode?: boolean;
   rgOhm?: number;
 }): Promise<CsvExportModelResponse> {
@@ -381,6 +411,7 @@ export async function csvExportModel(opts: {
     model_name: opts.modelName ?? "BSIM3_core",
     params: opts.params,
     power_params: opts.powerParams,
+    cap_wrapper: opts.capWrapper,
     include_diode: opts.includeDiode ?? true,
     rg_ohm: opts.rgOhm ?? 1.6,
   };
@@ -416,23 +447,29 @@ export async function csvExportModel(opts: {
 export async function csvSimulate(
   csvPath: string,
   opts: {
-    curveType: "idvg" | "idvd";
+    curveType: FitCurveType;
+    bvKind?: BvKind;
+    capType?: CapType;
     paramOverrides: Record<string, number>;
     vds?: number;
     vgs_v?: number;
     vds_max?: number;
     powerParams?: PowerMOSSubcktParams;
+    capWrapper?: PowerCapWrapper | null;
     signal?: AbortSignal;
   }
 ): Promise<{ curve_type: string; ivar: number[]; sim: number[]; meas: number[]; metadata: Record<string, unknown> }> {
   const body = {
     csv_path: csvPath,
     curve_type: opts.curveType,
+    bv_kind: opts.bvKind ?? "bvdss",
+    cap_type: opts.capType ?? "ciss",
     param_overrides: opts.paramOverrides,
     vds: opts.vds ?? 0.5,
     vgs_v: opts.vgs_v ?? 10.0,
     vds_max: opts.vds_max ?? 12.0,
     power_params: opts.powerParams,
+    cap_wrapper: opts.capWrapper,
   };
   if (!isTauri()) {
     return webFetch("/api/csv/simulate", body, opts.signal);
@@ -454,7 +491,9 @@ export async function csvSimulate(
 export async function csvFit(
   csvPath: string,
   opts: {
-    curveType?: "idvg" | "idvd";
+    curveType?: FitCurveType;
+    bvKind?: BvKind;
+    capType?: CapType;
     paramNames: string[];
     paramBounds?: Record<string, [number, number]>;
     initialParams?: Record<string, number>;
@@ -496,6 +535,8 @@ export async function csvFit(
   const body = {
     csv_path: csvPath,
     curve_type: opts.curveType ?? "idvg",
+    bv_kind: opts.bvKind ?? "bvdss",
+    cap_type: opts.capType ?? "ciss",
     param_names: opts.paramNames,
     param_bounds: opts.paramBounds ?? {},
     initial_params: opts.initialParams ?? {},
@@ -542,7 +583,7 @@ export async function csvFit(
 /** 联合拟合: 多条 IV 曲线共享参数 */
 export async function csvDualFit(
   opts: {
-    curves: Array<{ csvPath: string; curveType?: "idvg" | "idvd"; vds: number; vgs_v?: number; vds_max?: number; vmin: number; vmax: number; weight?: number }>;
+    curves: Array<{ csvPath: string; curveType?: FitCurveType; bvKind?: BvKind; capType?: CapType; vds: number; vgs_v?: number; vds_max?: number; vmin: number; vmax: number; weight?: number }>;
     paramNames: string[];
     paramBounds?: Record<string, [number, number]>;
     initialParams?: Record<string, number>;
@@ -555,7 +596,9 @@ export async function csvDualFit(
   fitted_params: Record<string, number>;
   curves: Array<{
     csv_path: string;
-    curve_type?: "idvg" | "idvd";
+    curve_type?: FitCurveType;
+    bv_kind?: BvKind;
+    cap_type?: CapType;
     vds: number;
     vgs_v?: number;
     vds_max?: number;
@@ -581,6 +624,8 @@ export async function csvDualFit(
     curves: opts.curves.map(c => ({
       csv_path: c.csvPath,
       curve_type: c.curveType ?? "idvg",
+      bv_kind: c.bvKind ?? "bvdss",
+      cap_type: c.capType ?? "ciss",
       vds: c.vds,
       vgs_v: c.vgs_v ?? 10.0,
       vds_max: c.vds_max ?? 12.0,
@@ -609,10 +654,56 @@ export async function csvDualFit(
   return resp.body;
 }
 
+export async function csvCvWrapperFit(opts: {
+  curves: Array<{ csvPath: string; capType: CapType; weight?: number }>;
+  csvPath?: string;
+  capType?: CapType;
+  params: Record<string, number>;
+  powerParams?: PowerMOSSubcktParams;
+  signal?: AbortSignal;
+}): Promise<{
+  cap_wrapper: PowerCapWrapper;
+  curves: Array<{
+    cap_type: CapType;
+    ivar: number[];
+    meas: number[];
+    sim: number[];
+    baseline: number[];
+    r2_linear: number;
+    r2_log: number;
+  }>;
+  warnings: string[];
+}> {
+  const body = {
+    curves: opts.curves.map(c => ({
+      csv_path: c.csvPath,
+      cap_type: c.capType,
+      weight: c.weight ?? 1,
+    })),
+    csv_path: opts.csvPath,
+    cap_type: opts.capType ?? "ciss",
+    params: opts.params,
+    power_params: opts.powerParams,
+  };
+  if (!isTauri()) {
+    return webFetch("/api/csv/cv_wrapper_fit", body, opts.signal);
+  }
+  const resp = await cmd<{ status: number; ok: boolean; body: any; error?: string }>("call_api", {
+    method: "POST",
+    endpoint: `/api/csv/cv_wrapper_fit`,
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const detail = stringifyBackendBody(resp.body) || resp.error || "";
+    throw new Error(`csvCvWrapperFit failed: ${resp.status} ${detail}`);
+  }
+  return resp.body;
+}
+
 /** 流式联合拟合: 多条 IV 曲线共享参数, 每步返回所有曲线当前 sim/R² */
 export async function* csvDualFitStream(
   opts: {
-    curves: Array<{ csvPath: string; curveType?: "idvg" | "idvd"; vds: number; vgs_v?: number; vds_max?: number; vmin: number; vmax: number; weight?: number }>;
+    curves: Array<{ csvPath: string; curveType?: FitCurveType; bvKind?: BvKind; capType?: CapType; vds: number; vgs_v?: number; vds_max?: number; vmin: number; vmax: number; weight?: number }>;
     paramNames: string[];
     paramBounds?: Record<string, [number, number]>;
     initialParams?: Record<string, number>;
@@ -629,7 +720,9 @@ export async function* csvDualFitStream(
   curves?: Array<{
     index: number;
     csv_path: string;
-    curve_type?: "idvg" | "idvd";
+    curve_type?: FitCurveType;
+    bv_kind?: BvKind;
+    cap_type?: CapType;
     vds: number;
     vgs_v?: number;
     vds_max?: number;
@@ -660,6 +753,8 @@ export async function* csvDualFitStream(
     curves: opts.curves.map(c => ({
       csv_path: c.csvPath,
       curve_type: c.curveType ?? "idvg",
+      bv_kind: c.bvKind ?? "bvdss",
+      cap_type: c.capType ?? "ciss",
       vds: c.vds,
       vgs_v: c.vgs_v ?? 10.0,
       vds_max: c.vds_max ?? 12.0,
@@ -727,11 +822,13 @@ export async function* csvDualFitStream(
 export async function* csvFitStream(
   opts: {
     csvPath: string;
-    curveType?: "idvg" | "idvd";
+    curveType?: FitCurveType;
+    bvKind?: BvKind;
+    capType?: CapType;
     paramNames: string[];
     paramBounds?: Record<string, [number, number]>;
     initialParams?: Record<string, number>;
-    protectCurves?: Array<{ csvPath: string; curve_type?: "idvg" | "idvd"; vds: number; vgs_v?: number; vds_max?: number; vmin: number; vmax: number; weight: number }>;
+    protectCurves?: Array<{ csvPath: string; curve_type?: FitCurveType; bv_kind?: BvKind; cap_type?: CapType; vds: number; vgs_v?: number; vds_max?: number; vmin: number; vmax: number; weight: number }>;
     vmin: number;
     vmax: number;
     vds?: number;
@@ -768,6 +865,8 @@ export async function* csvFitStream(
   const body = {
     csv_path: opts.csvPath,
     curve_type: opts.curveType ?? "idvg",
+    bv_kind: opts.bvKind ?? "bvdss",
+    cap_type: opts.capType ?? "ciss",
     param_names: opts.paramNames,
     param_bounds: opts.paramBounds ?? {},
     initial_params: opts.initialParams ?? {},
@@ -841,7 +940,7 @@ export async function* csvFitStream(
     if (opts.signal?.aborted) throw e;
     if (!isTauri()) throw e;
     const streamMessage = e instanceof Error ? e.message : String(e);
-    if (opts.curveType === "idvd" && /\b422\b/.test(streamMessage)) {
+    if ((opts.curveType === "idvd" || opts.curveType === "bv" || opts.curveType === "cv") && /\b422\b/.test(streamMessage)) {
       await stopBackend();
       const restarted = await startBackend();
       if (restarted) {
@@ -929,7 +1028,7 @@ export async function simulateCurve(
 /** 加载 CSV 单条曲线 */
 export async function loadCsvCurve(
   projectId: string,
-  opts: { csvPath: string; curveType: "idvg" | "idvd" | "cv" | "qg" | "body_diode" }
+  opts: { csvPath: string; curveType: FitCurveType | "qg" | "body_diode"; bvKind?: BvKind; capType?: CapType }
 ): Promise<{ curve_type: string; ivar: number[]; dvar: number[]; metadata: Record<string, unknown> }> {
   const resp = await cmd<{
     status: number; ok: boolean; body: {
@@ -941,7 +1040,7 @@ export async function loadCsvCurve(
   }>("call_api", {
     method: "POST",
     endpoint: `/api/projects/${projectId}/load_csv`,
-    body: JSON.stringify({ csv_path: opts.csvPath, curve_type: opts.curveType }),
+    body: JSON.stringify({ csv_path: opts.csvPath, curve_type: opts.curveType, bv_kind: opts.bvKind ?? "bvdss", cap_type: opts.capType ?? "ciss" }),
   });
   if (!resp.ok) throw new Error(`loadCsvCurve failed: ${resp.status}`);
   return resp.body;

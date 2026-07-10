@@ -31,7 +31,7 @@ class SimData:
         metadata: 元数据 (bias, temperature, instances, ...)
 
     工厂方法:
-        from_idvg(), from_idvd(), from_cv(), from_qg(), from_body_diode()
+        from_idvg(), from_idvd(), from_bv(), from_cv(), from_qg(), from_body_diode()
     """
     name: str
     curve_type: str
@@ -87,6 +87,7 @@ class SimData:
         return {
             'IdVg': 'vgs_v',
             'IdVd': 'vds_v',
+            'BV': 'vds_v',
             'CvVds': 'vds_v',
             'Qg': 'vgs_v',
             'IsVsd': 'vsd_v',
@@ -96,6 +97,7 @@ class SimData:
         return {
             'IdVg': 'id_a',
             'IdVd': 'id_a',
+            'BV': 'i_a',
             'CvVds': 'c_pf',
             'Qg': 'qg_nc',
             'IsVsd': 'is_a',
@@ -270,6 +272,46 @@ class SimData:
                 'temperature_c': temperature_c,
                 'ivar_name': 'vds_v',
                 'dvar_name': 'id_a',
+            }
+        )
+
+    @classmethod
+    def from_bv(cls, points: list[dict], kind: str = "bvdss",
+                temperature_c: int = 25) -> "SimData":
+        """Create a breakdown/leakage curve.
+
+        kind:
+            bvdss    - Vds sweep at Vgs=0, measured Id
+            bvgss_p  - positive Vgs sweep, measured gate current
+            bvgss_n  - negative Vgs sweep, measured gate current magnitude
+        """
+        norm_kind = kind.lower()
+        if norm_kind not in {"bvdss", "bvgss_p", "bvgss_n"}:
+            raise ValueError(f"未知 BV 曲线类型: {kind}")
+        x_key = "vds_v" if norm_kind == "bvdss" else "vgs_v"
+        y_key = "id_a" if norm_kind == "bvdss" else "ig_a"
+        filtered = [
+            p for p in points
+            if p.get(x_key) is not None
+            and p.get(y_key) is not None
+            and p.get("temperature_c", temperature_c) == temperature_c
+        ]
+        if not filtered:
+            raise ValueError(f"没有匹配的 BV 点 ({norm_kind}, T={temperature_c})")
+        filtered.sort(key=lambda p: p[x_key])
+        ivar = np.array([p[x_key] for p in filtered], dtype=float)
+        dvar = np.abs(np.array([p[y_key] for p in filtered], dtype=float))
+        return cls(
+            name=f"BV_{norm_kind}_T{temperature_c}C",
+            curve_type="BV",
+            data={'ivar': ivar, 'dvar': dvar},
+            metadata={
+                'bv_kind': norm_kind,
+                'temperature_c': temperature_c,
+                'vgs_v': 0.0 if norm_kind == "bvdss" else None,
+                'vds_v': 0.0 if norm_kind != "bvdss" else None,
+                'ivar_name': x_key,
+                'dvar_name': y_key,
             }
         )
 

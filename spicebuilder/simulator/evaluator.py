@@ -11,12 +11,14 @@ from typing import Optional, Tuple, List
 import numpy as np
 
 from spicebuilder.models.bsim3 import BSIM3Model
+from spicebuilder.models.cap_wrapper import PowerCapWrapper
 from spicebuilder.models.exporter import LibExporter
 from spicebuilder.models.powermos import PowerMOSSubcktParams
 from spicebuilder.simulator.ltspice import (
     LTspiceBackend,
     gen_idvg_netlist,
     gen_idvd_netlist,
+    gen_bv_netlist,
     gen_cv_netlist,
 )
 
@@ -38,7 +40,8 @@ class LTspiceEvaluator:
                  verbose: bool = False,
                  cell_count: int = 100,
                  cell_w_m: float = 0.2,
-                 power_params: PowerMOSSubcktParams | dict | None = None):
+                 power_params: PowerMOSSubcktParams | dict | None = None,
+                 cap_wrapper: PowerCapWrapper | dict | None = None):
         self.subckt_name = subckt_name
         legacy_base = PowerMOSSubcktParams(
             rg_ohm=rg_ohm,
@@ -67,6 +70,10 @@ class LTspiceEvaluator:
         self.verbose = verbose
         self.cell_count = pwr.cell_count
         self.cell_w_m = pwr.cell_w_m
+        if isinstance(cap_wrapper, dict):
+            self.cap_wrapper = PowerCapWrapper.from_dict(cap_wrapper)
+        else:
+            self.cap_wrapper = cap_wrapper
         self.cache: dict = {}  # param_hash -> array
         self.stats = {"calls": 0, "cache_hits": 0, "time": 0.0}
 
@@ -83,6 +90,7 @@ class LTspiceEvaluator:
             "VSAT", "A0", "AGS", "KETA", "DWG", "DWB",
             "PCLM", "PVAG", "DROUT",
             "TOX", "XJ", "RS", "RD",
+            "IS", "N", "BV", "IBV", "IGS0", "VGSLP", "BVGSP", "BVGSN",
         ]
         vals = []
         for k in keys:
@@ -90,7 +98,8 @@ class LTspiceEvaluator:
                 vals.append(f"{k}={model.get(k):.12g}")  # 提高精度 6g → 12g，避免缓存键冲突
             except (KeyError, ValueError):
                 pass
-        s = scenario + "|" + self.power_params.cache_key() + "|" + "|".join(vals)
+        cap_key = self.cap_wrapper.cache_key() if self.cap_wrapper else "capwrap=off"
+        s = scenario + "|" + self.power_params.cache_key() + "|" + cap_key + "|" + "|".join(vals)
         if ivar is not None:
             # 加 ivar shape + min/max 到 key 以防不同长度复用
             s += f"|n={len(ivar)}|min={ivar.min():.4g}|max={ivar.max():.4g}"
@@ -102,7 +111,8 @@ class LTspiceEvaluator:
         lib_path = tmpdir / "model.lib"
         self.exporter.export_subckt(model, lib_path,
                                      subckt_name=self.subckt_name,
-                                     power_params=self.power_params)
+                                     power_params=self.power_params,
+                                     cap_wrapper=self.cap_wrapper)
         return lib_path
 
     def eval_idvg(self,
@@ -213,16 +223,77 @@ class LTspiceEvaluator:
         self.cache[key] = out
         return out
 
+    def eval_bv(self,
+                model: BSIM3Model,
+                sweep_arr: np.ndarray,
+                kind: str = "bvdss") -> np.ndarray:
+        """Evaluate BVDSS/BVGSS leakage curves."""
+        import time
+        norm_kind = kind.lower()
+        key = self._param_hash(model, f"bv_{norm_kind}", sweep_arr)
+        if key in self.cache:
+            self.stats["cache_hits"] += 1
+            return self.cache[key]
+
+        t0 = time.time()
+        self.stats["calls"] += 1
+        lib_path = self._write_lib(model)
+        vmin, vmax = float(sweep_arr.min()), float(sweep_arr.max())
+        n = len(sweep_arr)
+        step = abs(vmax - vmin) / max(1, n - 1)
+        if step <= 0:
+            step = max(abs(vmax), 1.0) * 0.01
+        netlist = gen_bv_netlist(
+            str(lib_path),
+            kind=norm_kind,
+            vmin=vmin,
+            vmax=vmax,
+            vstep=step,
+            model_name=self.subckt_name,
+            use_subckt=True,
+        )
+        res = self.backend.run_netlist_text(netlist, timeout_s=15, cleanup=False)
+        self.stats["time"] += time.time() - t0
+
+        if not res.success or not res.raw_path or not res.raw_path.exists():
+            out = np.full_like(sweep_arr, 1e-18, dtype=float)
+            self.cache[key] = out
+            return out
+
+        try:
+            raw = self.backend.parse_raw(res.raw_path)
+            trace_x = "V(d)" if norm_kind == "bvdss" else "V(g)"
+            trace_i = "I(Vds)" if norm_kind == "bvdss" else "I(Vgs)"
+            if trace_x not in raw or trace_i not in raw:
+                out = np.full_like(sweep_arr, 1e-18, dtype=float)
+            else:
+                fit_x = np.array(raw[trace_x]["ivar"])
+                fit_i = np.abs(np.array(raw[trace_i]["dvar"]))
+                order = np.argsort(fit_x)
+                out = np.interp(sweep_arr, fit_x[order], fit_i[order], left=1e-18, right=1e-18)
+        except Exception as e:
+            if self.verbose:
+                print(f"[eval_bv] parse error: {e}")
+            out = np.full_like(sweep_arr, 1e-18, dtype=float)
+        finally:
+            try:
+                lib_path.parent.rmdir()
+            except OSError:
+                pass
+
+        self.cache[key] = out
+        return out
+
     def eval_cv(self,
                 model: BSIM3Model,
                 vds_arr: np.ndarray,
                 freq: float = 1e6,
                 vds_max: float = 25.0,
                 cap_type: str = "ciss") -> Optional[np.ndarray]:
-        """评估 C-V 曲线 (返回 C in F; None on LTspice failure).
+        """评估 C-V 曲线 (返回 C in pF; None on LTspice failure).
 
-        cap_type selects both the netlist pattern and which trace we
-        read back.  ciss -> V(G_int); coss/crss -> V(D_int).
+        cap_type selects both the netlist pattern and which current trace
+        we read back.  The CV netlists use a 1 V AC source, so C=|I|/omega.
         """
         import time
         import sys
@@ -239,8 +310,9 @@ class LTspiceEvaluator:
         lib_path = self._write_lib(model)
         netlist = gen_cv_netlist(str(lib_path), vds_max=vds_max, vds_step=vds_max / 50,
                                   freq=freq, model_name=self.subckt_name, use_subckt=True,
+                                  vds_values=vds_arr,
                                   cap_type=cap_type)
-        res = self.backend.run_netlist_text(netlist, timeout_s=15, cleanup=False)
+        res = self.backend.run_netlist_text(netlist, timeout_s=45, cleanup=False)
         self.stats["time"] += time.time() - t0
 
         if not res.success or not res.raw_path or not res.raw_path.exists():
@@ -248,29 +320,37 @@ class LTspiceEvaluator:
             return None
 
         try:
-            raw = self.backend.parse_raw(res.raw_path)
-            # LTspice returns trace names in lowercase: V(g_int), V(d_int)
-            v_trace = "V(g_int)" if cap_type == "ciss" else "V(d_int)"
-            if v_trace not in raw or 'I(Iac)' not in raw:
+            raw = self.backend.parse_raw(res.raw_path, complex_mode="imag_abs")
+            # LTspice returns trace names with source names preserved by
+            # the parser; try canonical and lowercase variants.
+            candidates = {
+                "ciss": ("I(Vg_ac)", "I(vg_ac)"),
+                "coss": ("I(Vd_ac)", "I(vd_ac)"),
+                "crss": ("I(Vg_short)", "I(vg_short)"),
+            }.get(cap_type, ("I(Vg_ac)", "I(vg_ac)"))
+            i_trace = next((name for name in candidates if name in raw), None)
+            if i_trace is None:
                 self.cache[key] = None
                 return None
-            v_node = np.asarray(raw[v_trace]['dvar'], dtype=float)
-            i_iac = np.asarray(raw['I(Iac)']['dvar'], dtype=float)
-            if v_node.size == 0 or i_iac.size == 0:
+            i_ac = np.abs(np.asarray(raw[i_trace]['dvar'], dtype=float))
+            if i_ac.size == 0:
                 self.cache[key] = None
                 return None
-            # C = |I| / (omega * |V|).  Iac amplitude is 1 A so i_iac
-            # should be 1.0 (the cap current) and v_node is the small-
-            # signal voltage on the measured node.  Length = nVds_step.
+            # The excitation amplitude is 1 V, so C = |I| / omega.
+            # Convert F -> pF so it matches SimData.from_cv CSV values.
             omega = 2 * np.pi * freq
-            c = i_iac / (omega * np.maximum(v_node, 1e-30))
-            if len(c) >= len(vds_arr):
-                return c[: len(vds_arr)]
+            c = i_ac / omega * 1e12
+            if len(c) == len(vds_arr):
+                out = c[: len(vds_arr)]
+                self.cache[key] = out
+                return out
             # Pad / interpolate to vds_arr length when fewer points
             # were returned than requested.
             x_axis = np.linspace(vds_arr[0], vds_arr[-1], len(c)) \
                 if vds_arr.size else np.linspace(0, vds_max, len(c))
-            return np.interp(vds_arr, x_axis, c)
+            out = np.interp(vds_arr, x_axis, c)
+            self.cache[key] = out
+            return out
         except Exception as e:
             if self.verbose:
                 print(f"[eval_cv] parse error: {e}")

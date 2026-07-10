@@ -103,6 +103,12 @@ PARAM_SPECS: list[BSIM3ParamSpec] = [
     BSIM3ParamSpec("N",      1.5,    0.5,   5.0,    "—",      "Diode",         "S6", "体二极管发射系数"),
     BSIM3ParamSpec("BV",     100.0,  1.0,   1500.0, "V",      "Diode",         "S6", "反向击穿电压"),
     BSIM3ParamSpec("IBV",    1.0e-3, 1.0e-9, 1.0,   "A",      "Diode",         "S6", "击穿电压处的电流"),
+
+    # === Gate-source leakage wrapper ===
+    BSIM3ParamSpec("IGS0",   1.0e-12,1.0e-18,1.0e-3, "A",      "GateLeakage",   "S6", "栅源击穿参考漏电流"),
+    BSIM3ParamSpec("VGSLP",  0.5,    0.02,  5.0,    "V",      "GateLeakage",   "S6", "栅源击穿软化斜率"),
+    BSIM3ParamSpec("BVGSP",  30.0,   1.0,   100.0,  "V",      "GateLeakage",   "S6", "正向栅源击穿电压"),
+    BSIM3ParamSpec("BVGSN",  30.0,   1.0,   100.0,  "V",      "GateLeakage",   "S6", "负向栅源击穿电压"),
 ]
 
 # 索引
@@ -238,12 +244,12 @@ class BSIM3Model:
     def to_spice_card(self, model_name: str | None = None) -> str:
         """输出 .model card 文本（不含 .model 行）
 
-        过滤掉 category='Diode' 的参数（IS, N, BV, IBV），
-        这些应该放在 .MODEL Dbody_diode 里。
+        过滤掉 wrapper-only 参数（Diode / GateLeakage），
+        这些应该放在 subckt 外围器件里。
         """
         lines = []
         for spec in PARAM_SPECS:
-            if spec.category == "Diode":
+            if spec.category in ("Diode", "GateLeakage"):
                 continue
             val = self._values[spec.name]
             # 格式化数值（提高精度以避免优化器梯度计算问题）
