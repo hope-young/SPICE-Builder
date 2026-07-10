@@ -58,6 +58,9 @@ class CapTableRequest(BaseModel):
     voltage_v: List[float] = Field(default_factory=list)
     capacitance_pf: List[float] = Field(default_factory=list)
     charge_pc: List[float] = Field(default_factory=list)
+    polynomial_coeff_f: Optional[List[float]] = None
+    polynomial_vmin_v: Optional[float] = None
+    polynomial_vspan_v: Optional[float] = None
 
 
 class PowerCapWrapperRequest(BaseModel):
@@ -275,11 +278,14 @@ class CsvSimulateRequest(BaseModel):
     bv_kind: Literal["bvdss", "bvgss_p", "bvgss_n"] = Field("bvdss")
     cap_type: Literal["ciss", "coss", "crss"] = Field("ciss")
     param_overrides: Dict[str, float] = Field(default_factory=dict)
+    subckt_name: str = Field("MY_MOSFET")
     vds: float = Field(0.5)
     vgs_v: float = Field(10.0)
     vds_max: float = Field(12.0)
     power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
     cap_wrapper: Optional[PowerCapWrapperRequest] = Field(None)
+    source_model_path: Optional[str] = Field(None, description="Optional imported .lib path to include directly")
+    prefer_source_model: bool = Field(False, description="Use source_model_path directly instead of regenerating a temp lib")
 
 
 class CsvLoadResponse(BaseModel):
@@ -295,6 +301,22 @@ class CsvSimulateResponse(BaseModel):
     sim: List[float]
     meas: List[float]
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class CsvQgSimulateRequest(BaseModel):
+    """Stateless Qg verification from datasheet charge values."""
+    qgs_nc: float = Field(20.0, description="Gate-source charge in nC")
+    qgd_nc: float = Field(30.0, description="Gate-drain charge in nC")
+    qg_nc: float = Field(60.0, description="Total gate charge in nC")
+    vg_final: float = Field(10.0, description="Final gate voltage used for Qg measurement")
+    vds: float = Field(25.0, description="Drain supply voltage used for Qg measurement")
+    id_load: float = Field(10.0, description="Load current used for Qg measurement")
+    param_overrides: Dict[str, float] = Field(default_factory=dict)
+    subckt_name: str = Field("MY_MOSFET")
+    power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
+    cap_wrapper: Optional[PowerCapWrapperRequest] = Field(None)
+    source_model_path: Optional[str] = Field(None, description="Optional imported .lib path to include directly")
+    prefer_source_model: bool = Field(False, description="Use source_model_path directly instead of regenerating a temp lib")
 
 
 class CsvFitStopConfig(BaseModel):
@@ -400,13 +422,15 @@ class CvWrapperCurveSpec(BaseModel):
     csv_path: str
     cap_type: Literal["ciss", "coss", "crss"] = "ciss"
     weight: float = 1.0
+    polynomial_order: int = Field(5, ge=0, le=12)
 
 
 class CsvCvWrapperFitRequest(BaseModel):
-    """Build a residual behavioral CV wrapper from loaded Ciss/Coss/Crss CSVs."""
+    """Build a polynomial-smoothed external-charge CV wrapper from CSVs."""
     curves: List[CvWrapperCurveSpec] = Field(default_factory=list)
     csv_path: Optional[str] = Field(None, description="Fallback single CSV path")
     cap_type: Literal["ciss", "coss", "crss"] = "ciss"
+    polynomial_order: int = Field(5, ge=0, le=12)
     params: Dict[str, float] = Field(default_factory=dict)
     power_params: Optional[PowerMOSSubcktParamsRequest] = Field(None)
 

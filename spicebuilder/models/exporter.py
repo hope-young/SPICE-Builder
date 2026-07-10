@@ -145,9 +145,14 @@ class LibExporter:
             f"AA={pwr.active_area_mm2:.6g}mm2 CellPitch={pwr.cell_pitch_um:.6g}um UnitM={unit_multiplier:.6g}",
         ]
         if capw and capw.enabled:
+            cap_desc = (
+                "external charge sources own the fitted Cgs/Cgd/Cds tables"
+                if capw.mode == "external_charge"
+                else "Ciss/Coss/Crss residuals are represented by behavioral capacitance currents"
+            )
             lines.extend([
                 f"* NOTICE: CV wrapper enabled ({capw.mode}).",
-                f"* Ciss/Coss/Crss residuals are represented by behavioral capacitance currents.",
+                f"* {cap_desc}.",
             ])
         lines.extend([
             "",
@@ -197,11 +202,12 @@ class LibExporter:
                 f".MODEL Dbody_diode D (IS={is_a:.4g} N={n:.4g} BV={bv:.4g} IBV={ibv:.4g})",
             ])
 
+        model_card = self._model_card_for_export(model, capw)
         lines.extend([
             ".ENDS",
             "",
             ".MODEL BSIM3_core NMOS LEVEL=49",
-            model.to_spice_card(),
+            model_card,
             ".END",
             "",
         ])
@@ -218,7 +224,127 @@ class LibExporter:
             pairs.append("0,0")
         return f".func SB_{name.upper()}(x) table(x,{','.join(pairs)})"
 
+    @staticmethod
+    def _format_charge_table_function(name: str, table: CapTable) -> str:
+        pairs: list[str] = []
+        for v, q_pc in zip(table.voltage_v, table.charge_pc):
+            pairs.append(f"{float(v):.8g},{float(q_pc) * 1e-12:.12e}")
+        if not pairs:
+            pairs.append("0,0")
+        return f".func SB_Q{name.upper()}(x) table(x,{','.join(pairs)})"
+
+    @staticmethod
+    def _pow_expr(var_name: str, power: int) -> str:
+        if power == 0:
+            return "1"
+        if power == 1:
+            return var_name
+        return "*".join([var_name] * power)
+
+    @classmethod
+    def _poly_expr(cls, coeff_f: list[float], var_name: str = "u") -> str:
+        terms: list[str] = []
+        for i, coeff in enumerate(coeff_f):
+            c = float(coeff)
+            if c == 0:
+                continue
+            if i == 0:
+                terms.append(f"({c:.12e})")
+            else:
+                terms.append(f"({c:.12e})*{cls._pow_expr(var_name, i)}")
+        return " + ".join(terms) if terms else "0"
+
+    @staticmethod
+    def _fallback_poly_coeff_f(table: CapTable, order: int = 5) -> tuple[list[float], float, float]:
+        import numpy as np
+
+        v = np.asarray(table.voltage_v, dtype=float)
+        c_f = np.asarray(table.capacitance_pf, dtype=float) * 1e-12
+        valid = np.isfinite(v) & np.isfinite(c_f)
+        v = v[valid]
+        c_f = c_f[valid]
+        if v.size == 0:
+            return [0.0], 0.0, 1.0
+        vmin = float(np.min(v))
+        vspan = float(np.max(v) - vmin)
+        if vspan <= 0 or v.size == 1:
+            return [max(float(np.mean(c_f)), 0.0)], vmin, 1.0
+        degree = int(max(0, min(order, v.size - 1, 12)))
+        u = 2.0 * (v - vmin) / vspan - 1.0
+        scale = max(float(np.nanmax(np.abs(c_f))), 1e-18)
+        coeff = np.polynomial.polynomial.polyfit(u, c_f / scale, deg=degree) * scale
+        return [float(x) for x in coeff], vmin, vspan
+
+    @classmethod
+    def _format_poly_cap_function(cls, name: str, table: CapTable, mode: str = "external_charge") -> list[str]:
+        upper = name.upper()
+        if table.polynomial_coeff_f:
+            coeff_f = [float(x) for x in table.polynomial_coeff_f]
+            vmin = float(table.polynomial_vmin_v if table.polynomial_vmin_v is not None else min(table.voltage_v or [0.0]))
+            vspan = float(table.polynomial_vspan_v if table.polynomial_vspan_v is not None else max((max(table.voltage_v or [1.0]) - vmin), 1.0))
+        else:
+            coeff_f, vmin, vspan = cls._fallback_poly_coeff_f(table)
+        vspan = vspan if abs(vspan) > 1e-30 else 1.0
+        coeff_text = ",".join(f"{c:.12e}" for c in coeff_f)
+        poly = cls._poly_expr(coeff_f)
+        raw = f"SB_{upper}_RAW"
+        norm = f"SB_{upper}_U"
+        func_line = (
+            f".func SB_{upper}(x) ({raw}({norm}(x)))"
+            if mode == "poly_residual"
+            else f".func SB_{upper}(x) (if({raw}({norm}(x))>0,{raw}({norm}(x)),0))"
+        )
+        return [
+            f"* SB_CV_POLY {upper} MODE={mode} VMIN={vmin:.12g} VSPAN={vspan:.12g} COEFF_F={coeff_text}",
+            f".func {norm}(x) (limit((2*((x)-{vmin:.12g})/{vspan:.12g})-1,-1,1))",
+            f".func {raw}(u) ({poly})",
+            func_line,
+        ]
+
+    @staticmethod
+    def _model_card_for_export(model: BSIM3Model, capw: PowerCapWrapper | None) -> str:
+        if not (capw and capw.enabled and capw.mode == "external_charge"):
+            return model.to_spice_card()
+
+        lines: list[str] = []
+        for spec in PARAM_SPECS:
+            if spec.category in ("Diode", "GateLeakage"):
+                continue
+            val = 0.0 if spec.name in ("CGSO", "CGDO", "CGBO", "TT") else model.get(spec.name)
+            if val == 0:
+                fmt = "0"
+            elif abs(val) < 1e-3 or abs(val) > 1e6:
+                fmt = f"{val:.8e}"
+            else:
+                fmt = f"{val:.8g}"
+            lines.append(f"+{spec.name}={fmt}")
+        return "\n".join(lines)
+
     def _cap_wrapper_lines(self, capw: PowerCapWrapper) -> list[str]:
+        if capw.mode in ("external_charge", "poly_residual"):
+            residual_mode = capw.mode == "poly_residual"
+            lines = [
+                "* CV polynomial residual wrapper: BSIM core capacitance plus Bcap residual matches target CV."
+                if residual_mode else
+                "* CV external-charge wrapper: positive total Cgs/Cgd/Cds are polynomial functions in Farads.",
+                "* Polynomial metadata comments support GUI re-import.",
+            ]
+            if not residual_mode:
+                lines.append("* CGSO/CGDO/CGBO/TT in BSIM3_core are exported as zero to avoid obvious double-counting.")
+            if capw.cgs:
+                lines.extend(self._format_poly_cap_function("cgs", capw.cgs, capw.mode))
+            if capw.cgd:
+                lines.extend(self._format_poly_cap_function("cgd", capw.cgd, capw.mode))
+            if capw.cds:
+                lines.extend(self._format_poly_cap_function("cds", capw.cds, capw.mode))
+            if capw.cgs:
+                lines.append("Bcap_cgs G S I={SB_CGS(V(D,S))*ddt(V(G,S))}")
+            if capw.cgd:
+                lines.append("Bcap_cgd G D I={SB_CGD(V(D,S))*ddt(V(G,D))}")
+            if capw.cds:
+                lines.append("Bcap_cds D S I={SB_CDS(V(D,S))*ddt(V(D,S))}")
+            return lines
+
         lines = [
             "* CV residual wrapper: table capacitance values are in Farads",
             "* Residual sources are connected at external package pins to match",

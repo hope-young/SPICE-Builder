@@ -20,6 +20,7 @@ from .models import (
     SimulateRequest, SimulateResponse, FitSingleRequest, FitSingleResponse,
     LoadCsvRequest, LoadCsvResponse,
     CsvLoadRequest, CsvLoadResponse, CsvSimulateRequest, CsvSimulateResponse,
+    CsvQgSimulateRequest,
     CsvFitRequest, CsvFitResponse,
     DualFitRequest, DualFitResponse, CsvExportModelRequest,
     CsvCvWrapperFitRequest, CsvCvWrapperFitResponse,
@@ -32,6 +33,9 @@ from spicebuilder.data.loader_csv import (
 from spicebuilder.data.simdata import SimData
 from spicebuilder.models.cap_wrapper import (
     PowerCapWrapper,
+    fit_external_charge_cap_wrapper,
+    fit_polynomial_external_charge_cap_wrapper,
+    fit_polynomial_residual_cap_wrapper,
     fit_residual_cap_wrapper,
     wrapper_terminal_caps,
 )
@@ -198,6 +202,20 @@ def _cap_wrapper_from_request(req) -> PowerCapWrapper | None:
     if wrapper and wrapper.enabled:
         return wrapper
     return None
+
+
+def _source_model_path_from_request(req) -> Path | None:
+    if not bool(getattr(req, "prefer_source_model", False)):
+        return None
+    raw = getattr(req, "source_model_path", None)
+    if not raw:
+        return None
+    path = Path(str(raw))
+    if not path.exists():
+        raise HTTPException(404, f"Source model not found: {raw}")
+    if path.suffix.lower() not in (".lib", ".cir", ".sub", ".sp", ".spi"):
+        raise HTTPException(400, f"Source model must be a SPICE file, got: {raw}")
+    return path.resolve()
 
 
 def _csv_optimizer_from_request(req) -> Optimizer:
@@ -1162,15 +1180,17 @@ def csv_simulate(req: CsvSimulateRequest):
     model = BSIM3Model(name="EVAL")
     # 没法接 init_from_key_params（没数据集），改用 BSIM3Model 默认值
     applied_params, skipped_params = _apply_sim_params_unchecked(model, req.param_overrides)
+    source_model_path = _source_model_path_from_request(req)
 
     # LTspice 评估
     try:
         ev = LTspiceEvaluator(
-            subckt_name="MY_MOSFET",
+            subckt_name=req.subckt_name or "MY_MOSFET",
             rg_ohm=1.6,
             verbose=False,
             power_params=_evaluator_power_params_from_request(req),
             cap_wrapper=_cap_wrapper_from_request(req),
+            source_model_path=source_model_path,
         )
         if req.curve_type == "idvg":
             sim_arr = ev.eval_idvg(model, sd.ivar, vds=req.vds)
@@ -1182,6 +1202,8 @@ def csv_simulate(req: CsvSimulateRequest):
             sim_arr = ev.eval_cv(model, sd.ivar, vds_max=req.vds_max, cap_type=sd.metadata.get("cap_type", req.cap_type))
             if sim_arr is None:
                 raise RuntimeError("LTspice CV evaluation failed")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"LTspice simulate failed: {e}")
 
@@ -1198,6 +1220,87 @@ def csv_simulate(req: CsvSimulateRequest):
             "param_overrides": req.param_overrides,
             "applied_param_count": applied_params,
             "skipped_params": skipped_params,
+            "model_source": "source_lib" if source_model_path else "regenerated",
+            "source_model_path": str(source_model_path) if source_model_path else None,
+        },
+    )
+
+
+def _build_qg_target(qgs_nc: float, qgd_nc: float, qg_nc: float, vg_final: float) -> tuple[np.ndarray, np.ndarray, dict]:
+    qg_total = max(float(qg_nc), 1e-9)
+    qgs = min(max(float(qgs_nc), 0.0), qg_total)
+    qgd = min(max(float(qgd_nc), 0.0), max(qg_total - qgs, 0.0))
+    q_miller_end = min(qgs + qgd, qg_total)
+    vg = max(float(vg_final), 1e-9)
+    plateau = min(max(vg * 0.55, 0.05), max(vg - 0.05, 0.05))
+
+    q1 = np.linspace(0.0, qgs, 25, endpoint=True) if qgs > 0 else np.array([0.0])
+    v1 = np.linspace(0.0, plateau, q1.size, endpoint=True)
+    q2 = np.linspace(qgs, q_miller_end, 25, endpoint=True) if q_miller_end > qgs else np.array([qgs])
+    v2 = np.full(q2.size, plateau)
+    q3 = np.linspace(q_miller_end, qg_total, 35, endpoint=True) if qg_total > q_miller_end else np.array([qg_total])
+    v3 = np.linspace(plateau, vg, q3.size, endpoint=True)
+    q = np.concatenate([q1, q2[1:], q3[1:]])
+    v = np.concatenate([v1, v2[1:], v3[1:]])
+    q_unique, idx = np.unique(q, return_index=True)
+    meta = {
+        "qgs_nc": qgs,
+        "qgd_nc": qgd,
+        "qg_nc": qg_total,
+        "qgd_start_nc": qgs,
+        "qgd_end_nc": q_miller_end,
+        "vg_final": vg,
+        "vplateau_auto": plateau,
+        "plateau_source": "auto_0.55_vg_final",
+    }
+    return q_unique, v[idx], meta
+
+
+@router.post("/csv/qg_simulate", response_model=CsvSimulateResponse)
+def csv_qg_simulate(req: CsvQgSimulateRequest):
+    """Generate a target Qg curve from datasheet values and verify by LTspice."""
+    qg_x, target_vg, qg_meta = _build_qg_target(req.qgs_nc, req.qgd_nc, req.qg_nc, req.vg_final)
+
+    model = BSIM3Model(name="EVAL")
+    applied_params, skipped_params = _apply_sim_params_unchecked(model, req.param_overrides)
+    source_model_path = _source_model_path_from_request(req)
+
+    try:
+        ev = LTspiceEvaluator(
+            subckt_name=req.subckt_name or "MY_MOSFET",
+            rg_ohm=1.6,
+            verbose=False,
+            power_params=_evaluator_power_params_from_request(req),
+            cap_wrapper=_cap_wrapper_from_request(req),
+            source_model_path=source_model_path,
+        )
+        sim_arr = ev.eval_qg(model, qg_x, vds=req.vds, id_load=req.id_load, vg_final=req.vg_final)
+        if sim_arr is None:
+            raise RuntimeError(ev.last_error or "LTspice Qg evaluation failed")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"LTspice Qg simulate failed: {e}")
+
+    sim = np.asarray(sim_arr, dtype=float)
+    rms = float(np.sqrt(np.mean((sim - target_vg) ** 2))) if sim.size == target_vg.size else 0.0
+    r2 = _r2_linear_safe(target_vg, sim)
+    return CsvSimulateResponse(
+        curve_type="qg",
+        ivar=qg_x.tolist(),
+        sim=sim.tolist(),
+        meas=target_vg.tolist(),
+        metadata={
+            **qg_meta,
+            "vds_v": req.vds,
+            "id_load_a": req.id_load,
+            "rms_v": rms,
+            "r2_linear": r2,
+            "param_overrides": req.param_overrides,
+            "applied_param_count": applied_params,
+            "skipped_params": skipped_params,
+            "model_source": "source_lib" if source_model_path else "regenerated",
+            "source_model_path": str(source_model_path) if source_model_path else None,
         },
     )
 
@@ -1222,7 +1325,7 @@ def _r2_log_safe(meas: np.ndarray, sim: np.ndarray) -> float:
 
 @router.post("/csv/cv_wrapper_fit", response_model=CsvCvWrapperFitResponse)
 def csv_cv_wrapper_fit(req: CsvCvWrapperFitRequest):
-    """Build a residual behavioral capacitance wrapper from CV CSVs."""
+    """Build a positive external-charge capacitance wrapper from CV CSVs."""
     specs = list(req.curves or [])
     if not specs:
         if not req.csv_path:
@@ -1230,15 +1333,22 @@ def csv_cv_wrapper_fit(req: CsvCvWrapperFitRequest):
         specs = [{"csv_path": req.csv_path, "cap_type": req.cap_type}]  # type: ignore[list-item]
 
     loaded: dict[str, SimData] = {}
+    polynomial_orders: dict[str, int] = {}
     warnings: list[str] = []
     for spec in specs:
         csv_path = spec.csv_path if hasattr(spec, "csv_path") else str(spec.get("csv_path", ""))
         cap_type = spec.cap_type if hasattr(spec, "cap_type") else str(spec.get("cap_type", "ciss"))
+        poly_order = int(
+            spec.polynomial_order if hasattr(spec, "polynomial_order")
+            else spec.get("polynomial_order", req.polynomial_order)  # type: ignore[union-attr]
+        )
+        poly_order = max(0, min(poly_order, 12))
         path = Path(csv_path)
         if not path.exists():
             raise HTTPException(404, f"CSV not found: {csv_path}")
         try:
             loaded[str(cap_type)] = load_cv_csv(path, cap_type=str(cap_type))
+            polynomial_orders[str(cap_type)] = poly_order
         except Exception as e:
             raise HTTPException(400, f"Failed to parse CV CSV {csv_path}: {e}")
 
@@ -1281,24 +1391,22 @@ def csv_cv_wrapper_fit(req: CsvCvWrapperFitRequest):
         warnings.append(f"Baseline LTspice CV failed: {e}; using zero baseline")
         baseline = {cap_type: np.zeros_like(v_grid) for cap_type in loaded.keys()}
 
-    wrapper = fit_residual_cap_wrapper(v_grid, measured, baseline)
+    wrapper = fit_polynomial_residual_cap_wrapper(
+        v_grid,
+        measured,
+        baseline=baseline,
+        polynomial_orders=polynomial_orders,
+        default_order=int(req.polynomial_order),
+    )
 
     curve_results: list[dict] = []
     try:
-        wrapped_ev = LTspiceEvaluator(
-            subckt_name="MY_MOSFET",
-            rg_ohm=1.6,
-            verbose=False,
-            power_params=pwr,
-            cap_wrapper=wrapper,
-        )
+        terminal_caps = wrapper_terminal_caps(wrapper, v_grid)
         for cap_type, meas in measured.items():
-            sim_arr = wrapped_ev.eval_cv(model, v_grid, vds_max=float(v_grid.max()), cap_type=cap_type)
-            if sim_arr is None:
-                sim = baseline.get(cap_type, np.zeros_like(v_grid))
-                warnings.append(f"Wrapped LTspice CV failed for {cap_type}; returning baseline")
-            else:
-                sim = np.asarray(sim_arr, dtype=float)
+            sim = np.asarray(baseline.get(cap_type, np.zeros_like(v_grid)), dtype=float) + np.asarray(
+                terminal_caps.get(cap_type, np.zeros_like(v_grid)),
+                dtype=float,
+            )
             curve_results.append({
                 "cap_type": cap_type,
                 "ivar": v_grid.tolist(),
@@ -1309,12 +1417,18 @@ def csv_cv_wrapper_fit(req: CsvCvWrapperFitRequest):
                 "r2_log": _r2_log_safe(meas, sim),
             })
     except Exception as e:
-        raise HTTPException(500, f"CV wrapper LTspice verification failed: {e}")
+        raise HTTPException(500, f"CV wrapper construction failed: {e}")
 
     return CsvCvWrapperFitResponse(
         cap_wrapper=wrapper.to_dict(),
         curves=curve_results,
-        warnings=warnings,
+        warnings=[
+            *warnings,
+            "Polynomial CV fit orders: " + ", ".join(
+                f"{cap}={polynomial_orders.get(cap, req.polynomial_order)}"
+                for cap in sorted(measured.keys())
+            ),
+        ],
     )
 
 

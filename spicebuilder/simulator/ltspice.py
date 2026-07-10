@@ -860,6 +860,54 @@ Vd_ac D 0 DC {{VDSVAL}} AC 1
         raise ValueError(f"Unknown cap_type: {cap_type!r}; expected ciss|coss|crss")
 
 
+def gen_qg_netlist(model_path: str,
+                   qg_max_nc: float = 100.0,
+                   vds_v: float = 25.0,
+                   id_load_a: float = 10.0,
+                   igate_a: float = 1e-3,
+                   vg_final_v: float = 10.0,
+                   model_name: str = "nmos1",
+                   use_subckt: bool = True) -> str:
+    """Generate a gate-charge transient test bench.
+
+    A constant current source charges the external gate pin, so the x-axis is
+    Qg = Ig * t.  The drain is tied to a VDD rail through a DC load current
+    source, matching the usual datasheet-style gate-charge switching setup.
+    """
+    abs_path = Path(model_path).resolve()
+    qg_c = max(float(qg_max_nc), 1e-6) * 1e-9
+    ig = max(abs(float(igate_a)), 1e-9)
+    tstop = max(qg_c / ig * 1.15, 1e-9)
+    tstep = max(tstop / 600.0, 1e-12)
+    tdelay = max(min(tstop * 1e-3, 1e-9), 1e-12)
+    trise = tdelay
+    pulse_width = max(tstop, tdelay * 10.0)
+    period = pulse_width * 2.0
+    vdd = max(float(vds_v), 1e-6)
+    vg_final = max(float(vg_final_v), 1e-6)
+    iload = max(abs(float(id_load_a)), 1e-12)
+    if use_subckt:
+        x_line = f"X1 D G 0 {model_name}"
+    else:
+        x_line = f"M1 D G 0 0 {model_name}"
+    return f"""* Gate-charge transient, VDS={vdd:g}V, Id(load)={iload:g}A
+.include "{abs_path}"
+{x_line}
+Vdd VDD 0 {vdd:g}
+Rdrain_leak D VDD 1e12
+Rgate_leak G 0 1e12
+Iload VDD D PULSE(0 {iload:g} {tdelay:.12g} {trise:.12g} {trise:.12g} {pulse_width:.12g} {period:.12g})
+Ig 0 G PULSE(0 {ig:g} {tdelay:.12g} {trise:.12g} {trise:.12g} {pulse_width:.12g} {period:.12g})
+Bgate_clamp G 0 I={{if(V(G)>{vg_final:g},1e3*(V(G)-{vg_final:g}),0)}}
+.ic V(G)=0 V(D)={vdd:g}
+.options method=gear maxord=2 reltol=1e-4 abstol=1e-12 vntol=1e-6 gmin=1e-12
+.save V(g) V(d)
+.tran 0 {tstop:.12g} 0 {tstep:.12g} uic
+.print tran V(g) V(d)
+.end
+"""
+
+
 # ============================================================
 #  快速测试
 # ============================================================

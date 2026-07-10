@@ -58,6 +58,7 @@ function axisLabelForSummary(summary: StepRuntimeSummary): string {
   if (summary.curveType === "idvd") return "Vds";
   if (summary.curveType === "cv") return "Vds";
   if (summary.curveType === "bv") return summary.bvKind === "bvdss" ? "Vds" : "Vgs";
+  if (summary.curveType === "qg") return "Qg";
   return "Vgs";
 }
 
@@ -147,11 +148,10 @@ function useTreeData(userSteps: Map<string, TreeChild[]>) {
         id: "cv", label: "CV / Capacitance", tag: "live", canAdd: false,
         children: userSteps.get("cv") || [],
       },
-      { id: "qg", label: "Qg / Gate Charge", tag: "next", canAdd: false, children: [
-        { id: "qg_total", label: "Qg total", status: "empty", r2: null, pts: 0, type: "Qg" },
-        { id: "qgs",      label: "Qgs",      status: "empty", r2: null, pts: 0, type: "Qg" },
-        { id: "qgd",      label: "Qgd",      status: "empty", r2: null, pts: 0, type: "Qg" },
-      ]},
+      {
+        id: "qg", label: "Qg / Gate Charge", tag: "live", canAdd: false,
+        children: userSteps.get("qg") || [],
+      },
       { id: "dpt", label: "DPT / Switching", tag: "next", canAdd: false, children: [
         { id: "dpt_on",  label: "Turn-on",  status: "empty", r2: null, pts: 0, type: "DPT" },
         { id: "dpt_off", label: "Turn-off", status: "empty", r2: null, pts: 0, type: "DPT" },
@@ -736,14 +736,18 @@ export function Workbench(props: WorkbenchProps) {
       { id: "crss", label: "Crss", status: "empty", r2: null, pts: 0,
         bias: "f=1MHz", csvFile: "Crss.csv", range: "Vds sweep", weight: 1.0, type: "CV" },
     ]);
+    initialMap.set("qg", [
+      { id: "qg_curve", label: "Qg Curve", status: "empty", r2: null, pts: 0,
+        bias: "Vg=10V", csvFile: "Generated", range: "Qg sweep", weight: 1.0, type: "Qg" },
+    ]);
     return initialMap;
   });
   const treeData = useTreeData(userSteps);
-  const [checkedFeatures, setCheckedFeatures]   = useState<Set<string>>(new Set(["idvg", "idvd", "bv", "cv"]));
+  const [checkedFeatures, setCheckedFeatures]   = useState<Set<string>>(new Set(["idvg", "idvd", "bv", "cv", "qg"]));
   const [checkedChildren, setCheckedChildren]   = useState<Set<string>>(
-    () => new Set(["idvg_05", "idvg_5", ...IDVD_DEFAULT_VGS.map(idvdStepId), "bvdss", "bvgss_p", "bvgss_n", "ciss", "coss", "crss"])
+    () => new Set(["idvg_05", "idvg_5", ...IDVD_DEFAULT_VGS.map(idvdStepId), "bvdss", "bvgss_p", "bvgss_n", "ciss", "coss", "crss", "qg_curve"])
   );
-  const [expandedFeatures, setExpandedFeatures] = useState<Set<string>>(new Set(["idvg", "idvd", "bv", "cv"]));
+  const [expandedFeatures, setExpandedFeatures] = useState<Set<string>>(new Set(["idvg", "idvd", "bv", "cv", "qg"]));
   const [selectedId, setSelectedId] = useState<string | null>("idvg_5");
 
   // Power Cell 配置
@@ -880,10 +884,12 @@ export function Workbench(props: WorkbenchProps) {
                 ? step.bias
                 : summary.curveType === "cv"
                   ? step.bias
+                  : summary.curveType === "qg"
+                    ? `Vg=${fmtTreeNumber(summary.vgs)}V`
                 : `Vds=${fmtTreeNumber(summary.vds)}V`,
             csvFile,
             range: summary.pts > 0
-              ? `${axisLabelForSummary(summary)} ${fmtTreeNumber(summary.vmin)}-${fmtTreeNumber(summary.vmax)}V`
+              ? `${axisLabelForSummary(summary)} ${fmtTreeNumber(summary.vmin)}-${fmtTreeNumber(summary.vmax)}${summary.curveType === "qg" ? "nC" : "V"}`
               : step.range,
           };
           changed = changed || JSON.stringify(nextStep) !== JSON.stringify(step);

@@ -278,6 +278,7 @@ export type CsvFitStopConfig = {
 };
 
 export type FitCurveType = "idvg" | "idvd" | "bv" | "cv";
+export type WorkbenchCurveType = FitCurveType | "qg";
 export type BvKind = "bvdss" | "bvgss_p" | "bvgss_n";
 export type CapType = "ciss" | "coss" | "crss";
 
@@ -286,6 +287,9 @@ export type CapTable = {
   voltage_v: number[];
   capacitance_pf: number[];
   charge_pc: number[];
+  polynomial_coeff_f?: number[] | null;
+  polynomial_vmin_v?: number | null;
+  polynomial_vspan_v?: number | null;
 };
 
 export type PowerCapWrapper = {
@@ -456,6 +460,9 @@ export async function csvSimulate(
     vds_max?: number;
     powerParams?: PowerMOSSubcktParams;
     capWrapper?: PowerCapWrapper | null;
+    sourceModelPath?: string | null;
+    preferSourceModel?: boolean;
+    subcktName?: string;
     signal?: AbortSignal;
   }
 ): Promise<{ curve_type: string; ivar: number[]; sim: number[]; meas: number[]; metadata: Record<string, unknown> }> {
@@ -465,11 +472,14 @@ export async function csvSimulate(
     bv_kind: opts.bvKind ?? "bvdss",
     cap_type: opts.capType ?? "ciss",
     param_overrides: opts.paramOverrides,
+    subckt_name: opts.subcktName ?? "MY_MOSFET",
     vds: opts.vds ?? 0.5,
     vgs_v: opts.vgs_v ?? 10.0,
     vds_max: opts.vds_max ?? 12.0,
     power_params: opts.powerParams,
     cap_wrapper: opts.capWrapper,
+    source_model_path: opts.sourceModelPath,
+    prefer_source_model: opts.preferSourceModel ?? false,
   };
   if (!isTauri()) {
     return webFetch("/api/csv/simulate", body, opts.signal);
@@ -484,6 +494,58 @@ export async function csvSimulate(
     body: JSON.stringify(body),
   });
   if (!resp.ok) throw new Error(`csvSimulate failed: ${resp.status}`);
+  return resp.body;
+}
+
+/** Qg step: no CSV. Build target from Qgs/Qgd/Qg and verify with LTspice transient. */
+export async function csvQgSimulate(
+  opts: {
+    qgsNc: number;
+    qgdNc: number;
+    qgNc: number;
+    vgFinal: number;
+    vds: number;
+    idLoad: number;
+    paramOverrides: Record<string, number>;
+    powerParams?: PowerMOSSubcktParams;
+    capWrapper?: PowerCapWrapper | null;
+    sourceModelPath?: string | null;
+    preferSourceModel?: boolean;
+    subcktName?: string;
+    signal?: AbortSignal;
+  }
+): Promise<{ curve_type: string; ivar: number[]; sim: number[]; meas: number[]; metadata: Record<string, unknown> }> {
+  const endpoint = "/api/csv/qg_simulate";
+  const body = {
+    qgs_nc: opts.qgsNc,
+    qgd_nc: opts.qgdNc,
+    qg_nc: opts.qgNc,
+    vg_final: opts.vgFinal,
+    vds: opts.vds,
+    id_load: opts.idLoad,
+    param_overrides: opts.paramOverrides,
+    subckt_name: opts.subcktName ?? "MY_MOSFET",
+    power_params: opts.powerParams,
+    cap_wrapper: opts.capWrapper,
+    source_model_path: opts.sourceModelPath,
+    prefer_source_model: opts.preferSourceModel ?? false,
+  };
+  if (!isTauri()) {
+    return webFetch(endpoint, body, opts.signal);
+  }
+  const resp = await cmd<{
+    status: number; ok: boolean; body: {
+      curve_type: string; ivar: number[]; sim: number[]; meas: number[]; metadata: Record<string, unknown>;
+    };
+  }>("call_api", {
+    method: "POST",
+    endpoint,
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const detail = stringifyBackendBody(resp.body);
+    throw new Error(`csvQgSimulate failed: ${resp.status} ${detail}`);
+  }
   return resp.body;
 }
 
@@ -655,9 +717,10 @@ export async function csvDualFit(
 }
 
 export async function csvCvWrapperFit(opts: {
-  curves: Array<{ csvPath: string; capType: CapType; weight?: number }>;
+  curves: Array<{ csvPath: string; capType: CapType; weight?: number; polynomialOrder?: number }>;
   csvPath?: string;
   capType?: CapType;
+  polynomialOrder?: number;
   params: Record<string, number>;
   powerParams?: PowerMOSSubcktParams;
   signal?: AbortSignal;
@@ -679,9 +742,11 @@ export async function csvCvWrapperFit(opts: {
       csv_path: c.csvPath,
       cap_type: c.capType,
       weight: c.weight ?? 1,
+      polynomial_order: c.polynomialOrder ?? opts.polynomialOrder ?? 5,
     })),
     csv_path: opts.csvPath,
     cap_type: opts.capType ?? "ciss",
+    polynomial_order: opts.polynomialOrder ?? 5,
     params: opts.params,
     power_params: opts.powerParams,
   };

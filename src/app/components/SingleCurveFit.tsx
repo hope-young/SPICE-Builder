@@ -14,6 +14,7 @@ import { Button } from "./ui";
 import {
   csvLoad,
   csvSimulate,
+  csvQgSimulate,
   csvFitStream,
   csvCvWrapperFit,
   csvDualFitStream,
@@ -55,7 +56,7 @@ function readStoredWidth(key: string, fallback: number, min: number, max: number
 }
 
 type StopPreset = "fast" | "balanced" | "precise" | "custom";
-type CurveType = "idvg" | "idvd" | "bv" | "cv";
+type CurveType = "idvg" | "idvd" | "bv" | "cv" | "qg";
 type FitTargetId = "idvg" | "idvd" | "bv" | "diode" | "cv" | "qg" | "dpt";
 type LayoutMode = "grid" | "vertical" | "horizontal";
 
@@ -107,8 +108,8 @@ const FIT_TARGET_TEMPLATES: Array<{
     id: "qg",
     label: "Qg / Gate Charge",
     hint: "栅电荷",
-    children: ["Qg total", "Qgs", "Qgd"],
-    implemented: false,
+    children: ["Qg curve"],
+    implemented: true,
   },
   {
     id: "dpt",
@@ -432,6 +433,11 @@ type TransferStep = {
   vdsMax: number;
   bvKind: BvKind;
   capType: CapType;
+  cvPolyOrder: number;
+  qgsNc: number;
+  qgdNc: number;
+  qgNc: number;
+  qgLoadCurrent: number;
   csvPath: string;
   raw: CurveRaw | null;
   simCurve: number[];
@@ -475,20 +481,26 @@ function makeTransferStep(
   const capType = capTypeFromStepId(id);
   const bvLabel = bvKind === "bvgss_p" ? "BVGSS+" : bvKind === "bvgss_n" ? "BVGSS-" : "BVDSS";
   const cvLabel = capType === "coss" ? "Coss" : capType === "crss" ? "Crss" : "Ciss";
+  const defaultQg = 60.0;
   return {
     id: id ?? `step-${Date.now()}-${index}`,
-    name: name ?? (curveType === "idvd" ? `IdVd @ Vgs=${bias}V` : curveType === "bv" ? bvLabel : curveType === "cv" ? cvLabel : `IdVg @ Vds=${bias}V`),
+    name: name ?? (curveType === "idvd" ? `IdVd @ Vgs=${bias}V` : curveType === "bv" ? bvLabel : curveType === "cv" ? cvLabel : curveType === "qg" ? "Qg / Gate Charge" : `IdVg @ Vds=${bias}V`),
     curveType,
-    vds: curveType === "idvg" ? bias : 0.5,
+    vds: curveType === "idvg" ? bias : curveType === "qg" ? 25.0 : 0.5,
     vgs: curveType === "idvd" ? bias : 10.0,
-    vdsMax: curveType === "bv" ? Math.max(120.0, bias || 120.0) : curveType === "cv" ? Math.max(25.0, bias || 25.0) : 12.0,
+    vdsMax: curveType === "bv" ? Math.max(120.0, bias || 120.0) : curveType === "cv" ? Math.max(25.0, bias || 25.0) : curveType === "qg" ? defaultQg : 12.0,
     bvKind,
     capType,
+    cvPolyOrder: 5,
+    qgsNc: 20.0,
+    qgdNc: 25.0,
+    qgNc: defaultQg,
+    qgLoadCurrent: 10.0,
     csvPath: "",
     raw: null,
     simCurve: [],
-    vmin: curveType === "idvd" ? 0.0 : curveType === "bv" ? 0.0 : curveType === "cv" ? 1.0 : 3.5,
-    vmax: curveType === "idvd" ? 12.0 : curveType === "bv" ? Math.max(120.0, bias || 120.0) : curveType === "cv" ? Math.max(25.0, bias || 25.0) : 5.0,
+    vmin: curveType === "idvd" ? 0.0 : curveType === "bv" ? 0.0 : curveType === "cv" ? 1.0 : curveType === "qg" ? 0.0 : 3.5,
+    vmax: curveType === "idvd" ? 12.0 : curveType === "bv" ? Math.max(120.0, bias || 120.0) : curveType === "cv" ? Math.max(25.0, bias || 25.0) : curveType === "qg" ? defaultQg : 5.0,
     status: "empty",
     rms: null,
     r2Log: null,
@@ -618,7 +630,119 @@ function parseSpiceWrapper(text: string, fallbackCellPitchUm: number): SpiceWrap
   return wrapper;
 }
 
-function parseSpiceParams(text: string, fallbackCellPitchUm = 2.0): { params: Record<string, number>; unknown: string[]; invalid: string[]; wrapper: SpiceWrapperImport } {
+function buildChargePc(voltage: number[], capacitancePf: number[]): number[] {
+  const charge: number[] = [];
+  let acc = 0;
+  for (let i = 0; i < voltage.length; i += 1) {
+    if (i > 0) {
+      const dv = voltage[i] - voltage[i - 1];
+      const c0 = capacitancePf[i - 1] ?? 0;
+      const c1 = capacitancePf[i] ?? c0;
+      acc += 0.5 * (c0 + c1) * dv;
+    }
+    charge.push(acc);
+  }
+  return charge;
+}
+
+function evalCapPolyPf(coeffF: number[], v: number, vmin: number, vspan: number): number {
+  const span = Math.abs(vspan) > 1e-30 ? vspan : 1;
+  const u = clamp((2 * (v - vmin)) / span - 1, -1, 1);
+  let acc = 0;
+  let pow = 1;
+  for (const coeff of coeffF) {
+    acc += coeff * pow;
+    pow *= u;
+  }
+  return Math.max(acc * 1e12, 0);
+}
+
+function parsePolyCapTable(text: string, name: "cgs" | "cgd" | "cds"): (NonNullable<PowerCapWrapper["cgs"]> & { wrapperMode?: string }) | null {
+  const upper = name.toUpperCase();
+  const re = new RegExp(`^\\s*\\*\\s*SB_CV_POLY\\s+${upper}\\s+([^\\r\\n]+)$`, "im");
+  const match = text.match(re);
+  if (!match) return null;
+  const meta = match[1];
+  const mode = meta.match(/\bMODE\s*=\s*([^\s]+)/i)?.[1]?.trim();
+  const vmin = parseSpiceNumber(meta.match(/\bVMIN\s*=\s*([^\s]+)/i)?.[1] ?? "") ?? 0;
+  const vspan = parseSpiceNumber(meta.match(/\bVSPAN\s*=\s*([^\s]+)/i)?.[1] ?? "") ?? 1;
+  const coeffText = meta.match(/\bCOEFF_F\s*=\s*([^\s]+)/i)?.[1] ?? "";
+  const coeff = coeffText
+    .split(",")
+    .map(token => parseSpiceNumber(token))
+    .filter((value): value is number => value !== null && Number.isFinite(value));
+  if (coeff.length === 0) return null;
+  const n = 101;
+  const voltage = Array.from({ length: n }, (_, idx) => vmin + (vspan * idx) / (n - 1));
+  const capacitance = voltage.map(v => evalCapPolyPf(coeff, v, vmin, vspan));
+  return {
+    name,
+    voltage_v: voltage,
+    capacitance_pf: capacitance,
+    charge_pc: buildChargePc(voltage, capacitance),
+    polynomial_coeff_f: coeff,
+    polynomial_vmin_v: vmin,
+    polynomial_vspan_v: vspan,
+    wrapperMode: mode,
+  };
+}
+
+function parseCapTable(text: string, name: "cgs" | "cgd" | "cds"): NonNullable<PowerCapWrapper["cgs"]> | null {
+  const upper = name.toUpperCase();
+  const re = new RegExp(`\\.func\\s+SB_${upper}\\s*\\([^)]*\\)\\s+table\\s*\\(\\s*x\\s*,([\\s\\S]*?)\\)`, "i");
+  const match = text.match(re);
+  if (!match) return null;
+  const values = match[1]
+    .replace(/\r?\n\s*\+\s*/g, ",")
+    .split(/[,\s]+/)
+    .map(token => token.trim())
+    .filter(Boolean)
+    .map(parseSpiceNumber)
+    .filter((value): value is number => value !== null && Number.isFinite(value));
+  const pairs: Array<{ v: number; cPf: number }> = [];
+  for (let i = 0; i + 1 < values.length; i += 2) {
+    pairs.push({ v: values[i], cPf: values[i + 1] * 1e12 });
+  }
+  if (pairs.length === 0) return null;
+  pairs.sort((a, b) => a.v - b.v);
+  const voltage = pairs.map(pair => pair.v);
+  const capacitance = pairs.map(pair => pair.cPf);
+  return {
+    name,
+    voltage_v: voltage,
+    capacitance_pf: capacitance,
+    charge_pc: buildChargePc(voltage, capacitance),
+  };
+}
+
+function parseCapWrapper(text: string): PowerCapWrapper | null {
+  const cgsPoly = parsePolyCapTable(text, "cgs");
+  const cgdPoly = parsePolyCapTable(text, "cgd");
+  const cdsPoly = parsePolyCapTable(text, "cds");
+  const polyMode = cgsPoly?.wrapperMode || cgdPoly?.wrapperMode || cdsPoly?.wrapperMode;
+  const cgs = cgsPoly ?? parseCapTable(text, "cgs");
+  const cgd = cgdPoly ?? parseCapTable(text, "cgd");
+  const cds = cdsPoly ?? parseCapTable(text, "cds");
+  const hasSource = /\bBcv_(cgs|cgd|cds)\b/i.test(text);
+  const hasChargeSource = /\bBq_(cgs|cgd|cds)\b/i.test(text);
+  const hasPolySource = /\bBcap_(cgs|cgd|cds)\b/i.test(text) || /\bSB_CV_POLY\b/i.test(text);
+  if (!cgs && !cgd && !cds && !hasSource && !hasChargeSource && !hasPolySource) return null;
+  return {
+    enabled: true,
+    mode: polyMode || (hasChargeSource || hasPolySource ? "external_charge" : "residual"),
+    cgs,
+    cgd,
+    cds,
+  };
+}
+
+function parseSubcktName(text: string): string | null {
+  const match = text.match(/^\s*\.SUBCKT\s+([^\s]+)/im);
+  const name = match?.[1]?.trim();
+  return name || null;
+}
+
+function parseSpiceParams(text: string, fallbackCellPitchUm = 2.0): { params: Record<string, number>; unknown: string[]; invalid: string[]; wrapper: SpiceWrapperImport; capWrapper: PowerCapWrapper | null } {
   const params: Record<string, number> = {};
   const unknown = new Set<string>();
   const invalid: string[] = [];
@@ -647,7 +771,13 @@ function parseSpiceParams(text: string, fallbackCellPitchUm = 2.0): { params: Re
     params[rawName] = value;
   }
 
-  return { params, unknown: Array.from(unknown), invalid, wrapper: parseSpiceWrapper(text, fallbackCellPitchUm) };
+  return {
+    params,
+    unknown: Array.from(unknown),
+    invalid,
+    wrapper: parseSpiceWrapper(text, fallbackCellPitchUm),
+    capWrapper: parseCapWrapper(text),
+  };
 }
 
 function positiveOrNull(v: number | null | undefined): number | null {
@@ -665,6 +795,7 @@ function curveTypeFromExternal(type: string | undefined): CurveType {
   if (type === "IdVd") return "idvd";
   if (type === "BV") return "bv";
   if (type === "CV") return "cv";
+  if (type === "Qg") return "qg";
   return "idvg";
 }
 
@@ -684,28 +815,66 @@ function targetIdForCurve(curveType: CurveType): FitTargetId {
   if (curveType === "idvd") return "idvd";
   if (curveType === "bv") return "bv";
   if (curveType === "cv") return "cv";
+  if (curveType === "qg") return "qg";
   return "idvg";
 }
 
 function initialFitRange(values: number[], curveType: CurveType, bvKind: BvKind = "bvdss"): [number, number] {
   const finite = values.filter(Number.isFinite).sort((a, b) => a - b);
-  if (finite.length === 0) return curveType === "idvd" ? [0, 1] : curveType === "bv" ? [0, 120] : curveType === "cv" ? [1, 25] : [3.5, 5.0];
+  if (finite.length === 0) return curveType === "idvd" ? [0, 1] : curveType === "bv" ? [0, 120] : curveType === "cv" ? [1, 25] : curveType === "qg" ? [0, 60] : [3.5, 5.0];
   const lo = finite[0];
   const hi = finite[finite.length - 1];
   if (!(hi > lo)) {
-    const pad = Math.max(Math.abs(hi) * 0.05, curveType === "idvd" || curveType === "bv" || curveType === "cv" ? 0.1 : 0.05);
+    const pad = Math.max(Math.abs(hi) * 0.05, curveType === "idvd" || curveType === "bv" || curveType === "cv" || curveType === "qg" ? 0.1 : 0.05);
     return [lo - pad, hi + pad];
   }
   const q = (p: number) => finite[Math.min(finite.length - 1, Math.max(0, Math.round((finite.length - 1) * p)))];
   const bvNegSweep = curveType === "bv" && bvKind === "bvgss_n" && Math.abs(lo) >= Math.abs(hi);
-  let nextMin = q(curveType === "idvd" ? 0.2 : curveType === "bv" ? (bvNegSweep ? 0.0 : 0.55) : curveType === "cv" ? 0.0 : 0.4);
-  let nextMax = q(curveType === "idvd" ? 0.85 : curveType === "bv" ? (bvNegSweep ? 0.45 : 1.0) : curveType === "cv" ? 1.0 : 0.6);
+  let nextMin = q(curveType === "idvd" ? 0.2 : curveType === "bv" ? (bvNegSweep ? 0.0 : 0.55) : curveType === "cv" || curveType === "qg" ? 0.0 : 0.4);
+  let nextMax = q(curveType === "idvd" ? 0.85 : curveType === "bv" ? (bvNegSweep ? 0.45 : 1.0) : curveType === "cv" || curveType === "qg" ? 1.0 : 0.6);
   if (!(nextMax > nextMin)) {
-    nextMin = lo + (hi - lo) * (curveType === "idvd" ? 0.15 : curveType === "bv" ? (bvNegSweep ? 0.0 : 0.5) : curveType === "cv" ? 0.0 : 0.35);
-    nextMax = lo + (hi - lo) * (curveType === "idvd" ? 0.85 : curveType === "bv" ? (bvNegSweep ? 0.45 : 1.0) : curveType === "cv" ? 1.0 : 0.65);
+    nextMin = lo + (hi - lo) * (curveType === "idvd" ? 0.15 : curveType === "bv" ? (bvNegSweep ? 0.0 : 0.5) : curveType === "cv" || curveType === "qg" ? 0.0 : 0.35);
+    nextMax = lo + (hi - lo) * (curveType === "idvd" ? 0.85 : curveType === "bv" ? (bvNegSweep ? 0.45 : 1.0) : curveType === "cv" || curveType === "qg" ? 1.0 : 0.65);
   }
   if (!(nextMax > nextMin)) return [lo, hi];
   return [Number(nextMin.toPrecision(6)), Number(nextMax.toPrecision(6))];
+}
+
+function buildQgTargetRaw(qgsNc: number, qgdNc: number, qgNc: number, vgFinal: number): CurveRaw {
+  const total = Math.max(Number(qgNc) || 0, 1e-9);
+  const qgs = clamp(Number(qgsNc) || 0, 0, total);
+  const qgd = clamp(Number(qgdNc) || 0, 0, Math.max(total - qgs, 0));
+  const qgdEnd = Math.min(qgs + qgd, total);
+  const vg = Math.max(Number(vgFinal) || 0, 1e-9);
+  const plateau = clamp(vg * 0.55, 0.05, Math.max(vg - 0.05, 0.05));
+  const xs: number[] = [];
+  const ys: number[] = [];
+  const pushSegment = (x0: number, x1: number, y0: number, y1: number, n: number, skipFirst: boolean) => {
+    const count = Math.max(2, n);
+    for (let i = skipFirst ? 1 : 0; i < count; i += 1) {
+      const t = count <= 1 ? 0 : i / (count - 1);
+      xs.push(x0 + (x1 - x0) * t);
+      ys.push(y0 + (y1 - y0) * t);
+    }
+  };
+  pushSegment(0, qgs, 0, plateau, 25, false);
+  pushSegment(qgs, qgdEnd, plateau, plateau, 25, true);
+  pushSegment(qgdEnd, total, plateau, vg, 35, true);
+  return {
+    ivar: xs,
+    dvar: ys,
+    meta: {
+      curve_type: "qg",
+      qgs_nc: qgs,
+      qgd_nc: qgd,
+      qg_nc: total,
+      qgd_start_nc: qgs,
+      qgd_end_nc: qgdEnd,
+      vg_final: vg,
+      vplateau_auto: plateau,
+      plateau_source: "auto_0.55_vg_final",
+    },
+  };
 }
 
 export function SingleCurveFit({
@@ -788,6 +957,11 @@ export function SingleCurveFit({
   const [vds, setVds] = useState(0.5);  // 曲线 1 的 Vds 偏置 (V)
   const [vgs, setVgs] = useState(10.0);  // IdVd 的固定 Vgs 偏置 (V)
   const [vdsMax, setVdsMax] = useState(12.0);  // IdVd 的 Vds sweep 上限
+  const [cvPolyOrder, setCvPolyOrder] = useState(5);
+  const [qgsNc, setQgsNc] = useState(20.0);
+  const [qgdNc, setQgdNc] = useState(25.0);
+  const [qgNc, setQgNc] = useState(60.0);
+  const [qgLoadCurrent, setQgLoadCurrent] = useState(10.0);
   const [dragging, setDragging] = useState<null | "min" | "max">(null);
 
   // ---- 参数 ----
@@ -861,6 +1035,8 @@ export function SingleCurveFit({
 
   // ---- 防抖 ----
   const pendingRef = useRef<Record<string, number>>({});
+  const importedSourceModelPathRef = useRef<string | null>(null);
+  const importedSourceModelDirtyRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const animTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chartPaneRef = useRef<HTMLDivElement>(null);
@@ -963,12 +1139,17 @@ export function SingleCurveFit({
     vdsMax,
     bvKind: steps[activeStep]?.bvKind ?? "bvdss",
     capType: steps[activeStep]?.capType ?? "ciss",
+    cvPolyOrder,
+    qgsNc,
+    qgdNc,
+    qgNc,
+    qgLoadCurrent,
     rms: fitRMS,
     r2Log: fitR2,
     r2Linear: fitR2Linear,
     fitHistory,
     ...overrides,
-  }), [steps, activeStep, csvPath, raw, simCurve, vmin, vmax, vds, vgs, vdsMax, fitRMS, fitR2, fitR2Linear, fitHistory]);
+  }), [steps, activeStep, csvPath, raw, simCurve, vmin, vmax, vds, vgs, vdsMax, cvPolyOrder, qgsNc, qgdNc, qgNc, qgLoadCurrent, fitRMS, fitR2, fitR2Linear, fitHistory]);
 
   const updateActiveStep = useCallback((overrides: Partial<TransferStep> = {}) => {
     setSteps(prev => prev.map((step, idx) => (
@@ -985,6 +1166,11 @@ export function SingleCurveFit({
             vdsMax,
             bvKind: step.bvKind,
             capType: step.capType,
+            cvPolyOrder,
+            qgsNc,
+            qgdNc,
+            qgNc,
+            qgLoadCurrent,
             rms: fitRMS,
             r2Log: fitR2,
             r2Linear: fitR2Linear,
@@ -993,7 +1179,7 @@ export function SingleCurveFit({
           }
         : step
     )));
-  }, [activeStep, csvPath, raw, simCurve, vmin, vmax, vds, vgs, vdsMax, fitRMS, fitR2, fitR2Linear, fitHistory]);
+  }, [activeStep, csvPath, raw, simCurve, vmin, vmax, vds, vgs, vdsMax, cvPolyOrder, qgsNc, qgdNc, qgNc, qgLoadCurrent, fitRMS, fitR2, fitR2Linear, fitHistory]);
 
   const loadStepIntoEditor = useCallback((step: TransferStep) => {
     setCsvPath(step.csvPath);
@@ -1004,6 +1190,11 @@ export function SingleCurveFit({
     setVds(step.vds);
     setVgs(step.vgs);
     setVdsMax(step.vdsMax);
+    setCvPolyOrder(step.cvPolyOrder);
+    setQgsNc(step.qgsNc);
+    setQgdNc(step.qgdNc);
+    setQgNc(step.qgNc);
+    setQgLoadCurrent(step.qgLoadCurrent);
     // capType/bvKind live on the step object; scalar editor controls read
     // them from steps[activeStep] after setActiveStep.
     setFitRMS(step.rms);
@@ -1046,7 +1237,7 @@ export function SingleCurveFit({
     const nextCurveType: CurveType = curveTypeFromExternal(externalSelectedStep.type);
     const nextBias = parseBiasVoltage(
       externalSelectedStep.bias,
-      nextCurveType === "idvd" ? (steps[steps.length - 1]?.vgs ?? 10.0) : nextCurveType === "bv" ? 120.0 : nextCurveType === "cv" ? 25.0 : (steps[steps.length - 1]?.vds ?? 0.5),
+      nextCurveType === "idvd" ? (steps[steps.length - 1]?.vgs ?? 10.0) : nextCurveType === "bv" ? 120.0 : nextCurveType === "cv" ? 25.0 : nextCurveType === "qg" ? 60.0 : (steps[steps.length - 1]?.vds ?? 0.5),
     );
     const next = makeTransferStep(
       steps.length + 1,
@@ -1208,6 +1399,7 @@ export function SingleCurveFit({
   const displayParams = animPlaying && fitHistory.length > 0
     ? fitHistory[animIndex]?.params ?? pvals
     : pvals;
+  const activeCurveType = steps[activeStep]?.curveType ?? "idvg";
 
   // ---- 绘图域（clientX → 数据 X）----
   const plotRef = useRef<HTMLDivElement>(null);
@@ -1466,6 +1658,42 @@ export function SingleCurveFit({
     });
   }, []);
 
+  const refreshQgTarget = useCallback(() => {
+    const nextRaw = buildQgTargetRaw(qgsNc, qgdNc, qgNc, vgs);
+    const nextSim = new Array(nextRaw.ivar.length).fill(Number.NaN);
+    setRaw(nextRaw);
+    setCsvPath("generated://qg-target");
+    setSimCurve(nextSim);
+    setVmin(0);
+    setVmax(Math.max(qgNc, 1e-9));
+    setVdsMax(Math.max(qgNc, 1e-9));
+    setFitRMS(null);
+    setFitR2(null);
+    setFitR2Linear(null);
+    setFitHistory([]);
+    setSteps(prev => prev.map((step, idx) => idx === activeStep ? {
+      ...step,
+      curveType: "qg" as const,
+      csvPath: "generated://qg-target",
+      raw: nextRaw,
+      simCurve: nextSim,
+      vmin: 0,
+      vmax: Math.max(qgNc, 1e-9),
+      vds,
+      vgs,
+      vdsMax: Math.max(qgNc, 1e-9),
+      qgsNc,
+      qgdNc,
+      qgNc,
+      qgLoadCurrent,
+      status: "loaded",
+      rms: null,
+      r2Log: null,
+      r2Linear: null,
+      fitHistory: [],
+    } : step));
+  }, [activeStep, qgdNc, qgLoadCurrent, qgNc, qgsNc, vds, vgs]);
+
   const powerParams = useMemo(() => ({
     ...importedWrapperOverrides,
     active_area_mm2: Math.min(Math.max(Number(activeAreaMm2) || 10.0, 1e-6), 1e6),
@@ -1504,7 +1732,7 @@ export function SingleCurveFit({
     );
     const stepLines = fittedStepSummaries.length > 0
       ? fittedStepSummaries.map(step => (
-        `* Step: ${step.name}, ${step.curveType === "idvd" ? `Vgs=${fmtParam(step.vgs)}V` : step.curveType === "bv" ? `BV=${step.bvKind}` : step.curveType === "cv" ? `CV=${step.capType}` : `Vds=${fmtParam(step.vds)}V`}, range=${fmtParam(step.vmin)}-${fmtParam(step.vmax)}V, pts=${step.pts}` +
+        `* Step: ${step.name}, ${step.curveType === "idvd" ? `Vgs=${fmtParam(step.vgs)}V` : step.curveType === "bv" ? `BV=${step.bvKind}` : step.curveType === "cv" ? `CV=${step.capType}` : step.curveType === "qg" ? `Qg check Vg=${fmtParam(step.vgs)}V Vds=${fmtParam(step.vds)}V` : `Vds=${fmtParam(step.vds)}V`}, range=${fmtParam(step.vmin)}-${fmtParam(step.vmax)}${step.curveType === "qg" ? "nC" : "V"}, pts=${step.pts}` +
         `${step.r2Log != null ? `, R2log=${step.r2Log.toFixed(4)}` : ""}` +
         `${step.r2Linear != null ? `, R2lin=${step.r2Linear.toFixed(4)}` : ""}`
       )).join("\n")
@@ -1514,26 +1742,56 @@ export function SingleCurveFit({
     }
     const subcktName = exportSubcktName || "MY_MOSFET";
     const capNotice = capWrapper?.enabled
-      ? `* CV wrapper: enabled (${capWrapper.mode}), residual Cgs/Cgd/Cds behavioral currents included\n`
+      ? `* CV wrapper: enabled (${capWrapper.mode}), ${capWrapper.mode === "external_charge" ? "external charge Cgs/Cgd/Cds sources included" : "residual Cgs/Cgd/Cds behavioral currents included"}\n`
       : "";
-    const formatCapFunc = (name: "cgs" | "cgd" | "cds") => {
-      const table = capWrapper?.[name];
-      if (!table || !table.voltage_v.length) return "";
-      const pairs = table.voltage_v
-        .map((v, idx) => {
-          const cPf = table.capacitance_pf[idx] ?? 0;
-          return `${fmtParam(v)},${(cPf * 1e-12).toExponential(12)}`;
-        })
-        .join(",");
-      return `.func SB_${name.toUpperCase()}(x) table(x,${pairs})`;
+    const powExpr = (varName: string, power: number) => {
+      if (power === 0) return "1";
+      if (power === 1) return varName;
+      return Array.from({ length: power }, () => varName).join("*");
     };
-    const capWrapperLines = capWrapper?.enabled ? [
+    const polyExpr = (coeff: number[]) => {
+      const terms = coeff
+        .map((c, idx) => c === 0 ? "" : idx === 0 ? `(${c.toExponential(12)})` : `(${c.toExponential(12)})*${powExpr("u", idx)}`)
+        .filter(Boolean);
+      return terms.length ? terms.join(" + ") : "0";
+    };
+    const polyDataForTable = (name: "cgs" | "cgd" | "cds") => {
+      const table = capWrapper?.[name];
+      if (!table || !table.voltage_v.length) return null;
+      const coeff = table.polynomial_coeff_f?.length
+        ? table.polynomial_coeff_f
+        : [Math.max(...table.capacitance_pf.map(v => Number.isFinite(v) ? v : 0), 0) * 1e-12];
+      const vmin = table.polynomial_vmin_v ?? Math.min(...table.voltage_v);
+      const vmax = Math.max(...table.voltage_v);
+      const vspan = table.polynomial_vspan_v ?? Math.max(vmax - vmin, 1);
+      return { coeff, vmin, vspan };
+    };
+    const formatPolyCapFunc = (name: "cgs" | "cgd" | "cds") => {
+      const data = polyDataForTable(name);
+      if (!data) return "";
+      const upper = name.toUpperCase();
+      return [
+        `* SB_CV_POLY ${upper} VMIN=${fmtParam(data.vmin)} VSPAN=${fmtParam(data.vspan)} COEFF_F=${data.coeff.map(c => c.toExponential(12)).join(",")}`,
+        `.func SB_${upper}_U(x) (limit((2*((x)-${fmtParam(data.vmin)})/${fmtParam(data.vspan)})-1,-1,1))`,
+        `.func SB_${upper}_RAW(u) (${polyExpr(data.coeff)})`,
+        `.func SB_${upper}(x) (if(SB_${upper}_RAW(SB_${upper}_U(x))>0,SB_${upper}_RAW(SB_${upper}_U(x)),0))`,
+      ].join("\n");
+    };
+    const capWrapperLines = capWrapper?.enabled && capWrapper.mode === "external_charge" ? [
+      "* CV external-charge wrapper: positive total Cgs/Cgd/Cds are polynomial functions in Farads.",
+      "* Polynomial metadata comments support GUI re-import.",
+      "* CGSO/CGDO/CGBO/TT in BSIM3_core are exported as zero to avoid obvious double-counting.",
+      capWrapper.cgs ? formatPolyCapFunc("cgs") : "",
+      capWrapper.cgd ? formatPolyCapFunc("cgd") : "",
+      capWrapper.cds ? formatPolyCapFunc("cds") : "",
+      capWrapper.cgs ? "Bcap_cgs G S I={SB_CGS(V(D,S))*ddt(V(G,S))}" : "",
+      capWrapper.cgd ? "Bcap_cgd G D I={SB_CGD(V(D,S))*ddt(V(G,D))}" : "",
+      capWrapper.cds ? "Bcap_cds D S I={SB_CDS(V(D,S))*ddt(V(D,S))}" : "",
+    ].filter(Boolean).join("\n") + "\n" : capWrapper?.enabled ? [
       "* CV residual wrapper: table capacitance values are in Farads",
       "* Residual sources are connected at external package pins to match",
       "* datasheet-style Ciss/Coss/Crss terminal measurements.",
-      formatCapFunc("cgs"),
-      formatCapFunc("cgd"),
-      formatCapFunc("cds"),
+      "",
       capWrapper.cgs ? "Bcv_cgs G S I={SB_CGS(V(D,S))*ddt(V(G,S))}" : "",
       capWrapper.cgd ? "Bcv_cgd G D I={SB_CGD(V(D,S))*ddt(V(G,D))}" : "",
       capWrapper.cds ? "Bcv_cds D S I={SB_CDS(V(D,S))*ddt(V(D,S))}" : "",
@@ -1614,16 +1872,113 @@ export function SingleCurveFit({
   const doSim = useCallback(async (
     params: Record<string, number>,
     powerOverride?: typeof powerParams,
+    subcktNameOverride?: string,
   ) => {
-    if (!csvPath) return;
     const activeCurveType = steps[activeStep]?.curveType ?? "idvg";
+    if (!csvPath && activeCurveType !== "qg") return;
     simAbortRef.current?.abort();
     const abort = new AbortController();
     const runId = simRunIdRef.current + 1;
     simRunIdRef.current = runId;
     simAbortRef.current = abort;
     setSimulating(true);
+    const sourceModelPath = importedSourceModelPathRef.current;
+    const preferSourceModel = Boolean(sourceModelPath && !importedSourceModelDirtyRef.current);
+    const simSubcktName = subcktNameOverride || exportSubcktName || "MY_MOSFET";
     try {
+      if (activeCurveType === "qg") {
+        const targetRaw = raw ?? buildQgTargetRaw(qgsNc, qgdNc, qgNc, vgs);
+        if (!raw) {
+          setRaw(targetRaw);
+          setCsvPath("generated://qg-target");
+        }
+        const qgRequest = {
+          qgsNc,
+          qgdNc,
+          qgNc,
+          vgFinal: vgs,
+          vds,
+          idLoad: qgLoadCurrent,
+          paramOverrides: params,
+          powerParams: powerOverride ?? powerParams,
+          capWrapper,
+          sourceModelPath,
+          preferSourceModel,
+          subcktName: simSubcktName,
+          signal: abort.signal,
+        } as const;
+        let r: Awaited<ReturnType<typeof csvQgSimulate>>;
+        try {
+          r = await csvQgSimulate(qgRequest);
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e);
+          if (isApiEndpointNotFound(e, "/api/csv/qg_simulate") || /LTspice Qg evaluation failed/i.test(message)) {
+            setLog("warn", "Qg simulate backend needs a refresh. Restarting Python backend and retrying once...");
+            await stopBackend();
+            const restarted = await startBackend();
+            if (!restarted) throw new Error("Python backend restart returned false");
+            r = await csvQgSimulate(qgRequest);
+          } else {
+            throw e;
+          }
+        }
+        if (abort.signal.aborted || runId !== simRunIdRef.current) return;
+        const rms = Number((r.metadata as any)?.rms_v);
+        const r2 = Number((r.metadata as any)?.r2_linear);
+        const nextRaw = { ivar: r.ivar, dvar: r.meas, meta: r.metadata };
+        setRaw(nextRaw);
+        setCsvPath("generated://qg-target");
+        setSimCurve(r.sim);
+        setFitRMS(Number.isFinite(rms) ? rms : null);
+        setFitR2(null);
+        setFitR2Linear(Number.isFinite(r2) ? r2 : null);
+        setFitHistory([{
+          step: 1,
+          params: {},
+          sim: r.sim,
+          r2_linear: Number.isFinite(r2) ? r2 : 0,
+          r2_log: 0,
+          ftol_metric: 0,
+          xtol_metric: 0,
+          gtol_metric: 0,
+          fit_rms: Number.isFinite(rms) ? rms : 0,
+        }]);
+        setSteps(prev => prev.map((step, idx) => idx === activeStep ? {
+          ...step,
+          curveType: "qg" as const,
+          csvPath: "generated://qg-target",
+          raw: nextRaw,
+          simCurve: r.sim,
+          vmin: 0,
+          vmax: Math.max(qgNc, 1e-9),
+          vds,
+          vgs,
+          vdsMax: Math.max(qgNc, 1e-9),
+          qgsNc,
+          qgdNc,
+          qgNc,
+          qgLoadCurrent,
+          status: "simulated",
+          rms: Number.isFinite(rms) ? rms : null,
+          r2Log: null,
+          r2Linear: Number.isFinite(r2) ? r2 : null,
+          fitHistory: [{
+            step: 1,
+            params: {},
+            sim: r.sim,
+            r2_linear: Number.isFinite(r2) ? r2 : 0,
+            r2_log: 0,
+            ftol_metric: 0,
+            xtol_metric: 0,
+            gtol_metric: 0,
+            fit_rms: Number.isFinite(rms) ? rms : 0,
+          }],
+        } : step));
+        const modelSource = String((r.metadata as any)?.model_source ?? (preferSourceModel ? "source_lib" : "regenerated"));
+        const sourceText = modelSource === "source_lib" ? `, source=${(r.metadata as any)?.source_model_path ?? sourceModelPath}` : ", source=regenerated temp lib";
+        setLog("success", `Qg simulate done: RMS=${Number.isFinite(rms) ? rms.toFixed(4) : "n/a"} V, R²lin=${Number.isFinite(r2) ? r2.toFixed(4) : "n/a"}${sourceText}`);
+        return;
+      }
       const r = await csvSimulate(csvPath, {
         curveType: activeCurveType,
         bvKind: steps[activeStep]?.bvKind ?? "bvdss",
@@ -1634,6 +1989,9 @@ export function SingleCurveFit({
         vds_max: vdsMax,
         powerParams: powerOverride ?? powerParams,
         capWrapper,
+        sourceModelPath,
+        preferSourceModel,
+        subcktName: simSubcktName,
         signal: abort.signal,
       });
       if (abort.signal.aborted || runId !== simRunIdRef.current) return;
@@ -1648,6 +2006,8 @@ export function SingleCurveFit({
         setLog("warn", "Simulation cancelled by user");
       } else {
         console.error("simulate failed:", e);
+        const message = e instanceof Error ? e.message : String(e);
+        setLog("error", `${activeCurveType === "qg" ? "Qg simulate" : "Simulation"} failed: ${message}`);
       }
     } finally {
       if (runId === simRunIdRef.current) {
@@ -1655,11 +2015,12 @@ export function SingleCurveFit({
         setSimulating(false);
       }
     }
-  }, [activeStep, capWrapper, csvPath, vds, vgs, vdsMax, powerParams, setLog, steps]);
+  }, [activeStep, capWrapper, csvPath, exportSubcktName, qgdNc, qgLoadCurrent, qgNc, qgsNc, raw, vds, vgs, vdsMax, powerParams, setLog, steps]);
 
   // 参数变化 -> 防抖刷新 sim
   const [simulating, setSimulating] = useState(false);
   const onParamChange = useCallback((name: string, value: number) => {
+    importedSourceModelDirtyRef.current = true;
     setPvals(prev => ({ ...prev, [name]: value }));
     pendingRef.current = { ...pendingRef.current, [name]: value };
     if (timerRef.current !== null) clearTimeout(timerRef.current);
@@ -1741,6 +2102,7 @@ export function SingleCurveFit({
     const catP = BSIM3_PARAMS.filter(p => p.category === cat);
     const next = { ...pvals };
     catP.forEach(p => { next[p.name] = p.default; });
+    importedSourceModelDirtyRef.current = true;
     setPvals(next);
     if (timerRef.current !== null) clearTimeout(timerRef.current);
     void doSim(next);
@@ -1752,12 +2114,15 @@ export function SingleCurveFit({
       const path = await invoke<string>("open_spice_model_file");
       const text = await invoke<string>("read_text_file", { path });
       const parsed = parseSpiceParams(text, cellPitchUm);
+      const parsedSubcktName = parseSubcktName(text);
       const importedNames = Object.keys(parsed.params);
       if (importedNames.length === 0) {
         setLog("warn", `No supported BSIM parameters found in ${path.split(/[/\\]/).pop() || path}`);
         return;
       }
       const next = { ...pvals, ...parsed.params };
+      importedSourceModelPathRef.current = path;
+      importedSourceModelDirtyRef.current = false;
       const nextArea = parsed.wrapper.activeAreaMm2;
       const nextPitch = parsed.wrapper.cellPitchUm;
       const nextRg = parsed.wrapper.rgOhm;
@@ -1781,13 +2146,15 @@ export function SingleCurveFit({
         ...(parsed.wrapper.rdriftOhm !== undefined ? { rdrift_ohm: parsed.wrapper.rdriftOhm } : {}),
         ...(parsed.wrapper.rjfetOhm !== undefined ? { rjfet_ohm: parsed.wrapper.rjfetOhm } : {}),
       });
+      setCapWrapper(parsed.capWrapper);
       if (nextArea !== undefined) setActiveAreaMm2(nextPowerParams.active_area_mm2);
       if (nextPitch !== undefined) setCellPitchUm(nextPowerParams.cell_pitch_um);
       if (nextRg !== undefined) setExportRgOhm(nextPowerParams.rg_ohm);
       if (nextIncludeDiode !== undefined) setExportIncludeDiode(nextPowerParams.include_diode);
+      if (parsedSubcktName) setExportSubcktName(parsedSubcktName);
       pendingRef.current = {};
       if (timerRef.current !== null) clearTimeout(timerRef.current);
-      void doSim(next, nextPowerParams);
+      void doSim(next, nextPowerParams, parsedSubcktName ?? undefined);
       const skippedText = parsed.unknown.length > 0 ? `, skipped ${parsed.unknown.length} unknown tokens` : "";
       const invalidText = parsed.invalid.length > 0 ? `, ignored ${parsed.invalid.length} invalid values` : "";
       const wrapperNotes = [
@@ -1800,9 +2167,10 @@ export function SingleCurveFit({
         parsed.wrapper.rjfetOhm !== undefined ? `Rjfet=${fmtParam(parsed.wrapper.rjfetOhm)}Ω` : null,
         nextIncludeDiode !== undefined ? `Diode=${nextPowerParams.include_diode ? "on" : "off"}` : null,
         parsed.wrapper.unitMultiplier !== undefined ? `M=${fmtParam(parsed.wrapper.unitMultiplier)}` : null,
+        parsed.capWrapper?.enabled ? `CV=${["cgs", "cgd", "cds"].filter(name => Boolean((parsed.capWrapper as any)[name])).join("+").toUpperCase()} ${parsed.capWrapper.mode}` : null,
       ].filter(Boolean).join(", ");
       const wrapperText = wrapperNotes ? `, wrapper: ${wrapperNotes}` : "";
-      setLog("success", `Imported ${importedNames.length} BSIM params from ${path.split(/[/\\]/).pop() || path}${wrapperText}${skippedText}${invalidText}`);
+      setLog("success", `Imported ${importedNames.length} BSIM params from ${path.split(/[/\\]/).pop() || path}${wrapperText}, source lib linked${skippedText}${invalidText}`);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       if (/no file selected/i.test(message)) return;
@@ -1846,10 +2214,10 @@ export function SingleCurveFit({
   const protectedCurves = useMemo(() => {
     if (!protectPrevious) return [];
     return steps.slice(0, activeStep)
-      .filter(step => step.status === "fitted" && step.csvPath && step.raw)
+      .filter(step => step.curveType !== "qg" && step.status === "fitted" && step.csvPath && step.raw)
       .map(step => ({
         csvPath: step.csvPath,
-        curve_type: step.curveType,
+        curve_type: step.curveType as "idvg" | "idvd" | "bv" | "cv",
         bv_kind: step.bvKind,
         cap_type: step.capType,
         vds: step.vds,
@@ -1912,6 +2280,7 @@ export function SingleCurveFit({
     };
     const commitPoint = (point: FitHistoryPoint, reason: string) => {
       setSimCurve(point.sim);
+      importedSourceModelDirtyRef.current = true;
       setPvals(prev => ({ ...prev, ...point.params }));
       pendingRef.current = {};
       setFitRMS(point.fit_rms);
@@ -1963,6 +2332,21 @@ export function SingleCurveFit({
       const params = fitParamNames;
       const activeCurveType = steps[activeStep]?.curveType ?? "idvg";
       const activeTargetId: FitTargetId = targetIdForCurve(activeCurveType);
+      if (activeCurveType === "qg") {
+        if (!selectedFitTargets.has(activeTargetId)) {
+          setLog("warn", "Qg / Gate Charge 未勾选，无法执行当前 step 验证。");
+          setFitting(false);
+          return;
+        }
+        if (!isStepSelectedForFit(steps[activeStep])) {
+          setLog("warn", "当前 Qg step 未勾选，不会参与验证。请先在左侧 tree 勾选该 step。");
+          setFitting(false);
+          return;
+        }
+        setLog("info", `Qg verify start: Qgs=${qgsNc}nC, Qgd=${qgdNc}nC, Qg=${qgNc}nC, Vg=${vgs}V, Vds=${vds}V, Id=${qgLoadCurrent}A`);
+        await doSim(pvals);
+        return;
+      }
       if (!csvPath || !raw) {
         setFitting(false);
         return;
@@ -1988,19 +2372,22 @@ export function SingleCurveFit({
           setFitting(false);
           return;
         }
-        setLog("info", `CV wrapper fit start: ${cvSteps.map(({ step }) => step.capType).join(", ")}, AA=${powerParams.active_area_mm2}mm², pitch=${powerParams.cell_pitch_um}µm`);
+        setLog("info", `CV polynomial wrapper fit start: ${cvSteps.map(({ step }) => `${step.capType}:order${step.cvPolyOrder}`).join(", ")}, AA=${powerParams.active_area_mm2}mm², pitch=${powerParams.cell_pitch_um}µm`);
         setSimulating(true);
         const result = await csvCvWrapperFit({
           curves: cvSteps.map(({ step }) => ({
             csvPath: step.csvPath,
             capType: step.capType,
             weight: 1.0,
+            polynomialOrder: step.cvPolyOrder,
           })),
+          polynomialOrder: saved.cvPolyOrder,
           params: pvals,
           powerParams,
           signal: abort.signal,
         });
         if (abort.signal.aborted) return;
+        importedSourceModelDirtyRef.current = true;
         setCapWrapper(result.cap_wrapper);
         const byCap = new Map(result.curves.map(curve => [curve.cap_type, curve]));
         const nextSteps = materialized.map((step) => {
@@ -2095,6 +2482,7 @@ export function SingleCurveFit({
             streamedHistory.push(point);
             applyActiveFitHistory([...streamedHistory]);
             setSimCurve(point.sim);
+            importedSourceModelDirtyRef.current = true;
             setPvals(prev => ({ ...prev, ...ev.params }));
             const eventCount = point.bound_events?.length ?? 0;
             if (eventCount > lastBoundEventCount) {
@@ -2133,6 +2521,7 @@ export function SingleCurveFit({
               if (isBetterPoint(finalPoint, bestPoint)) bestPoint = finalPoint;
             }
             setSimCurve(ev.sim!);
+            importedSourceModelDirtyRef.current = true;
             setPvals(prev => ({ ...prev, ...ev.fitted_params! }));
             setFitRMS(ev.rms ?? null);
             setFitR2(r2Log);
@@ -2189,7 +2578,7 @@ export function SingleCurveFit({
       setSimulating(false);
       setFitting(false);
     }
-  }, [activeStep, csvPath, raw, fitParamNames, fitParamBounds, protectedCurves, protectWeight, fitStopPayload, powerParams, pvals, selectedFitTargets, steps, vmin, vmax, vds, vgs, vdsMax, setLog, applyActiveFitHistory, lockParamsAfterFit, isStepSelectedForFit, currentStepPatch]);
+  }, [activeStep, csvPath, raw, fitParamNames, fitParamBounds, protectedCurves, protectWeight, fitStopPayload, powerParams, pvals, selectedFitTargets, steps, vmin, vmax, vds, vgs, vdsMax, cvPolyOrder, qgsNc, qgdNc, qgNc, qgLoadCurrent, doSim, setLog, applyActiveFitHistory, lockParamsAfterFit, isStepSelectedForFit, currentStepPatch]);
 
   const onJointFit = useCallback(async () => {
     const saved = currentStepPatch();
@@ -2199,6 +2588,7 @@ export function SingleCurveFit({
       .filter(({ step }) => (
         isStepSelectedForFit(step) &&
         selectedFitTargets.has(targetIdForCurve(step.curveType)) &&
+        step.curveType !== "qg" &&
         step.csvPath &&
         step.raw
       ));
@@ -2218,18 +2608,21 @@ export function SingleCurveFit({
       const abort = new AbortController();
       fitAbortRef.current = abort;
       try {
-        setLog("info", `CV wrapper fit start: ${loadedSteps.map(({ step }) => step.capType).join(", ")}, AA=${powerParams.active_area_mm2}mm², pitch=${powerParams.cell_pitch_um}µm`);
+        setLog("info", `CV polynomial wrapper fit start: ${loadedSteps.map(({ step }) => `${step.capType}:order${step.cvPolyOrder}`).join(", ")}, AA=${powerParams.active_area_mm2}mm², pitch=${powerParams.cell_pitch_um}µm`);
         const result = await csvCvWrapperFit({
           curves: loadedSteps.map(({ step }) => ({
             csvPath: step.csvPath,
             capType: step.capType,
             weight: 1.0,
+            polynomialOrder: step.cvPolyOrder,
           })),
+          polynomialOrder: saved.cvPolyOrder,
           params: pvals,
           powerParams,
           signal: abort.signal,
         });
         if (abort.signal.aborted) return;
+        importedSourceModelDirtyRef.current = true;
         setCapWrapper(result.cap_wrapper);
         const byCap = new Map(result.curves.map(curve => [curve.cap_type, curve]));
         const nextSteps = materialized.map((step) => {
@@ -2353,7 +2746,7 @@ export function SingleCurveFit({
       for await (const ev of csvDualFitStream({
         curves: loadedSteps.map(({ step }) => ({
           csvPath: step.csvPath,
-          curveType: step.curveType,
+          curveType: step.curveType as "idvg" | "idvd" | "bv" | "cv",
           bvKind: step.bvKind,
           capType: step.capType,
           vds: step.vds,
@@ -2373,6 +2766,7 @@ export function SingleCurveFit({
       })) {
         if (ev.kind === "step" && ev.curves && ev.params) {
           stepCount++;
+          importedSourceModelDirtyRef.current = true;
           setPvals(prev => ({ ...prev, ...ev.params }));
           pendingRef.current = {};
 
@@ -2432,6 +2826,7 @@ export function SingleCurveFit({
           }
         } else if (ev.kind === "final" && ev.curves && ev.fitted_params) {
           const fittedParams = ev.fitted_params;
+          importedSourceModelDirtyRef.current = true;
           setPvals(prev => ({ ...prev, ...fittedParams }));
           pendingRef.current = {};
 
@@ -2511,6 +2906,18 @@ export function SingleCurveFit({
       .filter(d => Number.isFinite(d.x) && (d.meas !== null || d.sim !== null));
   }, [raw, displaySim, yScaleMode]);
 
+  const qgMarkers = useMemo(() => {
+    if (!raw || activeCurveType !== "qg") return null;
+    const qgs = Number((raw.meta as any)?.qgs_nc);
+    const qgdEnd = Number((raw.meta as any)?.qgd_end_nc);
+    const qgTotal = Number((raw.meta as any)?.qg_nc);
+    return {
+      qgs: Number.isFinite(qgs) ? qgs : qgsNc,
+      qgdEnd: Number.isFinite(qgdEnd) ? qgdEnd : qgsNc + qgdNc,
+      qgTotal: Number.isFinite(qgTotal) ? qgTotal : qgNc,
+    };
+  }, [activeCurveType, qgdNc, qgNc, qgsNc, raw]);
+
   const logYDomain = useMemo(() => {
     const vals = chartData
       .flatMap(d => [d.meas, d.sim])
@@ -2568,6 +2975,7 @@ export function SingleCurveFit({
       return Boolean(
         isStepSelectedForFit(s) &&
         selectedFitTargets.has(targetIdForCurve(s.curveType)) &&
+        s.curveType !== "qg" &&
         s.csvPath &&
         s.raw
       );
@@ -2641,7 +3049,6 @@ export function SingleCurveFit({
     });
   }, [runWorkbenchAction]);
 
-  const activeCurveType = steps[activeStep]?.curveType ?? "idvg";
   const activeTargetId: FitTargetId = targetIdForCurve(activeCurveType);
   const canWorkbenchSimulate = Boolean(raw && !fitting && !simulating && selectedFitTargets.has(activeTargetId));
   const canWorkbenchFit = Boolean(
@@ -2649,6 +3056,13 @@ export function SingleCurveFit({
     loadedStepCount >= 2
   );
   const workbenchIsRunning = fitting || simulating;
+
+  useEffect(() => {
+    if (activeCurveType !== "qg") return;
+    if (workbenchIsRunning) return;
+    refreshQgTarget();
+  }, [activeCurveType, qgdNc, qgLoadCurrent, qgNc, qgsNc, refreshQgTarget, vds, vgs]);
+
   const targetConfigStep = externalSelectedStep?.id
     ? steps.find(step => step.id === externalSelectedStep.id) ?? steps[activeStep]
     : steps[activeStep];
@@ -2686,7 +3100,7 @@ export function SingleCurveFit({
       loading,
       isRunning: workbenchIsRunning,
       loadedStepCount,
-      activeStepName: steps[activeStep]?.name ?? (activeCurveType === "idvd" ? `IdVd @ Vgs=${vgs}V` : activeCurveType === "bv" ? "BV / Leakage" : activeCurveType === "cv" ? "CV / Capacitance" : `IdVg @ Vds=${vds}V`),
+      activeStepName: steps[activeStep]?.name ?? (activeCurveType === "idvd" ? `IdVd @ Vgs=${vgs}V` : activeCurveType === "bv" ? "BV / Leakage" : activeCurveType === "cv" ? "CV / Capacitance" : activeCurveType === "qg" ? "Qg / Gate Charge" : `IdVg @ Vds=${vds}V`),
     });
   }, [
     activeStep,
@@ -2852,7 +3266,7 @@ export function SingleCurveFit({
           fontWeight: 600, fontSize: 13,
           display: "flex", alignItems: "center", gap: 8,
         }}>
-          {isExportPanelVisible ? "SPICE Model Preview" : `Curves Plot · ${steps[activeStep]?.name ?? (activeCurveType === "idvd" ? `IdVd @ Vgs=${vgs}V` : activeCurveType === "bv" ? "BV / Leakage" : activeCurveType === "cv" ? "CV / Capacitance" : `IdVg @ Vds=${vds}V`)}`}
+          {isExportPanelVisible ? "SPICE Model Preview" : `Curves Plot · ${steps[activeStep]?.name ?? (activeCurveType === "idvd" ? `IdVd @ Vgs=${vgs}V` : activeCurveType === "bv" ? "BV / Leakage" : activeCurveType === "cv" ? "CV / Capacitance" : activeCurveType === "qg" ? "Qg / Gate Charge" : `IdVg @ Vds=${vds}V`)}`}
           {dragging && <span style={{ fontSize: 10, color: "var(--primary)" }}>拖动 {dragging === "min" ? "min" : "max"} 线...</span>}
         </div>
         <div ref={chartPaneRef} style={{ flex: 1, minHeight: 400, display: "flex", flexDirection: "column", background: "#fff", overflow: "hidden", position: "relative" }}>
@@ -2934,7 +3348,7 @@ export function SingleCurveFit({
               >
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2, position: "relative", zIndex: 12 }}>
                   <div style={{ fontSize: 10, color: "var(--muted)", flex: 1 }}>
-                    {activeCurveType === "idvd" ? `Vgs = ${vgs} V` : activeCurveType === "bv" ? `BV kind = ${steps[activeStep]?.bvKind ?? "bvdss"}` : activeCurveType === "cv" ? `CV = ${steps[activeStep]?.capType ?? "ciss"}` : `Vds = ${vds} V`}
+                    {activeCurveType === "idvd" ? `Vgs = ${vgs} V` : activeCurveType === "bv" ? `BV kind = ${steps[activeStep]?.bvKind ?? "bvdss"}` : activeCurveType === "cv" ? `CV = ${steps[activeStep]?.capType ?? "ciss"}` : activeCurveType === "qg" ? `Qg @ Vds=${vds} V, Id=${qgLoadCurrent} A` : `Vds = ${vds} V`}
                   </div>
                   <div style={{ display: "inline-flex", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden" }}>
                     {(["linear", "log"] as const).map(mode => (
@@ -2970,13 +3384,16 @@ export function SingleCurveFit({
                     />
                     <Tooltip
                       formatter={(v: number) => Number(v).toExponential(3)}
-                      labelFormatter={v => `${activeCurveType === "idvd" ? "Vds" : activeCurveType === "bv" || activeCurveType === "cv" ? "Vds" : "Vgs"}=${(v as number).toFixed(3)}`}
+                      labelFormatter={v => `${activeCurveType === "qg" ? "Qg" : activeCurveType === "idvd" ? "Vds" : activeCurveType === "bv" || activeCurveType === "cv" ? "Vds" : "Vgs"}=${(v as number).toFixed(3)}${activeCurveType === "qg" ? " nC" : " V"}`}
                       contentStyle={{ fontSize: 11 }}
                     />
                     <Legend wrapperStyle={{ fontSize: 11 }} />
                     <ReferenceLine x={vmin} stroke="var(--warning)" strokeDasharray="4 2" strokeWidth={2} />
                     <ReferenceLine x={vmax} stroke="var(--warning)" strokeDasharray="4 2" strokeWidth={2} />
-                    <Line type="monotone" dataKey="meas" stroke="#9ca3af" strokeWidth={1.5} dot={false} name="Measured" isAnimationActive={false} />
+                    {qgMarkers && <ReferenceLine x={qgMarkers.qgs} stroke="#64748b" strokeDasharray="2 2" label={{ value: "Qgs", fontSize: 10, fill: "#64748b" }} />}
+                    {qgMarkers && <ReferenceLine x={qgMarkers.qgdEnd} stroke="#0d7f8f" strokeDasharray="2 2" label={{ value: "Qgs+Qgd", fontSize: 10, fill: "#0d7f8f" }} />}
+                    {qgMarkers && <ReferenceLine x={qgMarkers.qgTotal} stroke="#b45309" strokeDasharray="2 2" label={{ value: "Qg", fontSize: 10, fill: "#b45309" }} />}
+                    <Line type="monotone" dataKey="meas" stroke="#9ca3af" strokeWidth={1.5} dot={false} name={activeCurveType === "qg" ? "Target" : "Measured"} isAnimationActive={false} />
                     <Line
                       type="monotone"
                       dataKey="sim"
@@ -3164,8 +3581,8 @@ export function SingleCurveFit({
                     器件级参数，应用于所有拟合步骤
                   </div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                    <label style={{ fontSize: 12, color: WB.textSm }}>Area mm²<input type="number" value={activeAreaMm2} step={0.1} onChange={e => setActiveAreaMm2(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-                    <label style={{ fontSize: 12, color: WB.textSm }}>Pitch µm<input type="number" value={cellPitchUm} step={0.1} onChange={e => setCellPitchUm(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Area mm²<input type="number" value={activeAreaMm2} step={0.1} onChange={e => { importedSourceModelDirtyRef.current = true; setActiveAreaMm2(Number(e.target.value)); }} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Pitch µm<input type="number" value={cellPitchUm} step={0.1} onChange={e => { importedSourceModelDirtyRef.current = true; setCellPitchUm(Number(e.target.value)); }} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
                   </div>
                 </section>
               </>
@@ -3178,33 +3595,51 @@ export function SingleCurveFit({
                     Type: {externalSelectedStep.type || "—"} · CSV: {externalSelectedStep.csvFile || "—"}
                   </div>
                 </section>
-                <section>
-                  <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Data Source</div>
-                  <Button
-                    size="sm"
-                    variant="primary"
-                    onClick={onLoad}
-                    disabled={!canLoadTargetCsv}
-                    style={{ width: "100%", justifyContent: "center" }}
-                    title={isTargetLoadSupported ? "为当前 step 加载 CSV" : "当前 step 类型暂未接入 CSV 加载"}
-                  >
-                    <Upload size={13} />{loading ? "Loading..." : "Load CSV"}
-                  </Button>
-                  <div
-                    style={{
-                      marginTop: 7,
-                      minHeight: 18,
-                      fontSize: 11,
-                      color: targetConfigFileName ? WB.textMd : WB.textXs,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                    title={targetConfigStep?.csvPath || "No CSV loaded"}
-                  >
-                    {targetConfigFileName || "No CSV loaded for this step"}
-                  </div>
-                </section>
+                {targetConfigStep?.curveType === "qg" ? (
+                  <section>
+                    <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Qg Target</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <label style={{ fontSize: 12, color: WB.textSm }}>Qgs (nC)<input type="number" value={qgsNc} min={0} step={1} onChange={e => setQgsNc(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                      <label style={{ fontSize: 12, color: WB.textSm }}>Qgd (nC)<input type="number" value={qgdNc} min={0} step={1} onChange={e => setQgdNc(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                      <label style={{ fontSize: 12, color: WB.textSm }}>Qg total (nC)<input type="number" value={qgNc} min={0.001} step={1} onChange={e => setQgNc(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                      <label style={{ fontSize: 12, color: WB.textSm }}>Vg final (V)<input type="number" value={vgs} min={0.001} step={0.5} onChange={e => setVgs(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                      <label style={{ fontSize: 12, color: WB.textSm }}>Vds test (V)<input type="number" value={vds} min={0.001} step={1} onChange={e => setVds(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                      <label style={{ fontSize: 12, color: WB.textSm }}>Id load (A)<input type="number" value={qgLoadCurrent} min={0.001} step={0.5} onChange={e => setQgLoadCurrent(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    </div>
+                    <div style={{ marginTop: 8, fontSize: 11, color: WB.textXs }}>
+                      Target curve is generated from gate-charge values; LTspice transient supplies the simulated curve.
+                    </div>
+                  </section>
+                ) : (
+                  <section>
+                    <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Data Source</div>
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      onClick={onLoad}
+                      disabled={!canLoadTargetCsv}
+                      style={{ width: "100%", justifyContent: "center" }}
+                      title={isTargetLoadSupported ? "为当前 step 加载 CSV" : "当前 step 类型暂未接入 CSV 加载"}
+                    >
+                      <Upload size={13} />{loading ? "Loading..." : "Load CSV"}
+                    </Button>
+                    <div
+                      style={{
+                        marginTop: 7,
+                        minHeight: 18,
+                        fontSize: 11,
+                        color: targetConfigFileName ? WB.textMd : WB.textXs,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                      title={targetConfigStep?.csvPath || "No CSV loaded"}
+                    >
+                      {targetConfigFileName || "No CSV loaded for this step"}
+                    </div>
+                  </section>
+                )}
+                {targetConfigStep?.curveType !== "qg" && (
                 <section>
                   <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Circuit Condition</div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
@@ -3226,17 +3661,22 @@ export function SingleCurveFit({
                       />
                     </label>
                     <label style={{ fontSize: 12, color: WB.textSm }}>Range<input type="text" value={`${targetConfigStep?.curveType === "idvd" || targetConfigStep?.curveType === "cv" ? "Vds" : targetConfigStep?.curveType === "bv" ? "V" : "Vgs"} ${vmin}-${vmax}V`} readOnly style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px", backgroundColor: WB.pageBg }} /></label>
+                    {targetConfigStep?.curveType === "cv" && (
+                      <label style={{ fontSize: 12, color: WB.textSm }}>Polynomial Order<input type="number" value={cvPolyOrder} min={0} max={12} step={1} onChange={e => setCvPolyOrder(Math.min(Math.max(Math.round(Number(e.target.value) || 0), 0), 12))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    )}
                   </div>
                 </section>
+                )}
                 <section>
                   <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Fit Range</div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                    <label style={{ fontSize: 12, color: WB.textSm }}>Vmin<input type="number" value={vmin} step={0.05} onChange={e => setVmin(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-                    <label style={{ fontSize: 12, color: WB.textSm }}>Vmax<input type="number" value={vmax} step={0.05} onChange={e => setVmax(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>{targetConfigStep?.curveType === "qg" ? "Qmin (nC)" : "Vmin"}<input type="number" value={vmin} step={targetConfigStep?.curveType === "qg" ? 1 : 0.05} onChange={e => setVmin(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>{targetConfigStep?.curveType === "qg" ? "Qmax (nC)" : "Vmax"}<input type="number" value={vmax} step={targetConfigStep?.curveType === "qg" ? 1 : 0.05} onChange={e => setVmax(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
                     <label style={{ fontSize: 12, color: WB.textSm }}>Points<input readOnly value={inRange} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px", backgroundColor: WB.pageBg }} /></label>
                     <label style={{ fontSize: 12, color: WB.textSm }}>Weight<input type="number" value={externalSelectedStep.weight ?? 1.0} min={0} max={2} step={0.1} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
                   </div>
                 </section>
+                {targetConfigStep?.curveType !== "qg" && (
                 <section>
                   <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Stop Criteria</div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
@@ -3252,6 +3692,7 @@ export function SingleCurveFit({
                     <label style={{ fontSize: 12, color: WB.textSm }}>R² linear<input type="number" value={fitStop.r2_linear} step={0.001} onChange={e => updateStopValue("r2_linear", Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
                   </div>
                 </section>
+                )}
               </>
             ) : (
               // 旧的默认显示（无外部选中时）
@@ -3284,6 +3725,9 @@ export function SingleCurveFit({
                   ) : (
                     <label style={{ fontSize: 12, color: WB.textSm }}>Vds (V)<input type="number" value={vds} step={0.1} onChange={e => setVds(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
                   )}
+                  {activeCurveType === "cv" && (
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Polynomial Order<input type="number" value={cvPolyOrder} min={0} max={12} step={1} onChange={e => setCvPolyOrder(Math.min(Math.max(Math.round(Number(e.target.value) || 0), 0), 12))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                  )}
                   <label style={{ fontSize: 12, color: WB.textSm }}>Vmin<input type="number" value={vmin} step={0.05} onChange={e => setVmin(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
                   <label style={{ fontSize: 12, color: WB.textSm }}>Vmax<input type="number" value={vmax} step={0.05} onChange={e => setVmax(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
                   <label style={{ fontSize: 12, color: WB.textSm }}>Points<input readOnly value={inRange} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
@@ -3308,8 +3752,8 @@ export function SingleCurveFit({
                 <section>
                   <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Power Cell</div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                    <label style={{ fontSize: 12, color: WB.textSm }}>Area mm²<input type="number" value={activeAreaMm2} step={0.1} onChange={e => setActiveAreaMm2(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
-                    <label style={{ fontSize: 12, color: WB.textSm }}>Pitch µm<input type="number" value={cellPitchUm} step={0.1} onChange={e => setCellPitchUm(Number(e.target.value))} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Area mm²<input type="number" value={activeAreaMm2} step={0.1} onChange={e => { importedSourceModelDirtyRef.current = true; setActiveAreaMm2(Number(e.target.value)); }} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
+                    <label style={{ fontSize: 12, color: WB.textSm }}>Pitch µm<input type="number" value={cellPitchUm} step={0.1} onChange={e => { importedSourceModelDirtyRef.current = true; setCellPitchUm(Number(e.target.value)); }} style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }} /></label>
                   </div>
                   <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, fontSize: 13, color: WB.textSm }}>
                     <input type="checkbox" checked={protectPrevious} onChange={e => setProtectPrevious(e.target.checked)} />
@@ -3400,7 +3844,7 @@ export function SingleCurveFit({
                   value={exportRgOhm}
                   min={0}
                   step={0.1}
-                  onChange={e => setExportRgOhm(Number(e.target.value))}
+                  onChange={e => { importedSourceModelDirtyRef.current = true; setExportRgOhm(Number(e.target.value)); }}
                   style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}
                 />
               </label>
@@ -3410,7 +3854,7 @@ export function SingleCurveFit({
                   type="number"
                   value={activeAreaMm2}
                   step={0.1}
-                  onChange={e => setActiveAreaMm2(Number(e.target.value))}
+                  onChange={e => { importedSourceModelDirtyRef.current = true; setActiveAreaMm2(Number(e.target.value)); }}
                   style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}
                 />
               </label>
@@ -3420,7 +3864,7 @@ export function SingleCurveFit({
                   type="number"
                   value={cellPitchUm}
                   step={0.1}
-                  onChange={e => setCellPitchUm(Number(e.target.value))}
+                  onChange={e => { importedSourceModelDirtyRef.current = true; setCellPitchUm(Number(e.target.value)); }}
                   style={{ width: "100%", marginTop: 4, fontSize: 13, padding: "3px 5px" }}
                 />
               </label>
@@ -3431,7 +3875,7 @@ export function SingleCurveFit({
                 <input
                   type="checkbox"
                   checked={exportIncludeDiode}
-                  onChange={e => setExportIncludeDiode(e.target.checked)}
+                  onChange={e => { importedSourceModelDirtyRef.current = true; setExportIncludeDiode(e.target.checked); }}
                 />
                 Include body diode
               </label>

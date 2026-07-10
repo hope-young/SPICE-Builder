@@ -11,7 +11,7 @@ from typing import Optional, Tuple, List
 import numpy as np
 
 from spicebuilder.models.bsim3 import BSIM3Model
-from spicebuilder.models.cap_wrapper import PowerCapWrapper
+from spicebuilder.models.cap_wrapper import PowerCapWrapper, wrapper_terminal_caps
 from spicebuilder.models.exporter import LibExporter
 from spicebuilder.models.powermos import PowerMOSSubcktParams
 from spicebuilder.simulator.ltspice import (
@@ -20,6 +20,7 @@ from spicebuilder.simulator.ltspice import (
     gen_idvd_netlist,
     gen_bv_netlist,
     gen_cv_netlist,
+    gen_qg_netlist,
 )
 
 
@@ -41,7 +42,8 @@ class LTspiceEvaluator:
                  cell_count: int = 100,
                  cell_w_m: float = 0.2,
                  power_params: PowerMOSSubcktParams | dict | None = None,
-                 cap_wrapper: PowerCapWrapper | dict | None = None):
+                 cap_wrapper: PowerCapWrapper | dict | None = None,
+                 source_model_path: str | Path | None = None):
         self.subckt_name = subckt_name
         legacy_base = PowerMOSSubcktParams(
             rg_ohm=rg_ohm,
@@ -74,8 +76,10 @@ class LTspiceEvaluator:
             self.cap_wrapper = PowerCapWrapper.from_dict(cap_wrapper)
         else:
             self.cap_wrapper = cap_wrapper
+        self.source_model_path = Path(source_model_path).resolve() if source_model_path else None
         self.cache: dict = {}  # param_hash -> array
         self.stats = {"calls": 0, "cache_hits": 0, "time": 0.0}
+        self.last_error: str = ""
 
     def _param_hash(self, model: BSIM3Model, scenario: str, ivar: np.ndarray = None) -> str:
         """用关键参数生成 hash (用作 cache key)
@@ -99,7 +103,15 @@ class LTspiceEvaluator:
             except (KeyError, ValueError):
                 pass
         cap_key = self.cap_wrapper.cache_key() if self.cap_wrapper else "capwrap=off"
+        source_key = "source=off"
+        if self.source_model_path:
+            try:
+                stat = self.source_model_path.stat()
+                source_key = f"source={self.source_model_path}|mtime={stat.st_mtime_ns}|size={stat.st_size}"
+            except OSError:
+                source_key = f"source={self.source_model_path}|missing"
         s = scenario + "|" + self.power_params.cache_key() + "|" + cap_key + "|" + "|".join(vals)
+        s += "|" + source_key
         if ivar is not None:
             # 加 ivar shape + min/max 到 key 以防不同长度复用
             s += f"|n={len(ivar)}|min={ivar.min():.4g}|max={ivar.max():.4g}"
@@ -107,6 +119,8 @@ class LTspiceEvaluator:
 
     def _write_lib(self, model: BSIM3Model) -> Path:
         """写一个临时 .lib"""
+        if self.source_model_path:
+            return self.source_model_path
         tmpdir = Path(tempfile.mkdtemp(prefix="lteval_", dir=str(self.work_dir)))
         lib_path = tmpdir / "model.lib"
         self.exporter.export_subckt(model, lib_path,
@@ -114,6 +128,14 @@ class LTspiceEvaluator:
                                      power_params=self.power_params,
                                      cap_wrapper=self.cap_wrapper)
         return lib_path
+
+    def _cleanup_lib(self, lib_path: Path) -> None:
+        if self.source_model_path and lib_path.resolve() == self.source_model_path:
+            return
+        try:
+            lib_path.parent.rmdir()
+        except OSError:
+            pass
 
     def eval_idvg(self,
                   model: BSIM3Model,
@@ -151,6 +173,7 @@ class LTspiceEvaluator:
         if not res.success or not res.raw_path or not res.raw_path.exists():
             out = np.full_like(vgs_arr, 1e-12, dtype=float)
             self.cache[key] = out
+            self._cleanup_lib(lib_path)
             return out
 
         try:
@@ -166,10 +189,7 @@ class LTspiceEvaluator:
                 print(f"[eval_idvg] parse error: {e}")
             out = np.full_like(vgs_arr, 1e-12, dtype=float)
         finally:
-            try:
-                lib_path.parent.rmdir()
-            except OSError:
-                pass
+            self._cleanup_lib(lib_path)
 
         self.cache[key] = out
         return out
@@ -200,6 +220,7 @@ class LTspiceEvaluator:
         if not res.success or not res.raw_path or not res.raw_path.exists():
             out = np.full_like(vds_arr, 1e-12, dtype=float)
             self.cache[key] = out
+            self._cleanup_lib(lib_path)
             return out
 
         try:
@@ -215,10 +236,7 @@ class LTspiceEvaluator:
                 print(f"[eval_idvd] parse error: {e}")
             out = np.full_like(vds_arr, 1e-12, dtype=float)
         finally:
-            try:
-                lib_path.parent.rmdir()
-            except OSError:
-                pass
+            self._cleanup_lib(lib_path)
 
         self.cache[key] = out
         return out
@@ -258,6 +276,7 @@ class LTspiceEvaluator:
         if not res.success or not res.raw_path or not res.raw_path.exists():
             out = np.full_like(sweep_arr, 1e-18, dtype=float)
             self.cache[key] = out
+            self._cleanup_lib(lib_path)
             return out
 
         try:
@@ -276,10 +295,7 @@ class LTspiceEvaluator:
                 print(f"[eval_bv] parse error: {e}")
             out = np.full_like(sweep_arr, 1e-18, dtype=float)
         finally:
-            try:
-                lib_path.parent.rmdir()
-            except OSError:
-                pass
+            self._cleanup_lib(lib_path)
 
         self.cache[key] = out
         return out
@@ -305,6 +321,20 @@ class LTspiceEvaluator:
             else:
                 return self.cache[key]
 
+        if (
+            not self.source_model_path
+            and self.cap_wrapper
+            and self.cap_wrapper.enabled
+            and self.cap_wrapper.mode == "external_charge"
+        ):
+            terminal_caps = wrapper_terminal_caps(self.cap_wrapper, np.asarray(vds_arr, dtype=float))
+            out = np.asarray(
+                terminal_caps.get(cap_type, np.zeros_like(vds_arr, dtype=float)),
+                dtype=float,
+            )
+            self.cache[key] = out
+            return out
+
         t0 = time.time()
         self.stats["calls"] += 1
         lib_path = self._write_lib(model)
@@ -316,7 +346,10 @@ class LTspiceEvaluator:
         self.stats["time"] += time.time() - t0
 
         if not res.success or not res.raw_path or not res.raw_path.exists():
+            details = res.error or res.error_text or (res.log_text[-1200:] if res.log_text else "")
+            self.last_error = f"LTspice did not produce CV raw output. {details}".strip()
             self.cache[key] = None
+            self._cleanup_lib(lib_path)
             return None
 
         try:
@@ -356,13 +389,82 @@ class LTspiceEvaluator:
                 print(f"[eval_cv] parse error: {e}")
             out = np.full_like(vds_arr, 1e-12, dtype=float)
         finally:
-            try:
-                lib_path.parent.rmdir()
-            except OSError:
-                pass
+            self._cleanup_lib(lib_path)
 
         self.cache[key] = out
         return out
+
+    def eval_qg(self,
+                model: BSIM3Model,
+                qg_arr_nc: np.ndarray,
+                vds: float = 25.0,
+                id_load: float = 10.0,
+                igate: float = 1e-3,
+                vg_final: float = 10.0) -> Optional[np.ndarray]:
+        """Evaluate gate-charge curve and return Vgs(V) over Qg(nC)."""
+        import time
+        qg_arr = np.asarray(qg_arr_nc, dtype=float)
+        key = self._param_hash(model, f"qg_vds{vds}_id{id_load}_ig{igate}_vg{vg_final}", qg_arr)
+        if key in self.cache:
+            self.stats["cache_hits"] += 1
+            return self.cache[key]
+
+        t0 = time.time()
+        self.stats["calls"] += 1
+        lib_path = self._write_lib(model)
+        qg_max = float(np.nanmax(qg_arr)) if qg_arr.size else 1.0
+        netlist = gen_qg_netlist(
+            str(lib_path),
+            qg_max_nc=max(qg_max, 1e-6),
+            vds_v=vds,
+            id_load_a=id_load,
+            igate_a=igate,
+            vg_final_v=vg_final,
+            model_name=self.subckt_name,
+            use_subckt=True,
+        )
+        res = self.backend.run_netlist_text(netlist, timeout_s=45, cleanup=False)
+        self.stats["time"] += time.time() - t0
+
+        if not res.success or not res.raw_path or not res.raw_path.exists():
+            details = res.error or res.error_text or (res.log_text[-1200:] if res.log_text else "")
+            self.last_error = f"LTspice did not produce Qg raw output. {details}".strip()
+            self.cache[key] = None
+            self._cleanup_lib(lib_path)
+            return None
+
+        try:
+            raw = self.backend.parse_raw(res.raw_path)
+            v_trace = next((name for name in ("V(g)", "v(g)", "V(G)") if name in raw), None)
+            if v_trace is None:
+                self.last_error = f"Qg raw missing V(g) trace; traces={list(raw.keys())[:12]}"
+                self.cache[key] = None
+                return None
+            t = np.asarray(raw[v_trace]["ivar"], dtype=float)
+            vg = np.asarray(raw[v_trace]["dvar"], dtype=float)
+            valid = np.isfinite(t) & np.isfinite(vg)
+            if valid.sum() < 2:
+                self.last_error = f"Qg raw has too few finite V(g) points: {int(valid.sum())}"
+                self.cache[key] = None
+                return None
+            ig = max(abs(float(igate)), 1e-12)
+            qg_c = max(qg_max, 1e-6) * 1e-9
+            tstop = max(qg_c / ig * 1.15, 1e-9)
+            tdelay = max(min(tstop * 1e-3, 1e-9), 1e-12)
+            qg_sim = np.maximum(t[valid] - tdelay, 0.0) * ig * 1e9
+            vg_sim = vg[valid]
+            order = np.argsort(qg_sim)
+            out = np.interp(qg_arr, qg_sim[order], vg_sim[order], left=vg_sim[order][0], right=vg_sim[order][-1])
+            self.cache[key] = out
+            return out
+        except Exception as e:
+            if self.verbose:
+                print(f"[eval_qg] parse error: {e}")
+            self.last_error = f"Qg raw parse error: {e}"
+            self.cache[key] = None
+            return None
+        finally:
+            self._cleanup_lib(lib_path)
 
     def print_stats(self):
         print(f"  LTspice eval: {self.stats['calls']} calls, "
